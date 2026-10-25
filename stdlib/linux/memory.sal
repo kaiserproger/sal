@@ -1,0 +1,16 @@
+# Linux x86-64 private anonymous read/write mappings.
+# Callers own the mapping lifetime; raw views must not outlive unmapping.
+operation LinuxMapMemory:
+    accepts length of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        return syscall(9, 0, length, 3, 34, -1, 0).
+
+operation LinuxUnmapMemory:
+    accepts buffer of type usize.
+    accepts length of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        return syscall(11, buffer, length, 0, 0, 0, 0).

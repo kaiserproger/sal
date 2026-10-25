@@ -1,0 +1,174 @@
+use "bytes.sal".
+
+# Native SAL routing: literal raw matching with :NAME single-segment captures
+# and strict percent/UTF-8 decoding. No allocation, no JSON dependency.
+# All names are Route-prefixed. Only BytesHexDigit is reused from bytes.sal.
+#
+# Paths are origin-form byte spans starting with /. Literal segments match raw
+# bytes exactly; :NAME captures exactly one nonempty raw segment. Segment count
+# is exact: root (/) and trailing empty literals count. Empty or malformed
+# patterns never match. Literal %/+ bytes are not decoded; captures stay raw
+# and must be passed through RouteDecode when decoded text is wanted.
+#
+# Error convention: RouteMatch returns bool; RouteCapture returns empty Bytes
+# on mismatch, missing name, or empty name; RouteDecode returns decoded byte
+# count, -22 malformed input or invalid UTF-8, -28 insufficient capacity.
+# Lifetime: RouteScan/RouteCapture return zero-copy views borrowing path;
+# the caller keeps path alive while using them. RouteDecode writes exactly the
+# returned count on success with no terminator; on any error a valid decoded
+# prefix may already be stored. The caller owns writable output/capacity and
+# must keep it disjoint from unread input bytes.
+#
+
+# Internal single-pass scanner shared by RouteMatch and RouteCapture.
+# name empty selects match mode: returns path itself on full match, empty on
+# mismatch. name nonempty selects capture mode: returns the last slice whose
+# :name equals name, empty when nothing matches. Malformed patterns (empty,
+# missing leading slash, lone colon) return empty in both modes.
+# Pure, no allocation; returned views borrow path.
+operation RouteScan:
+    accepts pattern of type Bytes.
+    accepts path of type Bytes.
+    accepts name of type Bytes.
+    returns Bytes.
+    body:
+        if len(pattern) == 0 || len(path) == 0:
+            return bytes("").
+        if byte(pattern, usize(0)) != 47 || byte(path, usize(0)) != 47:
+            return bytes("").
+        let internal = len(name) == 0.
+        let mut pi = usize(1).
+        let mut qi = usize(1).
+        let mut found = bytes("").
+        while true:
+            let mut pe = pi.
+            while pe < len(pattern) && byte(pattern, pe) != 47:
+                set pe = pe + 1.
+            let mut qe = qi.
+            while qe < len(path) && byte(path, qe) != 47:
+                set qe = qe + 1.
+            let plen = pe - pi.
+            let qlen = qe - qi.
+            if plen != 0 && byte(pattern, pi) == 58:
+                if plen == 1 || qlen == 0:
+                    return bytes("").
+                if !internal && slice(pattern, pi + 1, plen - 1) == name:
+                    set found = slice(path, qi, qlen).
+            else:
+                if plen != qlen || slice(pattern, pi, plen) != slice(path, qi, qlen):
+                    return bytes("").
+            if pe == len(pattern) && qe == len(path):
+                if internal:
+                    return path.
+                return found.
+            if pe == len(pattern) || qe == len(path):
+                return bytes("").
+            set pi = pe + 1.
+            set qi = qe + 1.
+        return bytes("").
+
+# Pure exact route match derived from the shared scanner, not a second pass.
+# True only for origin paths with identical segment counts, raw literal
+# equality, and one nonempty raw segment per :NAME slot.
+operation RouteMatch:
+    accepts pattern of type Bytes.
+    accepts path of type Bytes.
+    returns bool.
+    body:
+        return len(RouteScan(pattern, path, bytes(""))) != 0.
+
+# Pure raw zero-copy capture. Returns the last segment when :name repeats,
+# empty Bytes on mismatch, unknown names, or empty names. The public empty
+# name guard keeps match-mode path returns internal to RouteScan.
+operation RouteCapture:
+    accepts pattern of type Bytes.
+    accepts path of type Bytes.
+    accepts name of type Bytes.
+    returns Bytes.
+    body:
+        if len(name) == 0:
+            return bytes("").
+        return RouteScan(pattern, path, name).
+
+# Strict percent-decode with streaming UTF-8 validation in one pass.
+# Percent escapes (%HH, either hex case) emit one byte; + stays plus (43).
+# Escapes may yield slash or NUL. Raw and decoded bytes feed one UTF-8 state
+# machine: ASCII passes, 2-byte starts are 194..223, 3-byte 224..239, 4-byte
+# 240..244; continuations are 128..191. Overlongs, surrogates 55296..57343,
+# values above 1114111, lone continuations, and truncation are -22. Codepoint
+# arithmetic stays i64 because u8 math is checked. Hex uses BytesHexDigit.
+# Capacity is checked per emitted byte after validation, so -22 precedes -28
+# at the same byte; exact small capacities succeed (%41 needs one byte).
+# Only bytes validated so far are stored, so errors leave a valid prefix.
+# No terminator, no allocation. Caller supplies disjoint writable output.
+operation RouteDecode:
+    accepts value of type Bytes.
+    accepts output of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        let mut read = usize(0).
+        let mut written = usize(0).
+        let mut need = 0.
+        let mut scalar = 0.
+        let mut minimum = 0.
+        while read < len(value):
+            let octet = byte(value, read).
+            let mut current = i64(octet).
+            if octet == 37:
+                if len(value) - read < 3:
+                    return -22.
+                let high = BytesHexDigit(byte(value, read + 1)).
+                if high < 0:
+                    return -22.
+                let low = BytesHexDigit(byte(value, read + 2)).
+                if low < 0:
+                    return -22.
+                set current = high * 16 + low.
+                set read = read + 3.
+            else:
+                set read = read + 1.
+            if need == 0:
+                if current < 128:
+                    set scalar = current.
+                    set minimum = current.
+                else:
+                    if current < 194:
+                        return -22.
+                    if current <= 223:
+                        set scalar = current - 192.
+                        set minimum = 128.
+                        set need = 1.
+                    else:
+                        if current <= 239:
+                            set scalar = current - 224.
+                            set minimum = 2048.
+                            set need = 2.
+                        else:
+                            if current > 244:
+                                return -22.
+                            set scalar = current - 240.
+                            set minimum = 65536.
+                            set need = 3.
+            else:
+                if current < 128:
+                    return -22.
+                if current > 191:
+                    return -22.
+                set scalar = scalar * 64 + current - 128.
+                set need = need - 1.
+                if need == 0:
+                    if scalar < minimum:
+                        return -22.
+                    if scalar > 1114111:
+                        return -22.
+                    if scalar >= 55296 && scalar <= 57343:
+                        return -22.
+            if written >= capacity:
+                return -28.
+            store8(output + written, u8(current)).
+            set written = written + 1.
+        if need != 0:
+            return -22.
+        return i64(written).

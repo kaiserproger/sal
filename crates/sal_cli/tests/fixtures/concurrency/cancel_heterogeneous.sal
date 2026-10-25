@@ -1,0 +1,116 @@
+use "std/concurrency.sal".
+entity Pair:
+    layout "C".
+    has x of type i64.
+    has y of type i64.
+operation Main:
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mut failure = 0.
+        let data = channel(Pair, usize(1)).
+        let stop = channel(bool, usize(1)).
+        let ready = send(data, Pair(10, 20)).
+        if ready.sent == false:
+            if failure == 0:
+                set failure = 1.
+        let picked = wait_for(receive(data), receive(stop)).
+        if picked.status != 0:
+            if failure == 0:
+                set failure = 2.
+        if picked.index != 0:
+            if failure == 0:
+                set failure = 3.
+        if picked.arm0.selected == false:
+            if failure == 0:
+                set failure = 4.
+        if picked.arm0.open == false:
+            if failure == 0:
+                set failure = 5.
+        if picked.arm0.value.x != 10:
+            if failure == 0:
+                set failure = 6.
+        if picked.arm0.value.y != 20:
+            if failure == 0:
+                set failure = 7.
+        if picked.arm1.selected == true:
+            if failure == 0:
+                set failure = 8.
+        if picked.arm1.value == true:
+            if failure == 0:
+                set failure = 9.
+        let idle = wait_for(receive(data), receive(stop), otherwise()).
+        if idle.status != 2:
+            if failure == 0:
+                set failure = 10.
+        if idle.index != 2:
+            if failure == 0:
+                set failure = 11.
+        if idle.arm0.selected == true:
+            if failure == 0:
+                set failure = 12.
+        if idle.arm1.selected == true:
+            if failure == 0:
+                set failure = 13.
+        if close(data) == false:
+            if failure == 0:
+                set failure = 14.
+        if close(stop) == false:
+            if failure == 0:
+                set failure = 15.
+        let gone_data = receive(data).
+        if gone_data.open == true:
+            if failure == 0:
+                set failure = 16.
+        let gone_stop = wait_for(receive(stop), timeout(usize(20))).
+        if gone_stop.status != 1:
+            if failure == 0:
+                set failure = 17.
+        if gone_stop.index != 0:
+            if failure == 0:
+                set failure = 18.
+        if gone_stop.arm0.selected == false:
+            if failure == 0:
+                set failure = 19.
+        if gone_stop.arm0.open == true:
+            if failure == 0:
+                set failure = 20.
+        if gone_stop.arm0.value == true:
+            if failure == 0:
+                set failure = 21.
+        let data_two = channel(Pair, usize(0)).
+        let stop_two = channel(bool, usize(1)).
+        let woke = send(stop_two, true).
+        if woke.sent == false:
+            if failure == 0:
+                set failure = 22.
+        let signal = wait_for(receive(data_two), receive(stop_two)).
+        if signal.status != 0:
+            if failure == 0:
+                set failure = 23.
+        if signal.index != 1:
+            if failure == 0:
+                set failure = 24.
+        if signal.arm1.selected == false:
+            if failure == 0:
+                set failure = 25.
+        if signal.arm1.open == false:
+            if failure == 0:
+                set failure = 26.
+        if signal.arm1.value == false:
+            if failure == 0:
+                set failure = 27.
+        if signal.arm0.selected == true:
+            if failure == 0:
+                set failure = 28.
+        if signal.arm0.value.x != 0:
+            if failure == 0:
+                set failure = 29.
+        if signal.arm0.value.y != 0:
+            if failure == 0:
+                set failure = 30.
+        channel_drop(data_two).
+        channel_drop(stop_two).
+        channel_drop(data).
+        channel_drop(stop).
+        return failure.

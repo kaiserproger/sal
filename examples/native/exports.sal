@@ -1,0 +1,17 @@
+application CExports.
+
+operation Add:
+    accepts a of type i64.
+    accepts b of type i64.
+    returns i64.
+    exports "C" as "sal_add".
+    body:
+        return a + b.
+
+operation Equal:
+    accepts a of type i64.
+    accepts b of type i64.
+    returns bool.
+    exports "C" as "sal_equal".
+    body:
+        return a == b.

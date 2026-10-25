@@ -1,0 +1,130 @@
+use "io.sal".
+
+entity LinuxTimeval:
+    layout "C".
+    has seconds of type i64.
+    has microseconds of type i64.
+
+# Zero disables timeouts. The kernel borrows a fixed local C-layout timeval.
+operation LinuxSocketTimeouts:
+    accepts fd of type i64.
+    accepts seconds of type i64.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if seconds < 0:
+            return -22.
+        let value = LinuxTimeval(seconds, i64(0)).
+        let received = syscall(54, fd, 1, 20, address(value), size_of(LinuxTimeval), 0).
+        if received < 0:
+            return received.
+        return syscall(54, fd, 1, 21, address(value), size_of(LinuxTimeval), 0).
+
+# Linux x86-64 sockaddr_in: caller supplies 16 writable bytes.
+# IPv4 is the network-order numeric address (127.0.0.1 = 2130706433).
+operation LinuxIpv4Address:
+    accepts buffer of type usize.
+    accepts ipv4 of type u64.
+    accepts port of type i64.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        if ipv4 > 4294967295:
+            return -22.
+        if port < 0:
+            return -22.
+        if port > 65535:
+            return -22.
+        let mut index = usize(0).
+        while index < 16:
+            store8(buffer + index, u8(0)).
+            set index = index + 1.
+        store8(buffer, u8(2)).
+        store8(buffer + 2, u8(port / 256)).
+        store8(buffer + 3, u8(port % 256)).
+        store8(buffer + 4, u8(ipv4 / 16777216)).
+        store8(buffer + 5, u8(ipv4 / 65536 % 256)).
+        store8(buffer + 6, u8(ipv4 / 256 % 256)).
+        store8(buffer + 7, u8(ipv4 % 256)).
+        return 0.
+
+# endpoint points to sockaddr_in; reuse_value points to a native int of value 1.
+# The caller retains both buffers; no per-listener heap allocation is required.
+operation LinuxTcpListen:
+    accepts endpoint of type usize.
+    accepts reuse_value of type usize.
+    accepts backlog of type i64.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let listener = syscall(41, 2, 1, 0, 0, 0, 0).
+        if listener < 0:
+            return listener.
+        let option = syscall(54, listener, 1, 2, reuse_value, 4, 0).
+        if option < 0:
+            LinuxClose(listener).
+            return option.
+        let bound = syscall(49, listener, endpoint, 16, 0, 0, 0).
+        if bound < 0:
+            LinuxClose(listener).
+            return bound.
+        let listening = syscall(50, listener, backlog, 0, 0, 0, 0).
+        if listening < 0:
+            LinuxClose(listener).
+            return listening.
+        return listener.
+
+operation LinuxTcpAccept:
+    accepts listener of type i64.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mut client = syscall(43, listener, 0, 0, 0, 0, 0).
+        while client == -4:
+            set client = syscall(43, listener, 0, 0, 0, 0, 0).
+        return client.
+
+operation LinuxTcpConnect:
+    accepts endpoint of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let connection = syscall(41, 2, 1, 0, 0, 0, 0).
+        if connection < 0:
+            return connection.
+        let connected = syscall(42, connection, endpoint, 16, 0, 0, 0).
+        if connected < 0:
+            LinuxClose(connection).
+            return connected.
+        return connection.
+
+# Filesystem Unix socket; caller supplies 110 writable sockaddr_un bytes.
+# Empty, embedded-NUL and overlong paths fail before socket creation.
+operation LinuxUnixConnect:
+    accepts path of type Bytes.
+    accepts scratch of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if len(path) == 0:
+            return -22.
+        if len(path) > 107:
+            return -36.
+        store8(scratch, u8(1)).
+        store8(scratch + 1, u8(0)).
+        let mut index = usize(0).
+        while index < len(path):
+            let value = byte(path, index).
+            if value == 0:
+                return -22.
+            store8(scratch + 2 + index, value).
+            set index = index + 1.
+        store8(scratch + 2 + index, u8(0)).
+        let connection = syscall(41, 1, 1, 0, 0, 0, 0).
+        if connection < 0:
+            return connection.
+        let connected = syscall(42, connection, scratch, len(path) + 3, 0, 0, 0).
+        if connected < 0:
+            LinuxClose(connection).
+            return connected.
+        return connection.

@@ -1,0 +1,8 @@
+[package]
+name = "sal_semfront"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sal_syntax = { path = "../sal_syntax" }
+sal_ir = { path = "../sal_ir" }

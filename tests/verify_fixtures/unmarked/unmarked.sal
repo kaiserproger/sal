@@ -1,0 +1,16 @@
+application VerifyApp.
+
+layer Allowed:
+  owns Helper.
+
+layer App:
+  owns ApiService.
+  may depend on Allowed.
+
+module Helper:
+  belongs to Allowed.
+
+service ApiService:
+  belongs to App.
+  requires:
+    Serve.

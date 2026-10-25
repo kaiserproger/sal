@@ -1,0 +1,22 @@
+application VerifyApp.
+
+layer Allowed:
+  owns Helper.
+
+layer App:
+  owns ApiService.
+  may depend on Allowed.
+
+layer Forbidden:
+  owns Secret.
+
+module Helper:
+  belongs to Allowed.
+
+module Secret:
+  belongs to Forbidden.
+
+service ApiService:
+  belongs to App.
+  requires:
+    Serve.

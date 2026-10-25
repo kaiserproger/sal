@@ -1,0 +1,16 @@
+# Linux x86-64 kernel sigaction ABI. No scratch allocation or byte packing.
+entity LinuxSignalAction:
+    layout "C".
+    has handler of type usize.
+    has flags of type u64.
+    has restorer of type usize.
+    has mask of type u64.
+
+# Explicit process-wide policy: writes to closed peers return -32 (EPIPE)
+# instead of terminating on SIGPIPE. Children inherit this disposition.
+operation LinuxIgnoreBrokenPipe:
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let action = LinuxSignalAction(usize(1), u64(0), usize(0), u64(0)).
+        return syscall(13, 13, address(action), 0, 8, 0, 0).

@@ -1,0 +1,1 @@
+My program is named TupoiServer. It listens on HTTP port 8081, support only HTTP/1 version. On receiving an request to /say/{what} address, it must return a plain-text response with "what" content.

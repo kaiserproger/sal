@@ -1,0 +1,149 @@
+use "linux/net.sal".
+use "linux/memory.sal".
+use "linux/process.sal".
+
+# Static dependency inversion: applications MUST define the real SAL operation
+# ServerDispatch(client:i64, arena:usize, arena_size:usize)->i64 with effects
+# SystemCall, UnsafeMemory. There is deliberately no default dispatcher.
+# It borrows the socket and private COW arena, handles one request, and returns
+# the child's exit status. It must not close/unmap these borrowed resources.
+# Call ServerRun/ServerServe as Main's return value, including in fork children.
+# This dedicated server process owns its children (wait4 uses pid=-1).
+
+# Retry only interrupted waits. Unexpected wait errors are never spun on.
+operation ServerWait:
+    accepts options of type i64.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mut result = syscall(61, -1, 0, options, 0, 0, 0).
+        while result == -4:
+            set result = syscall(61, -1, 0, options, 0, 0, 0).
+        return result.
+
+# Drain already exited children without blocking. ECHILD resets the count,
+# including when the caller inherited an auto-reaping SIGCHLD disposition.
+operation ServerReap:
+    accepts live of type i64.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mut remaining = live.
+        while remaining > 0:
+            let child = ServerWait(1).
+            if child == -10:
+                return 0.
+            if child < 0:
+                return child.
+            if child == 0:
+                return remaining.
+            set remaining = remaining - 1.
+        return 0.
+
+# Fatal parent path: stop accepting, drain owned children, release the mapping.
+# Socket timeouts bound blocked I/O, not arbitrary application computation.
+# Cleanup errors never replace the original failure; close is not retried
+# because Linux has already released the descriptor, even on EINTR.
+operation ServerFinish:
+    accepts listener of type i64.
+    accepts arena of type usize.
+    accepts arena_size of type usize.
+    accepts live of type i64.
+    accepts failure of type i64.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        LinuxClose(listener).
+        let mut remaining = live.
+        while remaining > 0:
+            let child = ServerWait(0).
+            if child < 0:
+                LinuxUnmapMemory(arena, arena_size).
+                return failure.
+            set remaining = remaining - 1.
+        LinuxUnmapMemory(arena, arena_size).
+        return failure.
+
+# Validation failures (-22) leave ownership with the caller. After validation,
+# consumes a valid listening fd and private writable mapping of arena_size bytes.
+# Every return closes/unmaps them. Dispatch may overwrite its whole private arena.
+# Accepted sockets use fixed-frame timevals; there are no per-connection mappings.
+# No logs, scheduler, hidden HTTP policy, or hidden compiler signal setup.
+operation ServerServe:
+    accepts listener of type i64.
+    accepts arena of type usize.
+    accepts arena_size of type usize.
+    accepts max_clients of type i64.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if listener < 0 || arena == 0 || arena_size < 4096 || max_clients < 1:
+            return -22.
+        let policy = LinuxIgnoreBrokenPipe().
+        if policy < 0:
+            return ServerFinish(listener, arena, arena_size, 0, policy).
+        let mut live = 0.
+        while true:
+            let reaped = ServerReap(live).
+            if reaped < 0:
+                return ServerFinish(listener, arena, arena_size, live, reaped).
+            set live = reaped.
+            if live == max_clients:
+                let child = ServerWait(0).
+                if child == -10:
+                    set live = 0.
+                    continue.
+                if child < 0:
+                    return ServerFinish(listener, arena, arena_size, live, child).
+                set live = live - 1.
+                continue.
+            let client = LinuxTcpAccept(listener).
+            if client < 0:
+                return ServerFinish(listener, arena, arena_size, live, client).
+            let timeout = LinuxSocketTimeouts(client, i64(5)).
+            if timeout < 0:
+                LinuxClose(client).
+                return ServerFinish(listener, arena, arena_size, live, timeout).
+            let child = syscall(57, 0, 0, 0, 0, 0, 0).
+            if child < 0:
+                LinuxClose(client).
+                return ServerFinish(listener, arena, arena_size, live, child).
+            if child == 0:
+                LinuxClose(listener).
+                let status = ServerDispatch(client, arena, arena_size).
+                LinuxClose(client).
+                LinuxUnmapMemory(arena, arena_size).
+                return status.
+            LinuxClose(client).
+            set live = live + 1.
+        return 0.
+
+# Map once, then transfer both resources to ServerServe exactly once. Port zero
+# is allowed; callers needing the assigned port can bind and call ServerServe.
+operation ServerRun:
+    accepts ipv4 of type u64.
+    accepts port of type i64.
+    accepts arena_size of type usize.
+    accepts max_clients of type i64.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if arena_size < 4096 || max_clients < 1:
+            return -22.
+        let mapped = LinuxMapMemory(arena_size).
+        if mapped < 0:
+            return mapped.
+        let arena = usize(mapped).
+        let endpoint = LinuxIpv4Address(arena, ipv4, port).
+        if endpoint < 0:
+            LinuxUnmapMemory(arena, arena_size).
+            return endpoint.
+        store8(arena + 16, u8(1)).
+        store8(arena + 17, u8(0)).
+        store8(arena + 18, u8(0)).
+        store8(arena + 19, u8(0)).
+        let listener = LinuxTcpListen(arena, arena + 16, max_clients).
+        if listener < 0:
+            LinuxUnmapMemory(arena, arena_size).
+            return listener.
+        return ServerServe(listener, arena, arena_size, max_clients).

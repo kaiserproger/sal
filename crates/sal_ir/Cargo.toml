@@ -1,0 +1,7 @@
+[package]
+name = "sal_ir"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sal_syntax = { path = "../sal_syntax" }

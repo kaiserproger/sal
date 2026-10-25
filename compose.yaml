@@ -1,0 +1,53 @@
+name: sal-warehouse
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: warehouse
+      POSTGRES_DB: warehouse
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command:
+      - postgres
+      - -c
+      - listen_addresses=
+      - -c
+      - unix_socket_directories=/run/postgresql
+      - -c
+      - unix_socket_permissions=0777
+    volumes:
+      - warehouse-data:/var/lib/postgresql/data
+      - ./.warehouse-state/socket:/run/postgresql
+      - ./apps/warehouse/sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "/run/postgresql", "-U", "warehouse", "-d", "warehouse"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    mem_limit: 512m
+    restart: unless-stopped
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${WAREHOUSE_BIND:-127.0.0.1}:${WAREHOUSE_PORT:-8080}:8080"
+    volumes:
+      - ./.warehouse-state/socket:/run/postgresql:ro
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 12
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 256m
+    restart: unless-stopped
+
+volumes:
+  warehouse-data:

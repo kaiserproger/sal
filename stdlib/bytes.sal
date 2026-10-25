@@ -1,0 +1,118 @@
+# Arbitrary bytes are not UTF-8 Text. Search results are byte offsets or -1.
+operation BytesStartsWith:
+    accepts data of type Bytes.
+    accepts prefix of type Bytes.
+    returns bool.
+    body:
+        if len(prefix) > len(data):
+            return false.
+        return slice(data, usize(0), len(prefix)) == prefix.
+
+operation BytesFind:
+    accepts data of type Bytes.
+    accepts needle of type Bytes.
+    returns i64.
+    body:
+        if len(needle) > len(data):
+            return -1.
+        let last = len(data) - len(needle).
+        let mut offset = usize(0).
+        while offset <= last:
+            let mut index = usize(0).
+            while index < len(needle) && byte(data, offset + index) == byte(needle, index):
+                set index = index + 1.
+            if index == len(needle):
+                return i64(offset).
+            set offset = offset + 1.
+        return -1.
+
+# Like memcpy: source and writable destination must not overlap.
+# Capacity is checked before any write; no terminator is appended.
+operation BytesCopy:
+    accepts destination of type usize.
+    accepts capacity of type usize.
+    accepts value of type Bytes.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        let count = len(value).
+        if count > capacity:
+            return -28.
+        let mut index = usize(0).
+        while index < count:
+            store8(destination + index, byte(value, index)).
+            set index = index + 1.
+        return i64(count).
+
+# Nonnegative decimal, including leading zeros; -22 malformed, -75 overflow.
+operation BytesParseDecimal:
+    accepts value of type Bytes.
+    returns i64.
+    body:
+        if len(value) == 0:
+            return -22.
+        let mut number = 0.
+        let mut index = usize(0).
+        while index < len(value):
+            let digit = byte(value, index).
+            if digit < 48 || digit > 57:
+                return -22.
+            let numeric = i64(digit) - 48.
+            if number > 922337203685477580:
+                return -75.
+            if number == 922337203685477580 && numeric > 7:
+                return -75.
+            set number = number * 10 + numeric.
+            set index = index + 1.
+        return number.
+
+# Full signed i64 decimal, including MIN, without negating MIN or allocating.
+# Insufficient capacity is -28 and leaves the output untouched.
+operation BytesDecimal:
+    accepts value of type i64.
+    accepts output of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        let mut number = value.
+        if value > 0:
+            set number = 0 - value.
+        let mut scan = number.
+        let mut digits = usize(1).
+        while scan <= -10:
+            set scan = scan / 10.
+            set digits = digits + 1.
+        let mut sign = usize(0).
+        if value < 0:
+            set sign = usize(1).
+        let count = digits + sign.
+        if count > capacity:
+            return -28.
+        let mut position = count.
+        while position > sign:
+            set position = position - 1.
+            let digit = 0 - number % 10.
+            store8(output + position, u8(48 + digit)).
+            set number = number / 10.
+        if sign == 1:
+            store8(output, u8(45)).
+        return i64(count).
+
+operation BytesHexDigit:
+    accepts value of type u8.
+    returns i64.
+    body:
+        if value < 48:
+            return -22.
+        if value <= 57:
+            return i64(value) - 48.
+        if value < 65:
+            return -22.
+        if value <= 70:
+            return i64(value) - 55.
+        if value < 97:
+            return -22.
+        if value <= 102:
+            return i64(value) - 87.
+        return -22.

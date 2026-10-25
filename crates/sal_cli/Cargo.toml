@@ -1,0 +1,16 @@
+[package]
+name = "sal_cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sal"
+path = "src/main.rs"
+
+[dependencies]
+sal_syntax = { path = "../sal_syntax" }
+sal_ir = { path = "../sal_ir" }
+sal_backend_rust = { path = "../sal_backend_rust" }
+sal_semfront = { path = "../sal_semfront" }
+sal_backend_exec = { path = "../sal_backend_exec" }
+sal_backend_native = { path = "../sal_backend_native" }

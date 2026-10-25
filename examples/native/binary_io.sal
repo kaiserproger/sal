@@ -1,0 +1,22 @@
+use "../../stdlib/linux/io.sal".
+use "../../stdlib/linux/memory.sal".
+
+operation Main:
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mapping = LinuxMapMemory(usize(4096)).
+        if mapping < 0:
+            return 1.
+        let buffer = usize(mapping).
+        store8(buffer, u8(65)).
+        store8(buffer + 1, u8(0)).
+        store8(buffer + 2, u8(255)).
+        store8(buffer + 3, u8(10)).
+        let written = LinuxWriteAll(1, bytes_at(buffer, usize(4))).
+        let unmapped = LinuxUnmapMemory(buffer, usize(4096)).
+        if written != 4:
+            return 2.
+        if unmapped != 0:
+            return 3.
+        return 0.

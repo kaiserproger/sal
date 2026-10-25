@@ -1,0 +1,256 @@
+use "std/bytes.sal".
+use "std/json.sal".
+use "std/postgres.sal".
+
+# Bounded JSON request decoder for POST /reserve and /release (needs_codes
+# true) and POST /stock (needs_codes false). One root traversal built on the
+# shared JSON scanning primitives; unknown fields are validated with
+# JsonValueEnd and then ignored. No SQL interpolation: success yields a
+# contiguous PG text Bind parameter block in the caller arena.
+#
+# Status: 0 success, 400 invalid request, 413 explicit size/count/capacity
+# limit (body over 65536 bytes, more than 64 codes, a code over 128 decoded
+# bytes, or arena capacity too small). Lower-bound and shape violations (empty
+# array, empty code, NUL byte, duplicates, wrong JSON types or grammar) are
+# 400. On error the remaining fields are not useful; the arena may hold
+# partial work. Negative JSON helper errors map to 400 except -28 capacity,
+# which maps to 413.
+#
+# Parameter block: the first parameter is always the warehouse ID as a fixed
+# 19-digit zero-padded decimal (PG bigint accepts leading zeros), framed as a
+# BE32 length of 19 plus 19 digits, 23 bytes total. Codes follow in request
+# order, each framed as BE32 length plus decoded UTF-8 bytes. parameter_count
+# is code_count + 1 (stock mode: code_count 0, one parameter). The consumer
+# reads the leading BE32 length rather than assuming the fixed width.
+#
+# Zero-copy placement: each code is decoded directly into its final payload
+# position (cursor + 4) and PgPutParameter writes the length prefix in place,
+# using the pinned postgres contract's exact self placement support. The ID
+# placeholder is reserved up front so codes arriving before warehouse_id need
+# no payload move; the digits are filled in once the whole object validates.
+# Duplicate codes are found by re-walking the contiguous block already written
+# (at most 64 entries); matches are byte-exact AFTER escape decoding, so "A"
+# and "\u0041" collide. No per-code allocation or hash structures.
+#
+# Field names are matched after escape decoding ("wareh\u006fuse_id" counts),
+# and a repeated recognized field is 400 including across spelling variants.
+# In stock mode "codes" is an ordinary unknown field: validated, then ignored.
+# Metadata needs are bounded: a 32-byte key buffer at the arena top, so the
+# minimum capacity is 55 bytes (23 parameter plus 32 key). Key decode output
+# and code payloads never overlap the unread input; the caller owns that
+# aliasing discipline.
+entity WarehouseRequest:
+    layout "C".
+    has status of type i64.
+    has warehouse_id of type i64.
+    has code_count of type i64.
+    has parameters of type usize.
+    has parameter_bytes of type usize.
+
+operation WarehouseDecodeRequest:
+    accepts body of type Bytes.
+    accepts needs_codes of type bool.
+    accepts arena of type usize.
+    accepts capacity of type usize.
+    returns WarehouseRequest.
+    effects: UnsafeMemory.
+    body:
+        if capacity > usize(9223372036854775807):
+            return WarehouseRequest(413, 0, 0, arena, usize(0)).
+        if len(body) > 65536:
+            return WarehouseRequest(413, 0, 0, arena, usize(0)).
+        if capacity < 55:
+            return WarehouseRequest(413, 0, 0, arena, usize(0)).
+        let limit = arena + capacity - 32.
+        let key_output = arena + capacity - 32.
+        store8(arena, u8(0)).
+        store8(arena + 1, u8(0)).
+        store8(arena + 2, u8(0)).
+        store8(arena + 3, u8(19)).
+        let mut index = usize(0).
+        while index < 19:
+            store8(arena + 4 + index, u8(48)).
+            set index = index + 1.
+        let mut cursor = arena + 23.
+        let mut warehouse_id = 1.
+        let mut seen_id = false.
+        let mut seen_codes = false.
+        let mut code_count = 0.
+        let skipped = JsonWhitespaceEnd(body, usize(0)).
+        if skipped < 0:
+            return WarehouseRequest(400, 0, 0, arena, usize(0)).
+        let mut offset = usize(skipped).
+        if offset >= len(body):
+            return WarehouseRequest(400, 0, 0, arena, usize(0)).
+        if byte(body, offset) != 123:
+            return WarehouseRequest(400, 0, 0, arena, usize(0)).
+        set offset = offset + 1.
+        let head = JsonWhitespaceEnd(body, offset).
+        if head < 0:
+            return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+        set offset = usize(head).
+        if offset >= len(body):
+            return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+        if byte(body, offset) != 125:
+            while true:
+                let fieldPad = JsonWhitespaceEnd(body, offset).
+                if fieldPad < 0:
+                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                set offset = usize(fieldPad).
+                if offset >= len(body):
+                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                if byte(body, offset) != 34:
+                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                let key_end = JsonStringEnd(body, offset).
+                if key_end < 0:
+                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                let decoded = JsonDecodeString(body, offset, key_output, usize(32)).
+                if decoded < 0 && decoded != -28:
+                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                let mut known = 0.
+                if decoded == 12 && bytes_at(key_output, usize(12)) == bytes("warehouse_id"):
+                    set known = 1.
+                if decoded == 5 && bytes_at(key_output, usize(5)) == bytes("codes"):
+                    set known = 2.
+                let colon = JsonWhitespaceEnd(body, usize(key_end)).
+                if colon < 0:
+                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                set offset = usize(colon).
+                if offset >= len(body):
+                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                if byte(body, offset) != 58:
+                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                set offset = offset + 1.
+                let mark = JsonWhitespaceEnd(body, offset).
+                if mark < 0:
+                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                set offset = usize(mark).
+                if offset >= len(body):
+                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                if known == 1:
+                    if seen_id:
+                        return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                    let num_end = JsonNumberEnd(body, offset).
+                    if num_end < 0:
+                        return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                    let parsed = JsonUnsigned(slice(body, offset, usize(num_end) - offset)).
+                    if parsed < 1:
+                        return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                    set warehouse_id = parsed.
+                    set seen_id = true.
+                    set offset = usize(num_end).
+                else:
+                    if known == 2 && needs_codes:
+                        if seen_codes:
+                            return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                        if byte(body, offset) != 91:
+                            return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                        set offset = offset + 1.
+                        let edge = JsonWhitespaceEnd(body, offset).
+                        if edge < 0:
+                            return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                        set offset = usize(edge).
+                        if offset >= len(body):
+                            return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                        if byte(body, offset) == 93:
+                            return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                        while true:
+                            if code_count == 64:
+                                return WarehouseRequest(413, 0, 0, arena, cursor - arena).
+                            if offset >= len(body):
+                                return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                            if byte(body, offset) != 34:
+                                return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                            let elem_end = JsonStringEnd(body, offset).
+                            if elem_end < 0:
+                                return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                            let head_room = cursor + 4.
+                            if head_room > limit:
+                                return WarehouseRequest(413, 0, 0, arena, cursor - arena).
+                            let room = limit - head_room.
+                            let mut width = room.
+                            if width > 129:
+                                set width = usize(129).
+                            let part = JsonDecodeString(body, offset, head_room, width).
+                            if part == -28:
+                                return WarehouseRequest(413, 0, 0, arena, cursor - arena).
+                            if part < 1:
+                                return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                            if part > 128:
+                                return WarehouseRequest(413, 0, 0, arena, cursor - arena).
+                            let image = bytes_at(head_room, usize(part)).
+                            let mut probe = usize(0).
+                            while probe < usize(part):
+                                if byte(image, probe) == 0:
+                                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                                set probe = probe + 1.
+                            let mut earlier = arena + 23.
+                            while earlier < cursor:
+                                let eview = bytes_at(earlier, usize(4)).
+                                let elen = usize(byte(eview, usize(0))) * 16777216 + usize(byte(eview, usize(1))) * 65536 + usize(byte(eview, usize(2))) * 256 + usize(byte(eview, usize(3))).
+                                if elen == usize(part):
+                                    if bytes_at(earlier + 4, elen) == image:
+                                        return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                                set earlier = earlier + 4 + elen.
+                            let placed = PgPutParameter(image, cursor, limit - cursor).
+                            if placed < 0:
+                                if placed == -28:
+                                    return WarehouseRequest(413, 0, 0, arena, cursor - arena).
+                                return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                            if placed != part + 4:
+                                return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                            set cursor = cursor + usize(placed).
+                            set code_count = code_count + 1.
+                            let after = JsonWhitespaceEnd(body, usize(elem_end)).
+                            if after < 0:
+                                return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                            set offset = usize(after).
+                            if offset >= len(body):
+                                return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                            if byte(body, offset) == 44:
+                                set offset = offset + 1.
+                                let gap = JsonWhitespaceEnd(body, offset).
+                                if gap < 0:
+                                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                                set offset = usize(gap).
+                                continue.
+                            if byte(body, offset) == 93:
+                                set offset = offset + 1.
+                                break.
+                            return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                        set seen_codes = true.
+                    else:
+                        let ignored = JsonValueEnd(body, offset, usize(63)).
+                        if ignored < 0:
+                            return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                        set offset = usize(ignored).
+                let sep = JsonWhitespaceEnd(body, offset).
+                if sep < 0:
+                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                set offset = usize(sep).
+                if offset >= len(body):
+                    return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+                if byte(body, offset) == 44:
+                    set offset = offset + 1.
+                    continue.
+                if byte(body, offset) == 125:
+                    set offset = offset + 1.
+                    break.
+                return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+        if needs_codes && !seen_codes:
+            return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+        if !needs_codes && !seen_id:
+            return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+        let tail = JsonWhitespaceEnd(body, offset).
+        if tail != i64(len(body)):
+            return WarehouseRequest(400, 0, 0, arena, cursor - arena).
+        let mut divisor = 1000000000000000000.
+        let mut position = usize(0).
+        let mut rest = warehouse_id.
+        while position < 19:
+            let digit = rest / divisor.
+            store8(arena + 4 + position, u8(48 + digit)).
+            set rest = rest % divisor.
+            set divisor = divisor / 10.
+            set position = position + 1.
+        return WarehouseRequest(0, warehouse_id, code_count, arena, cursor - arena).

@@ -1,0 +1,6 @@
+.git
+.omp
+target
+build
+.warehouse-state
+**/__pycache__

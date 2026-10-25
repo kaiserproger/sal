@@ -1,0 +1,22 @@
+use "warehouse.sal".
+
+operation WarehouseDatabaseSocket:
+    returns Bytes.
+    body:
+        return bytes("/run/postgresql/.s.PGSQL.5432").
+
+operation WarehouseDatabaseName:
+    returns Bytes.
+    body:
+        return bytes("warehouse").
+
+operation WarehouseDatabaseUser:
+    returns Bytes.
+    body:
+        return bytes("warehouse").
+
+operation Main:
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        return ServerRun(u64(0), i64(8080), usize(2097152), i64(32)).

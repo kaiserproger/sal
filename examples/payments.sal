@@ -1,0 +1,56 @@
+# SAL example: PaymentSystem (valid).
+# Every statement ends with `.`; block headers end with `:`.
+
+application PaymentSystem.
+
+entity Account:
+  has id of type UUID.
+  has owner of type String.
+  has balance of type Money<USD>.
+  invariant Balance is never negative.
+
+entity Transfer:
+  has id of type UUID.
+  has source of type String.
+  has destination of type String.
+  has amount of type Money<USD>.
+  invariant Amount is positive.
+
+layer Domain:
+  owns Account.
+  owns Transfer.
+
+layer Application:
+  owns TransferService.
+  owns TransferFunds.
+  may depend on Domain.
+  must not depend on Infrastructure.
+
+layer Infrastructure:
+  owns PostgresLedger.
+  may depend on Domain.
+  may depend on Application.
+
+service TransferService:
+  belongs to Application.
+  requires:
+    Source account exists.
+    Sufficient funds available.
+  ensures:
+    Transfer is recorded.
+  execution must be atomic.
+  allowed effects:
+    DatabaseWrite.
+
+operation TransferFunds:
+  accepts source of type String.
+  accepts destination of type String.
+  accepts amount of type Money<USD>.
+  returns String.
+  effects: DatabaseWrite.
+
+module PostgresLedger:
+  belongs to Infrastructure.
+  may read Transfer.
+  may modify Transfer.
+  forbids HTTPAccess.

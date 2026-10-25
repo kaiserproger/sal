@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/sal_syntax", "crates/sal_ir", "crates/sal_backend_rust", "crates/sal_semfront", "crates/sal_backend_exec", "crates/sal_backend_native", "crates/sal_cli"]
+resolver = "2"

@@ -1,0 +1,258 @@
+# Synthetic sequential hot-field layout experiment, not warehouse throughput.
+# Linux x86-64 only; all allocation, initialization, warmup and cleanup are SAL.
+# stdin: exactly three bytes: layout d/a, profile s/l, counters t/p.
+# d = dense; a = wider AoS; s = small correctness case; l = large experiment.
+# t = clock only; p = perf stat control protocol on fd 3 (control), 4 (ack).
+# Example inputs: dst, ast, dlt, alt, dlp, alp. No newline is required.
+#
+# Large profile: 134217728 records, 2 warmups, 8 measured traversals.
+# Dense: stride 2, mapping 268435456 bytes (256 MiB).
+# AoS: stride 16, mapping 2147483648 bytes (2 GiB).
+# Both touch the same 268435456 hot bytes per traversal. Cold bytes and padding
+# remain anonymous-mapping zeros; initialization writes every mapped page.
+# Increase the large record count (a multiple of 256) if 256 MiB is not beyond
+# the selected CPU's LLC. Require ample free RAM and no swapping for both runs.
+# Small profile: 256 records, 1 warmup, 2 measured traversals; NOT performance.
+#
+# One shared kernel takes a runtime stride: identical loads, arithmetic, branch
+# and loop control for both layouts. No allocation or initialization is timed.
+# Per 256 records the checksum is 130688; each traversal resets its accumulator.
+# Large per-pass checksum: 68518150144; measured sum: 548145201152.
+# Small per-pass checksum: 130688; measured sum: 261376.
+# Counts <= 2^30 and repeats <= 64 bound even the worst-case loaded-byte sum
+# below 2^47, so no accumulator overflow or reliance on wrapping arithmetic.
+#
+# perf p mode expects perf stat --delay=-1 --control=fifo:CONTROL,ACK.
+# The shell launched by perf opens CONTROL for writing as fd 3 and ACK for
+# reading as fd 4, then execs this executable. Counter enable/disable is acked.
+# Counters cover the timed repeat loop plus clock/control boundary overhead;
+# elapsed_ns covers the repeat loop only (including calls/loop bookkeeping).
+# Output follows counter disable. All mapped data is unmapped on handled exits.
+# Exit codes: 1 input/config/layout; 2 mmap; 3 checksum; 4 clock; 5 perf control;
+# 6 output; 7 munmap. Linux OOM killing cannot execute application cleanup.
+
+use "../../stdlib/linux/memory.sal".
+use "../../stdlib/linux/io.sal".
+use "../../stdlib/bytes.sal".
+
+entity DenseHot:
+    layout "C".
+    has value of type u8.
+    has tag of type u8.
+
+entity WideHot:
+    layout "C".
+    has value of type u8.
+    has tag of type u8.
+    has cold of type u64.
+
+entity LayoutInput:
+    layout "C".
+    has layout of type u8.
+    has profile of type u8.
+    has counters of type u8.
+
+entity LayoutTimespec:
+    layout "C".
+    has seconds of type i64.
+    has nanoseconds of type i64.
+
+# 24 writable stack bytes, sufficient for a signed i64 decimal or perf ack.
+entity LayoutScratch:
+    layout "C".
+    has first of type u64.
+    has second of type u64.
+    has third of type u64.
+
+operation LayoutInitialize:
+    accepts base of type usize.
+    accepts count of type usize.
+    accepts stride of type usize.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        let mut cursor = base.
+        let mut index = usize(0).
+        while index < count:
+            let value = u8(index % 256).
+            store8(cursor, value).
+            store8(cursor + 1, u8(255 - i64(value))).
+            set cursor = cursor + stride.
+            set index = index + 1.
+        return 0.
+
+operation LayoutChecksum:
+    accepts base of type usize.
+    accepts count of type usize.
+    accepts stride of type usize.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        let mut checksum = i64(0).
+        let mut cursor = base.
+        let mut index = usize(0).
+        while index < count:
+            let value = i64(load8(cursor)).
+            let tag = i64(load8(cursor + 1)).
+            set checksum = checksum + value * 3 + tag.
+            if tag < 128:
+                set checksum = checksum + 1.
+            set cursor = cursor + stride.
+            set index = index + 1.
+        return checksum.
+
+operation LayoutRepeat:
+    accepts base of type usize.
+    accepts count of type usize.
+    accepts stride of type usize.
+    accepts repeats of type i64.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        let mut total = i64(0).
+        let mut iteration = i64(0).
+        while iteration < repeats:
+            set total = total + LayoutChecksum(base, count, stride).
+            set iteration = iteration + 1.
+        return total.
+
+operation LayoutClock:
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let stamp = LayoutTimespec(i64(0), i64(0)).
+        # clock_gettime(CLOCK_MONOTONIC, &stamp), not wall-clock time.
+        let result = syscall(228, 1, address(stamp), 0, 0, 0, 0).
+        if result < 0:
+            return result.
+        if stamp.seconds < 0 || stamp.seconds > 9223372035:
+            return -75.
+        if stamp.nanoseconds < 0 || stamp.nanoseconds >= 1000000000:
+            return -22.
+        return stamp.seconds * 1000000000 + stamp.nanoseconds.
+
+operation LayoutPerf:
+    accepts command of type Text.
+    returns bool.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let ack = LayoutScratch(u64(0), u64(0), u64(0)).
+        if LinuxWriteAll(3, bytes(command)) != i64(len(command)):
+            return false.
+        # perf's control protocol acknowledges with "ack\n" plus its NUL.
+        if LinuxReadExact(4, address(ack), usize(5)) != 5:
+            return false.
+        return bytes_at(address(ack), usize(5)) == bytes("ack\n\u{0}").
+
+operation LayoutPrint:
+    accepts label of type Text.
+    accepts value of type i64.
+    returns bool.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let buffer = LayoutScratch(u64(0), u64(0), u64(0)).
+        let length = BytesDecimal(value, address(buffer), size_of(LayoutScratch)).
+        if length < 0:
+            return false.
+        if LinuxWriteAll(1, bytes(label)) != i64(len(label)):
+            return false.
+        if LinuxWriteAll(1, bytes_at(address(buffer), usize(length))) != length:
+            return false.
+        return LinuxWriteAll(1, bytes("\n")) == 1.
+
+operation LayoutMeasure:
+    accepts base of type usize.
+    accepts count of type usize.
+    accepts stride of type usize.
+    accepts warmups of type i64.
+    accepts repeats of type i64.
+    accepts perf of type bool.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let initialized = LayoutInitialize(base, count, stride).
+        let expected = i64(count / 256) * 130688.
+        let mut iteration = i64(0).
+        while iteration < warmups:
+            if LayoutChecksum(base, count, stride) != expected:
+                return 3.
+            set iteration = iteration + 1.
+        if perf:
+            if !LayoutPerf("enable\n"):
+                return 5.
+        let start = LayoutClock().
+        if start < 0:
+            if perf:
+                let disabled = LayoutPerf("disable\n").
+            return 4.
+        let checksum = LayoutRepeat(base, count, stride, repeats).
+        let finish = LayoutClock().
+        if perf:
+            if !LayoutPerf("disable\n"):
+                return 5.
+        if finish < start:
+            return 4.
+        if checksum != expected * repeats:
+            return 3.
+        if !LayoutPrint("records=", i64(count)):
+            return 6.
+        if !LayoutPrint("stride_bytes=", i64(stride)):
+            return 6.
+        if !LayoutPrint("mapping_bytes=", i64(count * stride)):
+            return 6.
+        if !LayoutPrint("warmups=", warmups):
+            return 6.
+        if !LayoutPrint("repeats=", repeats):
+            return 6.
+        if !LayoutPrint("checksum_per_pass=", expected):
+            return 6.
+        if !LayoutPrint("checksum_sum=", checksum):
+            return 6.
+        if !LayoutPrint("elapsed_ns=", finish - start):
+            return 6.
+        return 0.
+
+operation Main:
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let input = LayoutInput(u8(0), u8(0), u8(0)).
+        if LinuxReadExact(0, address(input), usize(3)) != 3:
+            return 1.
+        if input.layout != 100 && input.layout != 97:
+            return 1.
+        if input.profile != 115 && input.profile != 108:
+            return 1.
+        if input.counters != 116 && input.counters != 112:
+            return 1.
+        if size_of(DenseHot) != 2 || size_of(WideHot) != 16:
+            return 1.
+        if offset_of(DenseHot, "value") != 0 || offset_of(WideHot, "value") != 0:
+            return 1.
+        if offset_of(DenseHot, "tag") != 1 || offset_of(WideHot, "tag") != 1:
+            return 1.
+        if offset_of(WideHot, "cold") != 8:
+            return 1.
+        let mut count = usize(134217728).
+        let mut warmups = i64(2).
+        let mut repeats = i64(8).
+        if input.profile == 115:
+            set count = usize(256).
+            set warmups = i64(1).
+            set repeats = i64(2).
+        if count == 0 || count > 1073741824 || count % 256 != 0:
+            return 1.
+        if warmups < 1 || repeats < 1 || repeats > 64:
+            return 1.
+        let mut stride = size_of(DenseHot).
+        if input.layout == 97:
+            set stride = size_of(WideHot).
+        let length = count * stride.
+        let mapping = LinuxMapMemory(length).
+        if mapping < 0:
+            return 2.
+        let result = LayoutMeasure(usize(mapping), count, stride, warmups, repeats, input.counters == 112).
+        let unmapped = LinuxUnmapMemory(usize(mapping), length).
+        if unmapped != 0:
+            return 7.
+        return result.

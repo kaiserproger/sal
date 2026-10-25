@@ -1,0 +1,683 @@
+# PostgreSQL wire protocol, trust-only local sockets. No libpq, no hidden runtime.
+# Caller owns the Unix fd and every buffer; any transport or protocol error means
+# the caller closes the fd with no retry. Short references cite message shapes from
+# https://www.postgresql.org/docs/current/protocol.html and its message-flow page.
+use "bytes.sal".
+use "linux/io.sal".
+
+# Borrowed validated DataRow field. pointer/length borrow message storage and die
+# at the next read into the same buffer. NULL is pointer 0 length -1. Malformed
+# or missing index is pointer 0 length -71. Fixed C frame, no heap.
+entity PgField:
+    layout "C".
+    has pointer of type usize.
+    has length of type i64.
+
+# Bounded big-endian cursor helpers shared by packet building and validation.
+operation PgReadU16:
+    accepts message of type Bytes.
+    accepts offset of type usize.
+    returns i64.
+    body:
+        if offset > len(message):
+            return -71.
+        if len(message) - offset < usize(2):
+            return -71.
+        return i64(byte(message, offset)) * 256 + i64(byte(message, offset + usize(1))).
+
+operation PgReadU32:
+    accepts message of type Bytes.
+    accepts offset of type usize.
+    returns i64.
+    body:
+        if offset > len(message):
+            return -71.
+        if len(message) - offset < usize(4):
+            return -71.
+        return i64(byte(message, offset)) * 16777216 + i64(byte(message, offset + usize(1))) * 65536 + i64(byte(message, offset + usize(2))) * 256 + i64(byte(message, offset + usize(3))).
+
+# End offset one past the NUL, or -71 when start is out of bounds or unterminated.
+operation PgCStringEnd:
+    accepts message of type Bytes.
+    accepts start of type usize.
+    returns i64.
+    body:
+        if start >= len(message):
+            return -71.
+        let mut offset = start.
+        while offset < len(message):
+            if byte(message, offset) == 0:
+                return i64(offset + usize(1)).
+            set offset = offset + usize(1).
+        return -71.
+
+operation PgWrite16:
+    accepts output of type usize.
+    accepts capacity of type usize.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        if output == usize(0):
+            return -22.
+        if value < 0 || value > 65535:
+            return -22.
+        if offset > capacity:
+            return -28.
+        if capacity - offset < usize(2):
+            return -28.
+        store8(output + offset, u8(value / 256)).
+        store8(output + offset + usize(1), u8(value % 256)).
+        return 2.
+
+operation PgWrite32:
+    accepts output of type usize.
+    accepts capacity of type usize.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        if output == usize(0):
+            return -22.
+        if value < -1:
+            return -22.
+        if value > 2147483647:
+            return -75.
+        if offset > capacity:
+            return -28.
+        if capacity - offset < usize(4):
+            return -28.
+        if value == -1:
+            store8(output + offset, u8(255)).
+            store8(output + offset + usize(1), u8(255)).
+            store8(output + offset + usize(2), u8(255)).
+            store8(output + offset + usize(3), u8(255)).
+            return 4.
+        store8(output + offset, u8(value / 16777216)).
+        store8(output + offset + usize(1), u8(value / 65536 % 256)).
+        store8(output + offset + usize(2), u8(value / 256 % 256)).
+        store8(output + offset + usize(3), u8(value % 256)).
+        return 4.
+
+operation PgPutNull:
+    accepts output of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        return PgWrite32(output, capacity, usize(0), -1).
+
+# SQL data, never query interpolation. Zero, embedded quotes, and Unicode pass
+# through as data. Exact self placement (address(value) == output + 4) writes only
+# the length prefix and skips the payload copy so callers can decode directly
+# into output + 4; every other overlap needs disjoint input and output.
+operation PgPutParameter:
+    accepts value of type Bytes.
+    accepts output of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        if output == usize(0):
+            return -22.
+        if len(value) > usize(2147483647):
+            return -75.
+        let count = len(value).
+        if usize(4) + count > capacity:
+            return -28.
+        let written = PgWrite32(output, capacity, usize(0), i64(count)).
+        if written < 0:
+            return written.
+        if address(value) == output + usize(4):
+            return i64(usize(4) + count).
+        let mut index = usize(0).
+        while index < count:
+            store8(output + usize(4) + index, byte(value, index)).
+            set index = index + usize(1).
+        return i64(usize(4) + count).
+
+# Exact type + BE32 length + payload. Returns total bytes including type/length.
+# Length must be 4..2147483647 or -71. Total beyond capacity is -28 and the caller
+# closes with no resync. Transport and EOF errors propagate unchanged.
+operation PgReadMessage:
+    accepts fd of type i64.
+    accepts scratch of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if fd < 0:
+            return -22.
+        if scratch == usize(0):
+            return -22.
+        if capacity > usize(9223372036854775807):
+            return -22.
+        if capacity < usize(5):
+            return -28.
+        let header = LinuxReadExact(fd, scratch, usize(5)).
+        if header < 0:
+            return header.
+        let length = i64(load8(scratch + usize(1))) * 16777216 + i64(load8(scratch + usize(2))) * 65536 + i64(load8(scratch + usize(3))) * 256 + i64(load8(scratch + usize(4))).
+        if length < 4 || length > 2147483647:
+            return -71.
+        let total = usize(length) + usize(1).
+        if total > capacity:
+            return -28.
+        if total == usize(5):
+            return 5.
+        let rest = LinuxReadExact(fd, scratch + usize(5), total - usize(5)).
+        if rest < 0:
+            return rest.
+        return i64(total).
+
+# Positive packed BE SQLSTATE of the C field, or -71 when the ErrorResponse is
+# malformed. Five ASCII uppercase/digits pack to more than 4095, distinct from
+# Linux errno; callers keep the stable server error as its negation.
+operation PgErrorCode:
+    accepts message of type Bytes.
+    returns i64.
+    body:
+        if len(message) < usize(5):
+            return -71.
+        if byte(message, usize(0)) != 69:
+            return -71.
+        let length = PgReadU32(message, usize(1)).
+        if length < 4:
+            return -71.
+        if usize(length) + usize(1) != len(message):
+            return -71.
+        let mut offset = usize(5).
+        let mut found = false.
+        let mut code = 0.
+        while offset < len(message):
+            let field = byte(message, offset).
+            if field == 0:
+                if offset + usize(1) == len(message):
+                    break.
+                return -71.
+            let end = PgCStringEnd(message, offset + usize(1)).
+            if end < 0:
+                return -71.
+            if field == 67 && !found:
+                if usize(end) - offset != usize(7):
+                    return -71.
+                let c0 = byte(message, offset + usize(1)).
+                let c1 = byte(message, offset + usize(2)).
+                let c2 = byte(message, offset + usize(3)).
+                let c3 = byte(message, offset + usize(4)).
+                let c4 = byte(message, offset + usize(5)).
+                if (c0 < 48 || c0 > 57) && (c0 < 65 || c0 > 90):
+                    return -71.
+                if (c1 < 48 || c1 > 57) && (c1 < 65 || c1 > 90):
+                    return -71.
+                if (c2 < 48 || c2 > 57) && (c2 < 65 || c2 > 90):
+                    return -71.
+                if (c3 < 48 || c3 > 57) && (c3 < 65 || c3 > 90):
+                    return -71.
+                if (c4 < 48 || c4 > 57) && (c4 < 65 || c4 > 90):
+                    return -71.
+                set code = i64(c0) * 4294967296 + i64(c1) * 16777216 + i64(c2) * 65536 + i64(c3) * 256 + i64(c4).
+                set found = true.
+            set offset = usize(end).
+        if !found:
+            return -71.
+        if code <= 4095:
+            return -71.
+        return code.
+
+# Borrowed validated DataRow view. Every field is validated even when only one is
+# selected, so trailing or truncated bytes fail closed instead of leaking.
+operation PgRowField:
+    accepts message of type Bytes.
+    accepts index of type i64.
+    returns PgField.
+    effects: UnsafeMemory.
+    body:
+        if index < 0 || index > 32767:
+            return PgField(usize(0), -71).
+        if len(message) < usize(7):
+            return PgField(usize(0), -71).
+        if byte(message, usize(0)) != 68:
+            return PgField(usize(0), -71).
+        let length = PgReadU32(message, usize(1)).
+        if length < 4:
+            return PgField(usize(0), -71).
+        if usize(length) + usize(1) != len(message):
+            return PgField(usize(0), -71).
+        let count = PgReadU16(message, usize(5)).
+        if count < 0 || count > 32767:
+            return PgField(usize(0), -71).
+        let base = address(message).
+        let mut offset = usize(7).
+        let mut number = 0.
+        let mut pointer = usize(0).
+        let mut size = -71.
+        let mut found = false.
+        while number < count:
+            if offset > len(message):
+                return PgField(usize(0), -71).
+            if len(message) - offset < usize(4):
+                return PgField(usize(0), -71).
+            let raw = PgReadU32(message, offset).
+            if raw < 0:
+                return PgField(usize(0), -71).
+            if raw == 4294967295:
+                if number == index:
+                    set pointer = usize(0).
+                    set size = -1.
+                    set found = true.
+                set offset = offset + usize(4).
+                set number = number + 1.
+                continue.
+            if usize(raw) > len(message) - offset - usize(4):
+                return PgField(usize(0), -71).
+            if number == index:
+                set pointer = base + offset + usize(4).
+                set size = raw.
+                set found = true.
+            set offset = offset + usize(4) + usize(raw).
+            set number = number + 1.
+        if offset != len(message):
+            return PgField(usize(0), -71).
+        if !found:
+            return PgField(usize(0), -71).
+        return PgField(pointer, size).
+
+# Unnamed Parse + Bind(all text params, all text results) + Execute(portal "",
+# maxrows 0) + Sync. No Describe is emitted, so the server replies ParseComplete
+# then BindComplete, never an unsolicited RowDescription. The whole packet is
+# built before any network output; any validation failure writes nothing.
+operation PgSendQuery:
+    accepts fd of type i64.
+    accepts query of type Bytes.
+    accepts parameter_count of type i64.
+    accepts parameters of type Bytes.
+    accepts scratch of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if fd < 0:
+            return -22.
+        if scratch == usize(0):
+            return -22.
+        if capacity > usize(9223372036854775807):
+            return -22.
+        if parameter_count < 0 || parameter_count > 32767:
+            return -22.
+        if len(query) == usize(0):
+            return -22.
+        let mut scan = usize(0).
+        while scan < len(query):
+            if byte(query, scan) == 0:
+                return -22.
+            set scan = scan + usize(1).
+        let mut cursor = usize(0).
+        let mut number = 0.
+        while number < parameter_count:
+            if len(parameters) - cursor < usize(4):
+                return -22.
+            let raw = PgReadU32(parameters, cursor).
+            if raw < 0:
+                return -22.
+            if raw == 4294967295:
+                set cursor = cursor + usize(4).
+                set number = number + 1.
+                continue.
+            if raw > 2147483647:
+                return -22.
+            if usize(raw) > len(parameters) - cursor - usize(4):
+                return -22.
+            set cursor = cursor + usize(4) + usize(raw).
+            set number = number + 1.
+        if cursor != len(parameters):
+            return -22.
+        let query_length = len(query).
+        let parameter_bytes = len(parameters).
+        if query_length > usize(2147483639):
+            return -75.
+        if parameter_bytes > usize(2147483635):
+            return -75.
+        let total = usize(37) + query_length + parameter_bytes.
+        if total > usize(2147483647):
+            return -75.
+        if total > capacity:
+            return -28.
+        let mut offset = usize(0).
+        store8(scratch + offset, u8(80)).
+        set offset = offset + usize(1).
+        let parse_length = i64(query_length) + 8.
+        let mut placed = PgWrite32(scratch, capacity, offset, parse_length).
+        if placed < 0:
+            return placed.
+        set offset = offset + usize(placed).
+        store8(scratch + offset, u8(0)).
+        set offset = offset + usize(1).
+        let mut copied = BytesCopy(scratch + offset, capacity - offset, query).
+        if copied < 0:
+            return copied.
+        set offset = offset + usize(copied).
+        store8(scratch + offset, u8(0)).
+        set offset = offset + usize(1).
+        set placed = PgWrite16(scratch, capacity, offset, 0).
+        if placed < 0:
+            return placed.
+        set offset = offset + usize(placed).
+        store8(scratch + offset, u8(66)).
+        set offset = offset + usize(1).
+        let bind_length = i64(parameter_bytes) + 12.
+        set placed = PgWrite32(scratch, capacity, offset, bind_length).
+        if placed < 0:
+            return placed.
+        set offset = offset + usize(placed).
+        store8(scratch + offset, u8(0)).
+        store8(scratch + offset + usize(1), u8(0)).
+        set offset = offset + usize(2).
+        set placed = PgWrite16(scratch, capacity, offset, 0).
+        if placed < 0:
+            return placed.
+        set offset = offset + usize(placed).
+        set placed = PgWrite16(scratch, capacity, offset, parameter_count).
+        if placed < 0:
+            return placed.
+        set offset = offset + usize(placed).
+        set copied = BytesCopy(scratch + offset, capacity - offset, parameters).
+        if copied < 0:
+            return copied.
+        set offset = offset + usize(copied).
+        set placed = PgWrite16(scratch, capacity, offset, 0).
+        if placed < 0:
+            return placed.
+        set offset = offset + usize(placed).
+        store8(scratch + offset, u8(69)).
+        set offset = offset + usize(1).
+        set placed = PgWrite32(scratch, capacity, offset, 9).
+        if placed < 0:
+            return placed.
+        set offset = offset + usize(placed).
+        store8(scratch + offset, u8(0)).
+        store8(scratch + offset + usize(1), u8(0)).
+        store8(scratch + offset + usize(2), u8(0)).
+        store8(scratch + offset + usize(3), u8(0)).
+        store8(scratch + offset + usize(4), u8(0)).
+        set offset = offset + usize(5).
+        store8(scratch + offset, u8(83)).
+        set offset = offset + usize(1).
+        set placed = PgWrite32(scratch, capacity, offset, 4).
+        if placed < 0:
+            return placed.
+        set offset = offset + usize(placed).
+        if offset != total:
+            return -71.
+        let sent = LinuxWriteAll(fd, bytes_at(scratch, total)).
+        if sent < 0:
+            return sent.
+        return i64(total).
+
+# Trust-only handshake. Sends StartupMessage(protocol 196608, user, database,
+# client_encoding UTF8) then reads until AuthenticationOk and idle ReadyForQuery.
+# Any other authentication including MD5/SCRAM is -95. Server errors return the
+# negated packed SQLSTATE. Ready before AuthenticationOk is -71, as is any
+# unknown frame. Only idle state I completes startup.
+operation PgStartup:
+    accepts fd of type i64.
+    accepts user of type Bytes.
+    accepts database of type Bytes.
+    accepts scratch of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if fd < 0:
+            return -22.
+        if scratch == usize(0):
+            return -22.
+        if capacity > usize(9223372036854775807):
+            return -22.
+        if len(user) == usize(0) || len(database) == usize(0):
+            return -22.
+        let mut scan = usize(0).
+        while scan < len(user):
+            if byte(user, scan) == 0:
+                return -22.
+            set scan = scan + usize(1).
+        set scan = usize(0).
+        while scan < len(database):
+            if byte(database, scan) == 0:
+                return -22.
+            set scan = scan + usize(1).
+        let user_length = len(user).
+        let database_length = len(database).
+        if user_length > usize(2147483601):
+            return -75.
+        if database_length > usize(2147483601) - user_length:
+            return -75.
+        let total = usize(46) + user_length + database_length.
+        if total > usize(2147483647):
+            return -75.
+        if total > capacity:
+            return -28.
+        let mut offset = usize(0).
+        let mut placed = PgWrite32(scratch, capacity, offset, i64(total)).
+        if placed < 0:
+            return placed.
+        set offset = offset + usize(placed).
+        set placed = PgWrite32(scratch, capacity, offset, 196608).
+        if placed < 0:
+            return placed.
+        set offset = offset + usize(placed).
+        let mut copied = BytesCopy(scratch + offset, capacity - offset, bytes("user")).
+        if copied < 0:
+            return copied.
+        set offset = offset + usize(copied).
+        store8(scratch + offset, u8(0)).
+        set offset = offset + usize(1).
+        set copied = BytesCopy(scratch + offset, capacity - offset, user).
+        if copied < 0:
+            return copied.
+        set offset = offset + usize(copied).
+        store8(scratch + offset, u8(0)).
+        set offset = offset + usize(1).
+        set copied = BytesCopy(scratch + offset, capacity - offset, bytes("database")).
+        if copied < 0:
+            return copied.
+        set offset = offset + usize(copied).
+        store8(scratch + offset, u8(0)).
+        set offset = offset + usize(1).
+        set copied = BytesCopy(scratch + offset, capacity - offset, database).
+        if copied < 0:
+            return copied.
+        set offset = offset + usize(copied).
+        store8(scratch + offset, u8(0)).
+        set offset = offset + usize(1).
+        set copied = BytesCopy(scratch + offset, capacity - offset, bytes("client_encoding")).
+        if copied < 0:
+            return copied.
+        set offset = offset + usize(copied).
+        store8(scratch + offset, u8(0)).
+        set offset = offset + usize(1).
+        set copied = BytesCopy(scratch + offset, capacity - offset, bytes("UTF8")).
+        if copied < 0:
+            return copied.
+        set offset = offset + usize(copied).
+        store8(scratch + offset, u8(0)).
+        store8(scratch + offset + usize(1), u8(0)).
+        set offset = offset + usize(2).
+        if offset != total:
+            return -71.
+        let sent = LinuxWriteAll(fd, bytes_at(scratch, total)).
+        if sent < 0:
+            return sent.
+        let mut authenticated = false.
+        while true:
+            let received = PgReadMessage(fd, scratch, capacity).
+            if received < 0:
+                return received.
+            let message = bytes_at(scratch, usize(received)).
+            let kind = byte(message, usize(0)).
+            if kind == 82:
+                if len(message) < usize(9):
+                    return -71.
+                let method = PgReadU32(message, usize(5)).
+                if method < 0:
+                    return -71.
+                if method != 0:
+                    return -95.
+                if len(message) != usize(9):
+                    return -71.
+                if authenticated:
+                    return -71.
+                set authenticated = true.
+                continue.
+            if kind == 69:
+                let code = PgErrorCode(message).
+                if code <= 4095:
+                    return -71.
+                return 0 - code.
+            if kind == 90:
+                if len(message) != usize(6):
+                    return -71.
+                if byte(message, usize(5)) != 73:
+                    return -71.
+                if !authenticated:
+                    return -71.
+                return 0.
+            if kind == 83:
+                let key_end = PgCStringEnd(message, usize(5)).
+                if key_end < 0 || key_end >= i64(len(message)):
+                    return -71.
+                if PgCStringEnd(message, usize(key_end)) != i64(len(message)):
+                    return -71.
+                continue.
+            if kind == 75:
+                if len(message) != usize(13):
+                    return -71.
+                continue.
+            if kind == 78:
+                let mut notice = usize(5).
+                while true:
+                    if notice >= len(message):
+                        return -71.
+                    if byte(message, notice) == 0:
+                        if notice + usize(1) == len(message):
+                            break.
+                        return -71.
+                    let field_end = PgCStringEnd(message, notice + usize(1)).
+                    if field_end < 0:
+                        return -71.
+                    set notice = usize(field_end).
+                    continue.
+                continue.
+            if kind == 65:
+                if len(message) < usize(11):
+                    return -71.
+                if PgReadU32(message, usize(5)) < 0:
+                    return -71.
+                let channel_end = PgCStringEnd(message, usize(9)).
+                if channel_end < 0:
+                    return -71.
+                if PgCStringEnd(message, usize(channel_end)) != i64(len(message)):
+                    return -71.
+                continue.
+            return -71.
+        return -71.
+
+# Discard ordinary query replies until a valid ReadyForQuery arrives. Keeps the
+# first ErrorResponse as its negated packed SQLSTATE and returns it after Ready.
+# Transport and framing errors dominate because the session is then unusable.
+# DataRow and RowDescription frames may be discarded; callers that need rows use
+# PgReadMessage plus PgRowField directly. Asynchronous Notice, ParameterStatus,
+# and Notification frames are drained. Anything else is -71.
+operation PgDrain:
+    accepts fd of type i64.
+    accepts scratch of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if fd < 0:
+            return -22.
+        if scratch == usize(0):
+            return -22.
+        if capacity > usize(9223372036854775807):
+            return -22.
+        let mut failure = 0.
+        while true:
+            let received = PgReadMessage(fd, scratch, capacity).
+            if received < 0:
+                return received.
+            let message = bytes_at(scratch, usize(received)).
+            let kind = byte(message, usize(0)).
+            if kind == 69:
+                let code = PgErrorCode(message).
+                if code <= 4095:
+                    return -71.
+                if failure == 0:
+                    set failure = 0 - code.
+                continue.
+            if kind == 90:
+                if len(message) != usize(6):
+                    return -71.
+                let state = byte(message, usize(5)).
+                if state != 73 && state != 84 && state != 69:
+                    return -71.
+                if failure != 0:
+                    return failure.
+                return 0.
+            if kind == 49 || kind == 50 || kind == 51 || kind == 73 || kind == 110 || kind == 115:
+                if len(message) != usize(5):
+                    return -71.
+                continue.
+            if kind == 67:
+                if len(message) < usize(6):
+                    return -71.
+                if byte(message, len(message) - usize(1)) != 0:
+                    return -71.
+                continue.
+            if kind == 68 || kind == 84 || kind == 116:
+                continue.
+            if kind == 78:
+                if len(message) < usize(6):
+                    return -71.
+                if byte(message, len(message) - usize(1)) != 0:
+                    return -71.
+                let mut notice = usize(5).
+                while true:
+                    if notice >= len(message):
+                        return -71.
+                    if byte(message, notice) == 0:
+                        if notice + usize(1) == len(message):
+                            break.
+                        return -71.
+                    let field_end = PgCStringEnd(message, notice + usize(1)).
+                    if field_end < 0:
+                        return -71.
+                    set notice = usize(field_end).
+                    continue.
+                continue.
+            if kind == 83:
+                let key_end = PgCStringEnd(message, usize(5)).
+                if key_end < 0 || key_end >= i64(len(message)):
+                    return -71.
+                if PgCStringEnd(message, usize(key_end)) != i64(len(message)):
+                    return -71.
+                continue.
+            if kind == 65:
+                if len(message) < usize(11):
+                    return -71.
+                if PgReadU32(message, usize(5)) < 0:
+                    return -71.
+                let channel_end = PgCStringEnd(message, usize(9)).
+                if channel_end < 0:
+                    return -71.
+                if PgCStringEnd(message, usize(channel_end)) != i64(len(message)):
+                    return -71.
+                continue.
+            if kind == 75:
+                if len(message) != usize(13):
+                    return -71.
+                continue.
+            return -71.
+        return -71.

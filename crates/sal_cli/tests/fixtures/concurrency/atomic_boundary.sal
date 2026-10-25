@@ -1,0 +1,35 @@
+use "std/linux/memory.sal".
+operation Main:
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mapping = LinuxMapMemory(usize(4096)).
+        if mapping < 0:
+            return 1.
+        let buf = usize(mapping).
+        let mut failure = 0.
+        store64(buf, usize(123456789)).
+        if load64(buf) != usize(123456789):
+            if failure == 0:
+                set failure = 2.
+        atomic_store(buf, u32(7)).
+        if atomic_load(buf) != u32(7):
+            if failure == 0:
+                set failure = 3.
+        if atomic_cas(buf, u32(7), u32(8)) != u32(7):
+            if failure == 0:
+                set failure = 4.
+        if atomic_load(buf) != u32(8):
+            if failure == 0:
+                set failure = 5.
+        if atomic_cas(buf, u32(7), u32(9)) != u32(8):
+            if failure == 0:
+                set failure = 6.
+        if atomic_load(buf) != u32(8):
+            if failure == 0:
+                set failure = 7.
+        let unmapped = LinuxUnmapMemory(buf, usize(4096)).
+        if unmapped != 0:
+            if failure == 0:
+                set failure = 8.
+        return failure.

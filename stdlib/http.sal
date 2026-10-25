@@ -1,0 +1,373 @@
+use "bytes.sal".
+use "linux/io.sal".
+
+# HTTP/1.x, origin-form requests only. Caller owns the buffer and its lifetime.
+# No allocation; no chunked transfer coding. Duplicate Content-Length is rejected.
+operation HttpToken:
+    accepts value of type u8.
+    returns bool.
+    body:
+        if value >= 48 && value <= 57:
+            return true.
+        if value >= 65 && value <= 90:
+            return true.
+        if value >= 97 && value <= 122:
+            return true.
+        let punctuation = bytes("!#$%&'*+-.^_`|~").
+        let mut index = usize(0).
+        while index < len(punctuation):
+            if value == byte(punctuation, index):
+                return true.
+            set index = index + 1.
+        return false.
+
+# Return the CR offset of a strictly valid request line, or -400.
+operation HttpRequestLineEnd:
+    accepts request of type Bytes.
+    returns i64.
+    body:
+        let mut index = usize(0).
+        while index < len(request):
+            if byte(request, index) == 32:
+                if index == 0:
+                    return -400.
+                let start = index + 1.
+                if start >= len(request):
+                    return -400.
+                if byte(request, start) != 47:
+                    return -400.
+                set index = start.
+                while index < len(request):
+                    let value = byte(request, index).
+                    if value == 32:
+                        let version = index + 1.
+                        if len(request) - version < 10:
+                            return -400.
+                        let protocol = slice(request, version, usize(8)).
+                        if protocol != bytes("HTTP/1.0") && protocol != bytes("HTTP/1.1"):
+                            return -400.
+                        if byte(request, version + 8) != 13:
+                            return -400.
+                        if byte(request, version + 9) != 10:
+                            return -400.
+                        return i64(version + 8).
+                    if value < 33:
+                        return -400.
+                    if value > 126:
+                        return -400.
+                    if value == 35:
+                        return -400.
+                    set index = index + 1.
+                return -400.
+            if HttpToken(byte(request, index)) == false:
+                return -400.
+            set index = index + 1.
+        return -400.
+
+# Search from start, including only positions with four available bytes.
+operation HttpFindBodyOffset:
+    accepts request of type Bytes.
+    accepts start of type usize.
+    returns i64.
+    body:
+        let mut index = start.
+        while index <= len(request):
+            if len(request) - index < 4:
+                return -400.
+            if byte(request, index) == 13 && byte(request, index + 1) == 10 && byte(request, index + 2) == 13 && byte(request, index + 3) == 10:
+                return i64(index + 4).
+            set index = index + 1.
+        return -400.
+
+# Delimiter lookup only, not whole-request validation. Missing delimiter is -400.
+operation HttpBodyOffset:
+    accepts request of type Bytes.
+    returns i64.
+    body:
+        return HttpFindBodyOffset(request, usize(0)).
+
+# Zero-copy method; an invalid or incomplete request line returns empty Bytes.
+# Headers/body need not be present. A valid method is never empty.
+operation HttpMethod:
+    accepts request of type Bytes.
+    returns Bytes.
+    body:
+        if HttpRequestLineEnd(request) < 0:
+            return bytes("").
+        let mut index = usize(0).
+        while byte(request, index) != 32:
+            set index = index + 1.
+        return slice(request, usize(0), index).
+
+# Zero-copy origin-form path, excluding query. Invalid lines return empty Bytes.
+# A valid path starts with / and is never empty; headers are not validated here.
+operation HttpPath:
+    accepts request of type Bytes.
+    returns Bytes.
+    body:
+        if HttpRequestLineEnd(request) < 0:
+            return bytes("").
+        let mut index = usize(0).
+        while byte(request, index) != 32:
+            set index = index + 1.
+        let start = index + 1.
+        set index = start.
+        while byte(request, index) != 32:
+            if byte(request, index) == 63:
+                return slice(request, start, index - start).
+            set index = index + 1.
+        return slice(request, start, index - start).
+
+# ASCII case-insensitive comparison against a lowercase header name.
+operation HttpHeaderNameEquals:
+    accepts name of type Bytes.
+    accepts lower of type Bytes.
+    returns bool.
+    body:
+        if len(name) != len(lower):
+            return false.
+        let mut index = usize(0).
+        while index < len(name):
+            let mut value = byte(name, index).
+            if value >= 65 && value <= 90:
+                set value = value + 32.
+            if value != byte(lower, index):
+                return false.
+            set index = index + 1.
+        return true.
+
+# Input ends immediately after CRLFCRLF. Validate all headers and framing.
+operation HttpContentLength:
+    accepts headers of type Bytes.
+    returns i64.
+    body:
+        let line = HttpRequestLineEnd(headers).
+        if line < 0:
+            return -400.
+        let mut index = usize(line) + 2.
+        let mut contentLength = 0.
+        let mut seenLength = false.
+        while index < len(headers):
+            if len(headers) - index < 2:
+                return -400.
+            if byte(headers, index) == 13:
+                if byte(headers, index + 1) != 10:
+                    return -400.
+                if len(headers) - index != 2:
+                    return -400.
+                return contentLength.
+            let nameStart = index.
+            while true:
+                if index >= len(headers):
+                    return -400.
+                let value = byte(headers, index).
+                if value == 58:
+                    break.
+                if !HttpToken(value):
+                    return -400.
+                set index = index + 1.
+            if index == nameStart:
+                return -400.
+            let name = slice(headers, nameStart, index - nameStart).
+            set index = index + 1.
+            let mut valueStart = index.
+            while true:
+                if index >= len(headers):
+                    return -400.
+                let value = byte(headers, index).
+                if value == 13:
+                    break.
+                if (value < 32 && value != 9) || value == 127:
+                    return -400.
+                set index = index + 1.
+            if len(headers) - index < 2:
+                return -400.
+            if byte(headers, index + 1) != 10:
+                return -400.
+            let mut valueEnd = index.
+            set index = index + 2.
+            if HttpHeaderNameEquals(name, bytes("transfer-encoding")):
+                return -400.
+            if !HttpHeaderNameEquals(name, bytes("content-length")):
+                continue.
+            if seenLength:
+                return -400.
+            set seenLength = true.
+            while true:
+                if valueStart == valueEnd:
+                    return -400.
+                let value = byte(headers, valueStart).
+                if value != 32 && value != 9:
+                    break.
+                set valueStart = valueStart + 1.
+            # Leading trim established a nonempty value with a nonspace first byte.
+            while true:
+                let value = byte(headers, valueEnd - 1).
+                if value != 32 && value != 9:
+                    break.
+                set valueEnd = valueEnd - 1.
+            let parsed = BytesParseDecimal(slice(headers, valueStart, valueEnd - valueStart)).
+            if parsed == -75:
+                return -413.
+            if parsed < 0:
+                return -400.
+            set contentLength = parsed.
+        return -400.
+
+# Read one complete request, ignoring already-read pipelined bytes (close only).
+# Header limit includes request line and final CRLFCRLF; exactly 16384 is allowed.
+# EOF before completion is -400; I/O errno propagates. Capacity exhaustion is
+# -413, or -431 when the 16384-byte header bound is reached without a delimiter.
+operation HttpReadRequest:
+    accepts fd of type i64.
+    accepts buffer of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if capacity > usize(9223372036854775807):
+            return -413.
+        let mut headerLimit = capacity.
+        if headerLimit > 16384:
+            set headerLimit = usize(16384).
+        let mut used = usize(0).
+        let mut bodyOffset = -400.
+        while bodyOffset < 0:
+            if used == headerLimit:
+                if headerLimit == 16384:
+                    return -431.
+                return -413.
+            let mut scan = usize(0).
+            if used > 3:
+                set scan = used - 3.
+            let received = LinuxReadInto(fd, buffer + used, headerLimit - used).
+            if received < 0:
+                return received.
+            if received == 0:
+                return -400.
+            set used = used + usize(received).
+            set bodyOffset = HttpFindBodyOffset(bytes_at(buffer, used), scan).
+        let headerSize = usize(bodyOffset).
+        let contentLength = HttpContentLength(bytes_at(buffer, headerSize)).
+        if contentLength < 0:
+            return contentLength.
+        if usize(contentLength) > capacity - headerSize:
+            return -413.
+        let total = headerSize + usize(contentLength).
+        while used < total:
+            let received = LinuxReadInto(fd, buffer + used, total - used).
+            if received < 0:
+                return received.
+            if received == 0:
+                return -400.
+            set used = used + usize(received).
+        return i64(total).
+
+operation HttpStatusLine:
+    accepts status of type i64.
+    returns Bytes.
+    body:
+        if status == 200:
+            return bytes("HTTP/1.1 200 OK\r\n").
+        if status == 400:
+            return bytes("HTTP/1.1 400 Bad Request\r\n").
+        if status == 404:
+            return bytes("HTTP/1.1 404 Not Found\r\n").
+        if status == 405:
+            return bytes("HTTP/1.1 405 Method Not Allowed\r\n").
+        if status == 408:
+            return bytes("HTTP/1.1 408 Request Timeout\r\n").
+        if status == 409:
+            return bytes("HTTP/1.1 409 Conflict\r\n").
+        if status == 413:
+            return bytes("HTTP/1.1 413 Payload Too Large\r\n").
+        if status == 415:
+            return bytes("HTTP/1.1 415 Unsupported Media Type\r\n").
+        if status == 431:
+            return bytes("HTTP/1.1 431 Request Header Fields Too Large\r\n").
+        if status == 500:
+            return bytes("HTTP/1.1 500 Internal Server Error\r\n").
+        if status == 503:
+            return bytes("HTTP/1.1 503 Service Unavailable\r\n").
+        return bytes("").
+
+# Caller scratch must not overlap body. Assemble headers before any network write.
+# Unsupported status is -22; insufficient scratch is -28, with no network output.
+# Scratch may be partly written on error. Response bodies are borrowed, not copied.
+operation HttpResponseHeader:
+    accepts status of type i64.
+    accepts length of type usize.
+    accepts json of type bool.
+    accepts scratch of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        let statusLine = HttpStatusLine(status).
+        if len(statusLine) == 0:
+            return -22.
+        if length > usize(9223372036854775807):
+            return -75.
+        let mut fields = bytes("Content-Type: text/plain; charset=utf-8\r\nContent-Length: ").
+        if json:
+            set fields = bytes("Content-Type: application/json\r\nContent-Length: ").
+        let ending = bytes("\r\nConnection: close\r\n\r\n").
+        let copiedStatus = BytesCopy(scratch, capacity, statusLine).
+        if copiedStatus < 0:
+            return copiedStatus.
+        let mut offset = usize(copiedStatus).
+        let copiedFields = BytesCopy(scratch + offset, capacity - offset, fields).
+        if copiedFields < 0:
+            return copiedFields.
+        set offset = offset + usize(copiedFields).
+        let copiedLength = BytesDecimal(i64(length), scratch + offset, capacity - offset).
+        if copiedLength < 0:
+            return copiedLength.
+        set offset = offset + usize(copiedLength).
+        let copiedEnding = BytesCopy(scratch + offset, capacity - offset, ending).
+        if copiedEnding < 0:
+            return copiedEnding.
+        return i64(offset + usize(copiedEnding)).
+
+operation HttpWriteFramed:
+    accepts fd of type i64.
+    accepts body of type Bytes.
+    accepts header of type Bytes.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let headerResult = LinuxWriteAll(fd, header).
+        if headerResult < 0:
+            return headerResult.
+        let bodyResult = LinuxWriteAll(fd, body).
+        if bodyResult < 0:
+            return bodyResult.
+        return 0.
+
+operation HttpWriteResponse:
+    accepts fd of type i64.
+    accepts status of type i64.
+    accepts body of type Bytes.
+    accepts scratch of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let headerSize = HttpResponseHeader(status, len(body), true, scratch, capacity).
+        if headerSize < 0:
+            return headerSize.
+        return HttpWriteFramed(fd, body, bytes_at(scratch, usize(headerSize))).
+
+operation HttpWriteTextResponse:
+    accepts fd of type i64.
+    accepts status of type i64.
+    accepts body of type Bytes.
+    accepts scratch of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let headerSize = HttpResponseHeader(status, len(body), false, scratch, capacity).
+        if headerSize < 0:
+            return headerSize.
+        return HttpWriteFramed(fd, body, bytes_at(scratch, usize(headerSize))).

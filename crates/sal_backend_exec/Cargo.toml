@@ -1,0 +1,8 @@
+[package]
+name = "sal_backend_exec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sal_ir = { path = "../sal_ir" }
+sal_syntax = { path = "../sal_syntax" }

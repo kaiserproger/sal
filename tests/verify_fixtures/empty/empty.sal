@@ -1,0 +1,7 @@
+application VerifyApp.
+
+layer Lonely:
+  owns Helper.
+
+service Helper:
+  belongs to Lonely.

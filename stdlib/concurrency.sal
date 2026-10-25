@@ -1,0 +1,637 @@
+# Native SAL concurrency runtime: channels, select arbitration, threads.
+#
+# All synchronization/channel algorithms are SAL source in this file. The
+# compiler only provides true machine/OS boundary intrinsics (atomic u32
+# seq-cst words, unaligned-tolerant 64-bit loads/stores, operation_address,
+# thread_launch via clone, and the zero-initialized concurrency_state
+# static). No scheduler, no polling loops, no per-message heap allocation.
+#
+# Channel memory (one private anonymous mmap per channel, base = channel):
+#   +0:  payload width in bytes (fixed per channel, >= 1).
+#   +8:  capacity in messages (0 = rendezvous, > 0 = bounded ring).
+#   +16: buffered message count (0 when a receiver is registered).
+#   +24: ring head index (< capacity, or 0 when capacity is 0).
+#   +32: ring tail index (< capacity, or 0 when capacity is 0).
+#   +40: closed flag (0 open, 1 closed).
+#   +48: owner refcount (explicit channel_clone/channel_drop; last drop unmaps).
+#   +56: waiter list head (intrusive chain of select nodes, 0 = none).
+#   +64: ring slots (capacity * width bytes; empty for rendezvous).
+# Head/tail stay modulo capacity so checked SAL arithmetic can never
+# overflow; the buffer product is range-checked once at creation.
+#
+# Select node (64 bytes in the compiler caller frame, stride 64):
+#   +0:  channel, +8: direction (0 receive, 1 send), +16: payload pointer
+#   (width-sized caller frame storage, receive storage zeroed by caller),
+#   +24: shared completion address, +32: intrusive next link,
+#   +40: outcome status (0 success, 1 closed), +48: local arm index
+#   (runtime fills at entry), +56: linked flag (1 = on a channel list).
+#
+# Shared completion (stack C record, address shared by one SalSelect call):
+#   +0: u32 atomic flag (0 waiting, 1 committed, 2 cancelled by timeout),
+#   +8: winning local arm index, +16: winner status. Waiters sleep on +0
+#   with futex WAIT expecting 0, so a commit between unlock and sleep
+#   returns EAGAIN instead of losing the wakeup.
+#
+# Global gate (concurrency_state static, 16 bytes, 16-aligned):
+#   +0: u32 spin/futex mutex (0 free, 1 held), +8: round-robin ticket.
+# registration and every cleanup decision are atomic and no stale
+# registered node is ever touched: a partner is eligible only when linked
+# and its completion flag is still 0. Nodes from the same selection are
+# excluded by completion address, and exactly one node per selection is
+# ever committed (flag 0 -> 1 once).
+# The ticket cycles 0 .. 2^32-1 (never overflowing checked arithmetic)
+# and each multi-arm scan starts at ticket % arm count: ready-or-closed
+# arms win in rotated source order, so multiple ready arms cannot
+# source-order starve. The ticket advances exactly once per SalSelect
+# invocation with more than one arm, under the gate on first entry;
+# single-arm send/receive primitives and spurious retries never perturb
+# rotation, so repeated ready selections cannot lock onto one parity.
+#
+# Futex usage: gate and select completions use PRIVATE ops (process-local
+# addresses). Thread join uses shared op 0 because the kernel
+# clear_child_tid wake is shared. Timed waits use WAIT_BITSET with an
+# absolute CLOCK_MONOTONIC deadline, so EINTR/spurious wakes just re-loop
+# with the same deadline; only a real ETIMEDOUT cancels the registration.
+entity SelectCompletion:
+    layout "C".
+    has flag of type u32.
+    has arm of type usize.
+    has status of type usize.
+
+entity FutexTime:
+    layout "C".
+    has seconds of type i64.
+    has nanoseconds of type i64.
+
+# Gate acquire: CAS 0 -> 1 wins; otherwise sleep until an unlock wakes us.
+# A wake that arrives before we sleep surfaces as EAGAIN and we re-CAS.
+operation ConcurrencyGateLock:
+    accepts state of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        while true:
+            if atomic_cas(state, u32(0), u32(1)) == u32(0):
+                return 0.
+            ConcurrencyFutexWaitPrivate(state, u32(1)).
+        return -1.
+
+# Gate release: clear then wake exactly one waiter (a mutex needs one).
+operation ConcurrencyGateUnlock:
+    accepts state of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        atomic_store(state, u32(0)).
+        return syscall(202, i64(state), 129, 1, 0, 0, 0).
+
+# Infinite private wait expecting the flag word to still hold expected.
+operation ConcurrencyFutexWaitPrivate:
+    accepts address of type usize.
+    accepts expected of type u32.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        return syscall(202, i64(address), 128, i64(expected), 0, 0, 0).
+
+# Wake one waiter on a private completion word.
+operation ConcurrencyFutexWakePrivate:
+    accepts address of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        return syscall(202, i64(address), 129, 1, 0, 0, 0).
+
+# Absolute-deadline private wait on CLOCK_MONOTONIC. Returns 0 on wake,
+# -4 EINTR, -11 EAGAIN (already committed), -110 ETIMEDOUT.
+operation ConcurrencyFutexWaitDeadline:
+    accepts address of type usize.
+    accepts expected of type u32.
+    accepts deadline of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        return syscall(202, i64(address), 137, i64(expected), i64(deadline), 0, 4294967295).
+
+# Monotonic clock sample into a 16-byte (seconds, nanoseconds) record.
+operation ConcurrencyMonoNow:
+    accepts output of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        return syscall(228, 1, i64(output), 0, 0, 0, 0).
+
+# Raw width-sized copy with no allocation: whole words then a byte tail.
+operation ConcurrencyCopy:
+    accepts destination of type usize.
+    accepts source of type usize.
+    accepts width of type usize.
+    effects: UnsafeMemory.
+    body:
+        let words = width / 8.
+        let mut index = usize(0).
+        while index < words:
+            store64(destination + index * 8, load64(source + index * 8)).
+            set index = index + 1.
+        let mut offset = words * 8.
+        while offset < width:
+            store8(destination + offset, load8(source + offset)).
+            set offset = offset + 1.
+
+# Intrusive unlink of one node from its channel waiter list. The linked
+# flag makes cleanup idempotent: already-removed nodes are skipped.
+operation ConcurrencyChannelUnlink:
+    accepts channel of type usize.
+    accepts node of type usize.
+    effects: UnsafeMemory.
+    body:
+        if load64(node + 56) != 0:
+            let mut previous = usize(0).
+            let mut current = load64(channel + 56).
+            while current != 0:
+                if current == node:
+                    let next = load64(current + 32).
+                    if previous == 0:
+                        store64(channel + 56, next).
+                    else:
+                        store64(previous + 32, next).
+                    store64(node + 32, usize(0)).
+                    store64(node + 56, usize(0)).
+                    set current = usize(0).
+                else:
+                    set previous = current.
+                    set current = load64(current + 32).
+
+# Unlink every still-linked node of one selection. Idempotent, gate-held.
+operation ConcurrencySelectCleanup:
+    accepts nodes of type usize.
+    accepts count of type usize.
+    effects: UnsafeMemory.
+    body:
+        let mut index = usize(0).
+        while index < count:
+            let node = nodes + index * 64.
+            if load64(node + 56) != 0:
+                ConcurrencyChannelUnlink(load64(node), node).
+            set index = index + 1.
+
+# Link every unlinked node of one selection onto its channel waiter list.
+operation ConcurrencySelectRegister:
+    accepts nodes of type usize.
+    accepts count of type usize.
+    effects: UnsafeMemory.
+    body:
+        let mut index = usize(0).
+        while index < count:
+            let node = nodes + index * 64.
+            if load64(node + 56) == 0:
+                let channel = load64(node).
+                store64(node + 32, load64(channel + 56)).
+                store64(channel + 56, node).
+                store64(node + 56, usize(1)).
+            set index = index + 1.
+
+# First eligible opposite-direction waiter on a channel: opposite
+# direction, different selection, still linked, completion still waiting.
+# Stale (cleaned-up or already-committed) nodes are never returned.
+operation ConcurrencyChannelFindPartner:
+    accepts channel of type usize.
+    accepts direction of type usize.
+    accepts self_completion of type usize.
+    returns usize.
+    effects: UnsafeMemory.
+    body:
+        let wanted = usize(1) - direction.
+        let mut current = load64(channel + 56).
+        while current != 0:
+            if load64(current + 8) == wanted && load64(current + 24) != self_completion && load64(current + 56) != 0 && atomic_load(load64(current + 24)) == u32(0):
+                return current.
+            set current = load64(current + 32).
+        return 0.
+
+# Create a channel: one zeroed mmap holding the header plus a
+# capacity * width ring. Returns 0 on invalid sizes or mmap failure.
+operation SalChannelNew:
+    accepts capacity of type usize.
+    accepts width of type usize.
+    returns usize.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if width == 0:
+            return usize(0).
+        let limit = usize(4611686018427387903) - 64.
+        if capacity != 0 && width > limit / capacity:
+            return usize(0).
+        let total = 64 + capacity * width.
+        let mapped = syscall(9, 0, i64(total), 3, 34, -1, 0).
+        if mapped < 0:
+            return usize(0).
+        let channel = usize(mapped).
+        store64(channel, width).
+        store64(channel + 8, capacity).
+        store64(channel + 16, usize(0)).
+        store64(channel + 24, usize(0)).
+        store64(channel + 32, usize(0)).
+        store64(channel + 40, usize(0)).
+        store64(channel + 48, usize(1)).
+        store64(channel + 56, usize(0)).
+        return channel.
+
+# Explicit ownership duplicate: bump the refcount under the gate.
+operation SalChannelClone:
+    accepts channel of type usize.
+    returns usize.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let state = concurrency_state().
+        ConcurrencyGateLock(state).
+        store64(channel + 48, load64(channel + 48) + 1).
+        ConcurrencyGateUnlock(state).
+        return channel.
+
+# Explicit ownership release; the last drop unmaps the ring exactly once.
+operation SalChannelDrop:
+    accepts channel of type usize.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let state = concurrency_state().
+        ConcurrencyGateLock(state).
+        let refs = load64(channel + 48).
+        if refs == 1:
+            let total = 64 + load64(channel + 8) * load64(channel).
+            store64(channel + 48, usize(0)).
+            ConcurrencyGateUnlock(state).
+            syscall(11, i64(channel), i64(total), 0, 0, 0, 0).
+        else:
+            if refs > 1:
+                store64(channel + 48, refs - 1).
+            ConcurrencyGateUnlock(state).
+
+# Close marks the channel, immediately fails every blocked send with
+# closed status, and commits every still-waiting blocked receiver under
+# the gate: buffered values drain into the receiver payload (success)
+# before later receivers observe closed-empty. Commit (flag 0 -> 1)
+# always precedes the wake, so a close racing the receiver's unlock/sleep
+# gap surfaces as EAGAIN instead of a lost wakeup. A second close fails.
+operation SalChannelClose:
+    accepts channel of type usize.
+    returns bool.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let state = concurrency_state().
+        ConcurrencyGateLock(state).
+        if load64(channel + 40) != 0:
+            ConcurrencyGateUnlock(state).
+            return false.
+        store64(channel + 40, usize(1)).
+        let mut current = load64(channel + 56).
+        while current != 0:
+            let next = load64(current + 32).
+            let waiter = load64(current + 24).
+            if atomic_load(waiter) == u32(0):
+                if load64(current + 8) == 1:
+                    store64(current + 40, usize(1)).
+                    store64(waiter + 8, load64(current + 48)).
+                    store64(waiter + 16, usize(1)).
+                    atomic_store(waiter, u32(1)).
+                    ConcurrencyChannelUnlink(channel, current).
+                    ConcurrencyFutexWakePrivate(waiter).
+                else:
+                    if load64(channel + 16) != 0:
+                        let drain_head = load64(channel + 24).
+                        let drain_width = load64(channel).
+                        ConcurrencyCopy(load64(current + 16), channel + 64 + drain_head * drain_width, drain_width).
+                        let drain_next = drain_head + 1.
+                        if drain_next == load64(channel + 8):
+                            store64(channel + 24, usize(0)).
+                        else:
+                            store64(channel + 24, drain_next).
+                        store64(channel + 16, load64(channel + 16) - 1).
+                        store64(current + 40, usize(0)).
+                        store64(waiter + 8, load64(current + 48)).
+                        store64(waiter + 16, usize(0)).
+                        atomic_store(waiter, u32(1)).
+                        ConcurrencyChannelUnlink(channel, current).
+                        ConcurrencyFutexWakePrivate(waiter).
+                    else:
+                        store64(current + 40, usize(1)).
+                        store64(waiter + 8, load64(current + 48)).
+                        store64(waiter + 16, usize(1)).
+                        atomic_store(waiter, u32(1)).
+                        ConcurrencyChannelUnlink(channel, current).
+                        ConcurrencyFutexWakePrivate(waiter).
+            set current = next.
+        ConcurrencyGateUnlock(state).
+        return true.
+
+# Atomic multi-arm select and the blocking primitive for single
+# send/receive. timeout -1 blocks forever, 0 is otherwise-fallback,
+# positive is milliseconds. Returns the winning arm index, or count for
+# fallback. Each channel width is used for its own node payload copies;
+# arms never assume a shared width. Ready-or-closed arms commit in
+# ticket-rotated source order: buffered sends enqueue when space remains,
+# buffered receives pop (pulling one waiting sender into the freed slot to
+# preserve FIFO), rendezvous arms pair directly, and closed sends fail
+# while closed receives drain before failing. The rotation ticket advances
+# exactly once per SalSelect invocation with more than one arm (gate-held
+# on first entry below): single-arm send/receive and spurious retries
+# never perturb rotation.
+operation SalSelect:
+    accepts nodes of type usize.
+    accepts count of type usize.
+    accepts timeout of type isize.
+    returns usize.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if count == 0:
+            return 0.
+        let state = concurrency_state().
+        let gate = state.
+        let ticket_word = state + 8.
+        let mut ticket_taken = false.
+        let mut start = usize(0).
+        let done = SelectCompletion(u32(0), usize(0), usize(0)).
+        let completion = address(done).
+        let mut mark = usize(0).
+        while mark < count:
+            let node_base = nodes + mark * 64.
+            store64(node_base + 24, completion).
+            store64(node_base + 40, usize(0)).
+            store64(node_base + 48, mark).
+            store64(node_base + 56, usize(0)).
+            set mark = mark + 1.
+        let clock = FutexTime(i64(0), i64(0)).
+        let clock_ptr = address(clock).
+        let mut deadline_ptr = usize(0).
+        if timeout > 0:
+            ConcurrencyMonoNow(clock_ptr).
+            let now_seconds = i64(load64(clock_ptr)).
+            let now_nanoseconds = i64(load64(clock_ptr + 8)).
+            let span = usize(timeout).
+            let add_seconds = i64(span / 1000).
+            let add_nanoseconds = i64(span % 1000 * 1000000).
+            let sum_nanoseconds = now_nanoseconds + add_nanoseconds.
+            let mut end_seconds = now_seconds + add_seconds.
+            let mut end_nanoseconds = sum_nanoseconds.
+            if sum_nanoseconds >= 1000000000:
+                set end_nanoseconds = sum_nanoseconds - 1000000000.
+                set end_seconds = end_seconds + 1.
+            store64(clock_ptr, usize(end_seconds)).
+            store64(clock_ptr + 8, usize(end_nanoseconds)).
+            set deadline_ptr = clock_ptr.
+        while true:
+            ConcurrencyGateLock(gate).
+            if ticket_taken == false:
+                if count > 1:
+                    set start = load64(ticket_word).
+                    let advance = start.
+                    if advance == usize(4294967295):
+                        store64(ticket_word, usize(0)).
+                    else:
+                        store64(ticket_word, advance + 1).
+                set ticket_taken = true.
+            if atomic_load(completion) != u32(0):
+                ConcurrencySelectCleanup(nodes, count).
+                let won = load64(completion + 8).
+                ConcurrencyGateUnlock(gate).
+                return won.
+            if count > 1:
+                set start = start % count.
+            let mut scan = usize(0).
+            let mut choice = count.
+            let mut choice_send = false.
+            let mut choice_closed = false.
+            let mut choice_partner = usize(0).
+            while scan < count:
+                let mut arm = start + scan.
+                if arm >= count:
+                    set arm = arm - count.
+                let candidate = nodes + arm * 64.
+                let candidate_channel = load64(candidate).
+                let candidate_direction = load64(candidate + 8).
+                if candidate_direction == 1:
+                    if load64(candidate_channel + 40) != 0:
+                        set choice = arm.
+                        set choice_send = true.
+                        set choice_closed = true.
+                        set choice_partner = usize(0).
+                        break.
+                    let mate = ConcurrencyChannelFindPartner(candidate_channel, candidate_direction, completion).
+                    if mate != 0:
+                        set choice = arm.
+                        set choice_send = true.
+                        set choice_closed = false.
+                        set choice_partner = mate.
+                        break.
+                    if load64(candidate_channel + 8) != 0 && load64(candidate_channel + 16) < load64(candidate_channel + 8):
+                        set choice = arm.
+                        set choice_send = true.
+                        set choice_closed = false.
+                        set choice_partner = usize(0).
+                        break.
+                else:
+                    if load64(candidate_channel + 16) != 0:
+                        set choice = arm.
+                        set choice_send = false.
+                        set choice_closed = false.
+                        set choice_partner = ConcurrencyChannelFindPartner(candidate_channel, candidate_direction, completion).
+                        break.
+                    if load64(candidate_channel + 40) != 0:
+                        set choice = arm.
+                        set choice_send = false.
+                        set choice_closed = true.
+                        set choice_partner = usize(0).
+                        break.
+                    let mate = ConcurrencyChannelFindPartner(candidate_channel, candidate_direction, completion).
+                    if mate != 0:
+                        set choice = arm.
+                        set choice_send = false.
+                        set choice_closed = false.
+                        set choice_partner = mate.
+                        break.
+                set scan = scan + 1.
+            if choice != count:
+                let win = nodes + choice * 64.
+                let win_channel = load64(win).
+                let win_width = load64(win_channel).
+                let win_payload = load64(win + 16).
+                if choice_closed:
+                    store64(win + 40, usize(1)).
+                    store64(completion + 8, choice).
+                    store64(completion + 16, usize(1)).
+                    atomic_store(completion, u32(1)).
+                else:
+                    if choice_send:
+                        if choice_partner != 0:
+                            ConcurrencyCopy(load64(choice_partner + 16), win_payload, win_width).
+                            let send_mate_done = load64(choice_partner + 24).
+                            store64(send_mate_done + 8, load64(choice_partner + 48)).
+                            store64(send_mate_done + 16, usize(0)).
+                            atomic_store(send_mate_done, u32(1)).
+                            ConcurrencyChannelUnlink(win_channel, choice_partner).
+                            ConcurrencyFutexWakePrivate(send_mate_done).
+                        else:
+                            let tail = load64(win_channel + 32).
+                            let send_cap = load64(win_channel + 8).
+                            ConcurrencyCopy(win_channel + 64 + tail * win_width, win_payload, win_width).
+                            let mut send_next = tail + 1.
+                            if send_next == send_cap:
+                                set send_next = usize(0).
+                            store64(win_channel + 32, send_next).
+                            store64(win_channel + 16, load64(win_channel + 16) + 1).
+                        store64(win + 40, usize(0)).
+                        store64(completion + 8, choice).
+                        store64(completion + 16, usize(0)).
+                        atomic_store(completion, u32(1)).
+                    else:
+                        if load64(win_channel + 16) != 0:
+                            let head = load64(win_channel + 24).
+                            let receive_cap = load64(win_channel + 8).
+                            ConcurrencyCopy(win_payload, win_channel + 64 + head * win_width, win_width).
+                            let mut receive_next = head + 1.
+                            if receive_next == receive_cap:
+                                set receive_next = usize(0).
+                            store64(win_channel + 24, receive_next).
+                            store64(win_channel + 16, load64(win_channel + 16) - 1).
+                            if choice_partner != 0:
+                                let back_tail = load64(win_channel + 32).
+                                let back_cap = load64(win_channel + 8).
+                                ConcurrencyCopy(win_channel + 64 + back_tail * win_width, load64(choice_partner + 16), win_width).
+                                let mut back_next = back_tail + 1.
+                                if back_next == back_cap:
+                                    set back_next = usize(0).
+                                store64(win_channel + 32, back_next).
+                                store64(win_channel + 16, load64(win_channel + 16) + 1).
+                                let receive_mate_done = load64(choice_partner + 24).
+                                store64(receive_mate_done + 8, load64(choice_partner + 48)).
+                                store64(receive_mate_done + 16, usize(0)).
+                                atomic_store(receive_mate_done, u32(1)).
+                                ConcurrencyChannelUnlink(win_channel, choice_partner).
+                                ConcurrencyFutexWakePrivate(receive_mate_done).
+                        else:
+                            ConcurrencyCopy(win_payload, load64(choice_partner + 16), win_width).
+                            let rendezvous_done = load64(choice_partner + 24).
+                            store64(rendezvous_done + 8, load64(choice_partner + 48)).
+                            store64(rendezvous_done + 16, usize(0)).
+                            atomic_store(rendezvous_done, u32(1)).
+                            ConcurrencyChannelUnlink(win_channel, choice_partner).
+                            ConcurrencyFutexWakePrivate(rendezvous_done).
+                        store64(win + 40, usize(0)).
+                        store64(completion + 8, choice).
+                        store64(completion + 16, usize(0)).
+                        atomic_store(completion, u32(1)).
+                ConcurrencySelectCleanup(nodes, count).
+                ConcurrencyGateUnlock(gate).
+                return choice.
+            if timeout == 0:
+                ConcurrencySelectCleanup(nodes, count).
+                ConcurrencyGateUnlock(gate).
+                return count.
+            ConcurrencySelectRegister(nodes, count).
+            ConcurrencyGateUnlock(gate).
+            if deadline_ptr == 0:
+                ConcurrencyFutexWaitPrivate(completion, u32(0)).
+                continue.
+            let waited = ConcurrencyFutexWaitDeadline(completion, u32(0), deadline_ptr).
+            if waited != -110:
+                continue.
+            ConcurrencyGateLock(gate).
+            if atomic_load(completion) != u32(0):
+                ConcurrencySelectCleanup(nodes, count).
+                let timed_won = load64(completion + 8).
+                ConcurrencyGateUnlock(gate).
+                return timed_won.
+            atomic_store(completion, u32(2)).
+            ConcurrencySelectCleanup(nodes, count).
+            ConcurrencyGateUnlock(gate).
+            return count.
+        return count.
+
+# Raw mmap helper for compiler-owned spawn contexts. Returns 0 on failure.
+operation SalAlloc:
+    accepts size of type usize.
+    returns usize.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if size == 0:
+            return usize(0).
+        let mapped = syscall(9, 0, i64(size), 3, 34, -1, 0).
+        if mapped < 0:
+            return usize(0).
+        return usize(mapped).
+
+# Raw munmap helper for compiler-owned spawn contexts.
+operation SalFree:
+    accepts address of type usize.
+    accepts size of type usize.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if address != 0 && size != 0:
+            syscall(11, i64(address), i64(size), 0, 0, 0, 0).
+
+# Spawn a real OS thread: one page control block {tid u32 at +0,
+# result i64 at +8, stack base at +16, stack size at +24} plus an 8 MiB
+# stack whose lowest page is a PROT_NONE guard. The child runs
+# entry(argument) via thread_launch (clone with VM/FS/FILES/SIGHAND/
+# THREAD/SYSVSEM/PARENT_SETTID/CHILD_SETTID/CHILD_CLEARTID), stores its
+# i64 result at control + 8, and exits; the kernel then zeroes control
+# + 0 and issues the shared clear_tid wake the join waits for. A guard
+# mprotect failure unmaps both mappings and reports spawn failure (0).
+# Returns the control address as the thread handle, or 0 when any
+# mapping, guard, or the clone itself fails (mappings reclaimed).
+operation SalThreadSpawn:
+    accepts entry of type usize.
+    accepts argument of type usize.
+    returns usize.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let control_mapped = syscall(9, 0, 4096, 3, 34, -1, 0).
+        if control_mapped < 0:
+            return usize(0).
+        let control = usize(control_mapped).
+        let stack_size = usize(8388608).
+        let stack_mapped = syscall(9, 0, i64(stack_size), 3, 34, -1, 0).
+        if stack_mapped < 0:
+            syscall(11, control_mapped, 4096, 0, 0, 0, 0).
+            return usize(0).
+        let base = usize(stack_mapped).
+        let guarded = syscall(10, stack_mapped, 4096, 0, 0, 0, 0).
+        if guarded != 0:
+            syscall(11, stack_mapped, i64(stack_size), 0, 0, 0, 0).
+            syscall(11, control_mapped, 4096, 0, 0, 0, 0).
+            return usize(0).
+        store64(control + 16, base).
+        store64(control + 24, stack_size).
+        let top = base + stack_size.
+        let launched = thread_launch(entry, argument, top, control).
+        if launched < 0:
+            syscall(11, stack_mapped, i64(stack_size), 0, 0, 0, 0).
+            syscall(11, control_mapped, 4096, 0, 0, 0, 0).
+            return usize(0).
+        return control.
+
+# Join waits on the shared clear_tid word (shared op 0, never private:
+# the kernel wake is shared), reclaims stack, guard, control and handle
+# storage once the child is gone, then reinterprets the stored 64-bit word
+# as signed i64 without a trapping usize -> i64 cast, so negative worker
+# results survive (high bit set means value - (2^64 - bits)).
+operation SalThreadJoin:
+    accepts thread of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let control = thread.
+        let base = load64(control + 16).
+        let size = load64(control + 24).
+        let mut tid = atomic_load(control).
+        while tid != u32(0):
+            syscall(202, i64(control), 0, i64(tid), 0, 0, 0).
+            set tid = atomic_load(control).
+        let bits = load64(control + 8).
+        syscall(11, i64(base), i64(size), 0, 0, 0, 0).
+        syscall(11, i64(control), 4096, 0, 0, 0, 0).
+        let high = bits / 4294967296.
+        let low = bits % 4294967296.
+        if high < 2147483648:
+            return i64(bits).
+        return (i64(high) - 4294967296) * 4294967296 + i64(low).

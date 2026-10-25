@@ -1,0 +1,532 @@
+use "codec.sal".
+use "std/http.sal".
+use "std/server.sal".
+use "std/postgres.sal".
+
+# Each view below borrows caller storage. PG fields are consumed before the next
+# read; request parameters, SQL, PG scratch, and the completed reply never alias.
+entity WarehouseRows:
+    layout "C".
+    has status of type i64.
+    has rows of type i64.
+    has written of type i64.
+    has available of type bool.
+
+operation WarehouseAppend:
+    accepts output of type usize.
+    accepts capacity of type usize.
+    accepts offset of type i64.
+    accepts value of type Bytes.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        if offset < 0:
+            return offset.
+        if usize(offset) > capacity:
+            return -28.
+        let result = BytesCopy(output + usize(offset), capacity - usize(offset), value).
+        if result < 0:
+            return result.
+        return offset + result.
+
+operation WarehouseNumber:
+    accepts output of type usize.
+    accepts capacity of type usize.
+    accepts offset of type i64.
+    accepts value of type i64.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        if offset < 0:
+            return offset.
+        if usize(offset) > capacity:
+            return -28.
+        let result = BytesDecimal(value, output + usize(offset), capacity - usize(offset)).
+        if result < 0:
+            return result.
+        return offset + result.
+
+operation WarehouseQuote:
+    accepts output of type usize.
+    accepts capacity of type usize.
+    accepts offset of type i64.
+    accepts value of type Bytes.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        if offset < 0:
+            return offset.
+        if usize(offset) > capacity:
+            return -28.
+        let result = JsonWriteString(value, output + usize(offset), capacity - usize(offset)).
+        if result < 0:
+            return result.
+        return offset + result.
+
+operation WarehouseFieldNumber:
+    accepts field of type PgField.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        if field.length < 1 || field.length > 19:
+            return -71.
+        let result = BytesParseDecimal(bytes_at(field.pointer, usize(field.length))).
+        if result < 0:
+            return -71.
+        return result.
+
+operation WarehouseFieldText:
+    accepts field of type PgField.
+    accepts limit of type i64.
+    returns bool.
+    effects: UnsafeMemory.
+    body:
+        if field.length < 1 || field.length > limit:
+            return false.
+        let value = bytes_at(field.pointer, usize(field.length)).
+        let mut index = usize(0).
+        while index < len(value):
+            if byte(value, index) == 0:
+                return false.
+            set index = index + 1.
+        return true.
+
+# A bounded cstring endpoint, including its NUL. Used for asynchronous PG frames.
+operation WarehouseCStringEnd:
+    accepts message of type Bytes.
+    accepts start of type usize.
+    returns i64.
+    body:
+        let mut offset = start.
+        while offset < len(message):
+            if byte(message, offset) == 0:
+                return i64(offset + 1).
+            set offset = offset + 1.
+        return -71.
+
+operation WarehouseAuxiliary:
+    accepts message of type Bytes.
+    returns bool.
+    body:
+        let kind = byte(message, usize(0)).
+        if kind == 83:
+            let key = WarehouseCStringEnd(message, usize(5)).
+            if key < 7:
+                return false.
+            let value = WarehouseCStringEnd(message, usize(key)).
+            return value == i64(len(message)).
+        if kind == 65:
+            if len(message) < 11:
+                return false.
+            let channel = WarehouseCStringEnd(message, usize(9)).
+            if channel < 11:
+                return false.
+            return WarehouseCStringEnd(message, usize(channel)) == i64(len(message)).
+        if kind == 78:
+            let mut offset = usize(5).
+            while offset < len(message):
+                if byte(message, offset) == 0:
+                    return offset + 1 == len(message).
+                let end = WarehouseCStringEnd(message, offset + 1).
+                if end < 0:
+                    return false.
+                set offset = usize(end).
+        return false.
+
+# Exactly the wire sequence emitted by Parse+Bind+Execute+Sync (no Describe).
+# status preserves the first SQL error through ReadyForQuery. A malformed frame
+# or lost connection is returned immediately: the owner must close, not reuse it.
+# Modes: 0 command, 1 warehouse, 2 encoded warehouse, 3 reserve locks,
+# 4 release locks, 5 encoded stock, 6 UPDATE. No per-row allocation or ID copying.
+operation WarehouseQuery:
+    accepts fd of type i64.
+    accepts query of type Bytes.
+    accepts parameter_count of type i64.
+    accepts parameters of type Bytes.
+    accepts mode of type i64.
+    accepts command of type Bytes.
+    accepts expected_rows of type i64.
+    accepts ready_state of type u8.
+    accepts scratch of type usize.
+    accepts output of type usize.
+    accepts capacity of type usize.
+    accepts offset of type i64.
+    returns WarehouseRows.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let sent = PgSendQuery(fd, query, parameter_count, parameters, scratch, usize(65536)).
+        if sent < 0:
+            return WarehouseRows(sent, 0, offset, false).
+        let mut stage = 0.
+        let mut failure = 0.
+        let mut rows = 0.
+        let mut written = offset.
+        let mut available = false.
+        let mut previous_id = 0.
+        while true:
+            let received = PgReadMessage(fd, scratch, usize(65536)).
+            if received < 0:
+                return WarehouseRows(received, rows, written, available).
+            let message = bytes_at(scratch, usize(received)).
+            let kind = byte(message, usize(0)).
+            if kind == 78 || kind == 83 || kind == 65:
+                if !WarehouseAuxiliary(message):
+                    return WarehouseRows(-71, rows, written, available).
+                continue.
+            if kind == 69:
+                let sqlstate = PgErrorCode(message).
+                if sqlstate <= 4095 || stage == 4 || stage == 5:
+                    return WarehouseRows(-71, rows, written, available).
+                if failure >= 0:
+                    set failure = 0 - sqlstate.
+                set stage = 5.
+                continue.
+            if kind == 90:
+                if len(message) != 6:
+                    return WarehouseRows(-71, rows, written, available).
+                let state = byte(message, usize(5)).
+                if state != 73 && state != 84 && state != 69:
+                    return WarehouseRows(-71, rows, written, available).
+                if stage == 5 && failure < -4095:
+                    return WarehouseRows(failure, rows, written, available).
+                if stage != 4 || state != ready_state:
+                    return WarehouseRows(-71, rows, written, available).
+                if failure == 0 && written < 0:
+                    if written == -28:
+                        return WarehouseRows(413, rows, written, available).
+                    return WarehouseRows(-71, rows, written, available).
+                return WarehouseRows(failure, rows, written, available).
+            if stage == 0 && kind == 49 && len(message) == 5:
+                set stage = 1.
+                continue.
+            if stage == 1 && kind == 50 && len(message) == 5:
+                set stage = 2.
+                continue.
+            if stage != 2:
+                return WarehouseRows(-71, rows, written, available).
+            if kind == 67:
+                if len(message) < 7 || byte(message, len(message) - 1) != 0:
+                    return WarehouseRows(-71, rows, written, available).
+                let tag = slice(message, usize(5), len(message) - 6).
+                if mode == 0:
+                    if rows != 0 || tag != command:
+                        return WarehouseRows(-71, rows, written, available).
+                else:
+                    let mut prefix = bytes("SELECT ").
+                    if mode == 6:
+                        set prefix = bytes("UPDATE ").
+                    if !BytesStartsWith(tag, prefix):
+                        return WarehouseRows(-71, rows, written, available).
+                    let count = BytesParseDecimal(slice(tag, len(prefix), len(tag) - len(prefix))).
+                    if count < 0:
+                        return WarehouseRows(-71, rows, written, available).
+                    if mode == 6:
+                        if count != expected_rows || rows != 0:
+                            return WarehouseRows(-71, rows, written, available).
+                    else:
+                        if count != rows:
+                            return WarehouseRows(-71, rows, written, available).
+                set stage = 4.
+                continue.
+            if kind != 68 || mode == 0 || mode == 6 || len(message) < 7:
+                return WarehouseRows(-71, rows, written, available).
+            let fields = i64(byte(message, usize(5))) * 256 + i64(byte(message, usize(6))).
+            let mut expected_fields = 3.
+            if mode == 5:
+                set expected_fields = 6.
+            if fields != expected_fields:
+                return WarehouseRows(-71, rows, written, available).
+            let first = PgRowField(message, 0).
+            let second = PgRowField(message, 1).
+            let third = PgRowField(message, 2).
+            if first.length < 0 || second.length < 0 || third.length < 0:
+                return WarehouseRows(-71, rows, written, available).
+            set rows = rows + 1.
+            if mode == 1 || mode == 2:
+                let id = WarehouseFieldNumber(first).
+                if rows != 1 || id < 1 || !WarehouseFieldText(second, 256) || third.length != 1:
+                    return WarehouseRows(-71, rows, written, available).
+                let boolean = load8(third.pointer).
+                if boolean != 116 && boolean != 102:
+                    return WarehouseRows(-71, rows, written, available).
+                set available = boolean == 116.
+                if mode == 2:
+                    set written = WarehouseAppend(output, capacity, written, bytes("{\"warehouse\":{\"id\":" )).
+                    set written = WarehouseNumber(output, capacity, written, id).
+                    set written = WarehouseAppend(output, capacity, written, bytes(",\"name\":" )).
+                    set written = WarehouseQuote(output, capacity, written, bytes_at(second.pointer, usize(second.length))).
+                    set written = WarehouseAppend(output, capacity, written, bytes(",\"available\":" )).
+                    if available:
+                        set written = WarehouseAppend(output, capacity, written, bytes("true")).
+                    else:
+                        set written = WarehouseAppend(output, capacity, written, bytes("false")).
+                    set written = WarehouseAppend(output, capacity, written, bytes("},\"items\":[")).
+                continue.
+            if mode == 3 || mode == 4:
+                let id = WarehouseFieldNumber(first).
+                let quantity = WarehouseFieldNumber(second).
+                let reserved = WarehouseFieldNumber(third).
+                if id <= previous_id || quantity < 0 || reserved < 0 || reserved > quantity || rows > expected_rows:
+                    return WarehouseRows(-71, rows, written, available).
+                set previous_id = id.
+                if (mode == 3 && reserved == quantity) || (mode == 4 && reserved == 0):
+                    set failure = 409.
+                continue.
+            let quantity_field = PgRowField(message, 3).
+            let reserved_field = PgRowField(message, 4).
+            let remaining_field = PgRowField(message, 5).
+            let quantity = WarehouseFieldNumber(quantity_field).
+            let reserved = WarehouseFieldNumber(reserved_field).
+            let remaining = WarehouseFieldNumber(remaining_field).
+            if !WarehouseFieldText(first, 256) || !WarehouseFieldText(second, 64) || !WarehouseFieldText(third, 128):
+                return WarehouseRows(-71, rows, written, available).
+            if quantity < 0 || reserved < 0 || reserved > quantity || remaining != quantity - reserved:
+                return WarehouseRows(-71, rows, written, available).
+            if rows > 1:
+                set written = WarehouseAppend(output, capacity, written, bytes(",")).
+            set written = WarehouseAppend(output, capacity, written, bytes("{\"name\":" )).
+            set written = WarehouseQuote(output, capacity, written, bytes_at(first.pointer, usize(first.length))).
+            set written = WarehouseAppend(output, capacity, written, bytes(",\"size\":" )).
+            set written = WarehouseQuote(output, capacity, written, bytes_at(second.pointer, usize(second.length))).
+            set written = WarehouseAppend(output, capacity, written, bytes(",\"code\":" )).
+            set written = WarehouseQuote(output, capacity, written, bytes_at(third.pointer, usize(third.length))).
+            set written = WarehouseAppend(output, capacity, written, bytes(",\"quantity\":" )).
+            set written = WarehouseNumber(output, capacity, written, quantity).
+            set written = WarehouseAppend(output, capacity, written, bytes(",\"reserved\":" )).
+            set written = WarehouseNumber(output, capacity, written, reserved).
+            set written = WarehouseAppend(output, capacity, written, bytes(",\"available_quantity\":" )).
+            set written = WarehouseNumber(output, capacity, written, remaining).
+            set written = WarehouseAppend(output, capacity, written, bytes("}")).
+        return WarehouseRows(-71, rows, written, available).
+
+# Only placeholder NUMBERS enter SQL construction. All request values remain in
+# the codec's contiguous, bounded Bind block through the entire transaction.
+operation WarehouseCodesSql:
+    accepts prefix of type Bytes.
+    accepts suffix of type Bytes.
+    accepts count of type i64.
+    accepts output of type usize.
+    returns i64.
+    effects: UnsafeMemory.
+    body:
+        if count < 1 || count > 64:
+            return -22.
+        let mut written = WarehouseAppend(output, usize(4096), 0, prefix).
+        let mut index = 0.
+        while index < count:
+            if index > 0:
+                set written = WarehouseAppend(output, usize(4096), written, bytes(",")).
+            set written = WarehouseAppend(output, usize(4096), written, bytes("$")).
+            set written = WarehouseNumber(output, usize(4096), written, index + 2).
+            set index = index + 1.
+        return WarehouseAppend(output, usize(4096), written, suffix).
+
+operation WarehouseError:
+    accepts client of type i64.
+    accepts status of type i64.
+    accepts code of type Bytes.
+    accepts output of type usize.
+    accepts capacity of type usize.
+    accepts header of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mut written = WarehouseAppend(output, capacity, 0, bytes("{\"error\":{\"code\":" )).
+        set written = WarehouseQuote(output, capacity, written, code).
+        set written = WarehouseAppend(output, capacity, written, bytes("}}")).
+        if written < 0:
+            return written.
+        return HttpWriteResponse(client, status, bytes_at(output, usize(written)), header, usize(1024)).
+
+# Rollback and close never replace a primary error. Even an unusable connection
+# is bounded by its socket timeout; rollback is attempted only after Ready.
+operation WarehouseAbort:
+    accepts fd of type i64.
+    accepts scratch of type usize.
+    accepts primary of type i64.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if primary >= 0 || primary < -4095:
+            WarehouseQuery(fd, bytes("ROLLBACK"), 0, bytes(""), 0, bytes("ROLLBACK"), 0, u8(73), scratch, usize(0), usize(0), 0).
+        LinuxClose(fd).
+        return primary.
+
+operation WarehouseTransaction:
+    accepts fd of type i64.
+    accepts request of type WarehouseRequest.
+    accepts action of type i64.
+    accepts sql of type usize.
+    accepts scratch of type usize.
+    accepts output of type usize.
+    accepts capacity of type usize.
+    returns WarehouseRows.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let parameters = bytes_at(request.parameters, request.parameter_bytes).
+        # Read the first BE32 length rather than depending on ID zero-padding.
+        if len(parameters) < 5:
+            LinuxClose(fd).
+            return WarehouseRows(-71, 0, 0, false).
+        let first_length = usize(byte(parameters, usize(0))) * 16777216 + usize(byte(parameters, usize(1))) * 65536 + usize(byte(parameters, usize(2))) * 256 + usize(byte(parameters, usize(3))).
+        if first_length < 1 || first_length > 19 || first_length > len(parameters) - 4:
+            LinuxClose(fd).
+            return WarehouseRows(-71, 0, 0, false).
+        let warehouse_parameter = slice(parameters, usize(0), first_length + 4).
+        let mut begin = bytes("BEGIN").
+        if action == 0:
+            set begin = bytes("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").
+        let begun = WarehouseQuery(fd, begin, 0, bytes(""), 0, bytes("BEGIN"), 0, u8(84), scratch, output, capacity, 0).
+        if begun.status != 0:
+            WarehouseAbort(fd, scratch, begun.status).
+            return begun.
+        let mut metadata_sql = bytes("SELECT id,name,available FROM warehouses WHERE id=$1 FOR SHARE").
+        let mut metadata_mode = 1.
+        if action == 0:
+            set metadata_sql = bytes("SELECT id,name,available FROM warehouses WHERE id=$1").
+            set metadata_mode = 2.
+        let warehouse = WarehouseQuery(fd, metadata_sql, 1, warehouse_parameter, metadata_mode, bytes(""), 1, u8(84), scratch, output, capacity, 0).
+        if warehouse.status != 0:
+            WarehouseAbort(fd, scratch, warehouse.status).
+            return warehouse.
+        if warehouse.rows != 1:
+            WarehouseAbort(fd, scratch, 404).
+            return WarehouseRows(404, 0, 0, false).
+        if action == 1 && !warehouse.available:
+            WarehouseAbort(fd, scratch, 410).
+            return WarehouseRows(410, 0, 0, false).
+        let mut written = warehouse.written.
+        if action == 0:
+            let stock = WarehouseQuery(fd, bytes("SELECT items.name,items.size,items.code,inventory.quantity,inventory.reserved,inventory.quantity-inventory.reserved FROM inventory JOIN items ON items.id=inventory.item_id WHERE inventory.warehouse_id=$1 ORDER BY items.code COLLATE \"C\""), 1, warehouse_parameter, 5, bytes(""), 0, u8(84), scratch, output, capacity, written).
+            if stock.status != 0:
+                WarehouseAbort(fd, scratch, stock.status).
+                return stock.
+            set written = WarehouseAppend(output, capacity, stock.written, bytes("]}")).
+        else:
+            let query_size = WarehouseCodesSql(bytes("SELECT inventory.item_id,inventory.quantity,inventory.reserved FROM inventory JOIN items ON items.id=inventory.item_id WHERE inventory.warehouse_id=$1 AND items.code IN ("), bytes(") ORDER BY inventory.item_id FOR UPDATE OF inventory"), request.code_count, sql).
+            if query_size < 0:
+                WarehouseAbort(fd, scratch, 413).
+                return WarehouseRows(413, 0, 0, false).
+            let mut lock_mode = 3.
+            if action == 2:
+                set lock_mode = 4.
+            let locked = WarehouseQuery(fd, bytes_at(sql, usize(query_size)), request.code_count + 1, parameters, lock_mode, bytes(""), request.code_count, u8(84), scratch, output, capacity, 0).
+            if locked.status < 0:
+                WarehouseAbort(fd, scratch, locked.status).
+                return locked.
+            if locked.rows != request.code_count:
+                WarehouseAbort(fd, scratch, 405).
+                return WarehouseRows(405, 0, 0, false).
+            if locked.status != 0:
+                WarehouseAbort(fd, scratch, locked.status).
+                return locked.
+            let mut update_prefix = bytes("UPDATE inventory SET reserved=reserved+1 FROM items WHERE items.id=inventory.item_id AND inventory.warehouse_id=$1 AND items.code IN (").
+            if action == 2:
+                set update_prefix = bytes("UPDATE inventory SET reserved=reserved-1 FROM items WHERE items.id=inventory.item_id AND inventory.warehouse_id=$1 AND items.code IN (").
+            let update_size = WarehouseCodesSql(update_prefix, bytes(")"), request.code_count, sql).
+            if update_size < 0:
+                WarehouseAbort(fd, scratch, 413).
+                return WarehouseRows(413, 0, 0, false).
+            let updated = WarehouseQuery(fd, bytes_at(sql, usize(update_size)), request.code_count + 1, parameters, 6, bytes(""), request.code_count, u8(84), scratch, output, capacity, 0).
+            if updated.status != 0:
+                WarehouseAbort(fd, scratch, updated.status).
+                return updated.
+            set written = WarehouseAppend(output, capacity, 0, bytes("{\"warehouse_id\":" )).
+            set written = WarehouseNumber(output, capacity, written, request.warehouse_id).
+            if action == 1:
+                set written = WarehouseAppend(output, capacity, written, bytes(",\"reserved\":" )).
+            else:
+                set written = WarehouseAppend(output, capacity, written, bytes(",\"released\":" )).
+            set written = WarehouseNumber(output, capacity, written, request.code_count).
+            set written = WarehouseAppend(output, capacity, written, bytes("}")).
+        if written < 0:
+            WarehouseAbort(fd, scratch, 413).
+            return WarehouseRows(413, 0, 0, false).
+        let committed = WarehouseQuery(fd, bytes("COMMIT"), 0, bytes(""), 0, bytes("COMMIT"), 0, u8(73), scratch, output, capacity, written).
+        LinuxClose(fd).
+        if committed.status < 0 && committed.status >= -4095:
+            # A partial COMMIT write, EOF, or malformed reply has unknown outcome.
+            # Never rollback, replay, or compensate once COMMIT has been sent.
+            return WarehouseRows(504, 0, 0, false).
+        if committed.status != 0:
+            return committed.
+        return WarehouseRows(0, 0, written, warehouse.available).
+
+# The server owns client and arena. This callback owns only its database fd,
+# closed by WarehouseTransaction on every return, or here before transaction.
+operation ServerDispatch:
+    accepts client of type i64.
+    accepts arena of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if capacity < 262144 || arena == 0 || capacity > usize(9223372036854775807):
+            return -22.
+        let codec = arena + 131072.
+        let sql = codec + 16384.
+        let scratch = sql + 4096.
+        let output = scratch + 65536.
+        let response_capacity = capacity - 218112.
+        let header = arena + capacity - 1024.
+        let received = HttpReadRequest(client, arena, usize(131072)).
+        if received < 0:
+            if received == -400:
+                return WarehouseError(client, 400, bytes("invalid_request"), output, response_capacity, header).
+            if received == -413:
+                return WarehouseError(client, 413, bytes("request_too_large"), output, response_capacity, header).
+            if received == -431:
+                return WarehouseError(client, 431, bytes("headers_too_large"), output, response_capacity, header).
+            if received == -11 || received == -110:
+                return WarehouseError(client, 408, bytes("request_timeout"), output, response_capacity, header).
+            return received.
+        let http = bytes_at(arena, usize(received)).
+        let path = HttpPath(http).
+        if path != bytes("/stock") && path != bytes("/reserve") && path != bytes("/release"):
+            return WarehouseError(client, 404, bytes("action_not_found"), output, response_capacity, header).
+        if HttpMethod(http) != bytes("POST"):
+            return WarehouseError(client, 405, bytes("method_not_allowed"), output, response_capacity, header).
+        let body_offset = HttpBodyOffset(http).
+        if body_offset < 0:
+            return WarehouseError(client, 400, bytes("invalid_request"), output, response_capacity, header).
+        let body = slice(http, usize(body_offset), len(http) - usize(body_offset)).
+        let request = WarehouseDecodeRequest(body, path != bytes("/stock"), codec, usize(16384)).
+        if request.status == 413:
+            return WarehouseError(client, 413, bytes("request_too_large"), output, response_capacity, header).
+        if request.status != 0:
+            return WarehouseError(client, 400, bytes("invalid_request"), output, response_capacity, header).
+        let fd = LinuxUnixConnect(WarehouseDatabaseSocket(), scratch).
+        if fd < 0:
+            return WarehouseError(client, 503, bytes("database_error"), output, response_capacity, header).
+        let timeout = LinuxSocketTimeouts(fd, 5).
+        if timeout < 0:
+            LinuxClose(fd).
+            return WarehouseError(client, 503, bytes("database_error"), output, response_capacity, header).
+        let started = PgStartup(fd, WarehouseDatabaseUser(), WarehouseDatabaseName(), scratch, usize(65536)).
+        if started < 0:
+            LinuxClose(fd).
+            return WarehouseError(client, 503, bytes("database_error"), output, response_capacity, header).
+        let mut action = 0.
+        if path == bytes("/reserve"):
+            set action = 1.
+        if path == bytes("/release"):
+            set action = 2.
+        let result = WarehouseTransaction(fd, request, action, sql, scratch, output, response_capacity).
+        if result.status == 0:
+            return HttpWriteResponse(client, 200, bytes_at(output, usize(result.written)), header, usize(1024)).
+        if result.status == 404:
+            return WarehouseError(client, 404, bytes("warehouse_not_found"), output, response_capacity, header).
+        if result.status == 405:
+            return WarehouseError(client, 404, bytes("item_not_found"), output, response_capacity, header).
+        if result.status == 410:
+            return WarehouseError(client, 409, bytes("warehouse_unavailable"), output, response_capacity, header).
+        if result.status == 409:
+            let mut code = bytes("insufficient_stock").
+            if action == 2:
+                set code = bytes("insufficient_reservation").
+            return WarehouseError(client, 409, code, output, response_capacity, header).
+        if result.status == 413:
+            return WarehouseError(client, 413, bytes("result_too_large"), output, response_capacity, header).
+        if result.status == 504:
+            return WarehouseError(client, 503, bytes("commit_outcome_unknown"), output, response_capacity, header).
+        return WarehouseError(client, 503, bytes("database_error"), output, response_capacity, header).

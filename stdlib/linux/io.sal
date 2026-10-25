@@ -1,0 +1,57 @@
+# Linux x86-64: syscall results preserve negative errno values.
+# UnsafeMemory is explicit because the kernel consumes raw buffer addresses.
+operation LinuxWriteAll:
+    accepts fd of type i64.
+    accepts data of type Bytes.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mut offset = usize(0).
+        while offset < len(data):
+            let remaining = slice(data, offset, len(data) - offset).
+            let written = syscall(1, fd, address(remaining), len(remaining), 0, 0, 0).
+            if written == -4:
+                continue.
+            if written == 0:
+                return -5.
+            if written < 0:
+                return written.
+            set offset = offset + usize(written).
+        return i64(offset).
+
+operation LinuxReadInto:
+    accepts fd of type i64.
+    accepts buffer of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mut result = syscall(0, fd, buffer, capacity, 0, 0, 0).
+        while result == -4:
+            set result = syscall(0, fd, buffer, capacity, 0, 0, 0).
+        return result.
+
+operation LinuxClose:
+    accepts fd of type i64.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        return syscall(3, fd, 0, 0, 0, 0, 0).
+
+# Exactly capacity bytes or a negative errno; early EOF is -61 (ENODATA).
+operation LinuxReadExact:
+    accepts fd of type i64.
+    accepts buffer of type usize.
+    accepts capacity of type usize.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mut offset = usize(0).
+        while offset < capacity:
+            let received = LinuxReadInto(fd, buffer + offset, capacity - offset).
+            if received == 0:
+                return -61.
+            if received < 0:
+                return received.
+            set offset = offset + usize(received).
+        return i64(offset).

@@ -1,0 +1,33 @@
+use "std/concurrency.sal".
+entity Limits:
+    layout "C".
+    has current of type usize.
+    has maximum of type usize.
+operation One:
+    accepts value of type i64.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        return value + 1.
+operation Main:
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mut failure = 0.
+        let cap = Limits(usize(67108864), usize(67108864)).
+        if syscall(160, 9, address(cap), 0, 0, 0, 0) != 0:
+            return 70.
+        let mut total = 0.
+        let mut index = 0.
+        while index < 32:
+            let thread = spawn(One, index).
+            let code = join(thread).
+            if code != index + 1:
+                if failure == 0:
+                    set failure = 1.
+            set total = total + code.
+            set index = index + 1.
+        if total != 528:
+            if failure == 0:
+                set failure = 2.
+        return failure.

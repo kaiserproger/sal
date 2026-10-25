@@ -1,0 +1,17 @@
+application NativeFunctions.
+
+operation Sum:
+    accepts a of type i64.
+    accepts b of type i64.
+    returns i64.
+    body:
+        return a + b.
+
+operation Main:
+    returns Text.
+    body:
+        let answer = Sum(20, 22).
+        if answer == 42:
+            return "{\"answer\": 42}".
+        else:
+            return "wrong result".

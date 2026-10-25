@@ -1,0 +1,32 @@
+use "std/concurrency.sal".
+operation EchoWorker:
+    accepts ch of type Channel<i64>.
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let got = receive(ch).
+        channel_drop(ch).
+        if got.open == false:
+            return -1.
+        return got.value + 1.
+operation Main:
+    returns i64.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mut failure = 0.
+        let ch = channel(i64, usize(0)).
+        let worker_ch = channel_clone(ch).
+        let thread = spawn(EchoWorker, worker_ch).
+        let sent = send(ch, 41).
+        if sent.sent == false:
+            if failure == 0:
+                set failure = 1.
+        if sent.value != 41:
+            if failure == 0:
+                set failure = 2.
+        let code = join(thread).
+        channel_drop(ch).
+        if code != 42:
+            if failure == 0:
+                set failure = 3.
+        return failure.
