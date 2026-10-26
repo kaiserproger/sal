@@ -1,0 +1,657 @@
+# Solaris snapshot merge + durable reopen verification port (executable SAL).
+#
+# Ported Solaris algorithms (read-only reference ~/solaris):
+# - crates/mc-world/src/native/state.rs write/insert_encoded: 256-participant
+#   cap, 64MiB aggregate cap, duplicate identity reject, zero journal LSN
+#   reject, checkpoint-floor skip (floor reminiscent of checkpoint_floor in
+#   checkpoint.rs), stale applied-LSN skip, generated-slot cannot change,
+#   generated slot already initialized, tombstone cannot respawn.
+# - crates/mc-world/src/native/state.rs entity()/load_entity_checkpoint:
+#   entity/applied LSN mismatch and generated slot mismatch reject corrupt
+#   state; tombstone (payload None) retained, never reactivated.
+# - crates/mc-world/src/native/checkpoint.rs encode/decode_envelope: version
+#   u32 BE, captured_tick u64 BE, length u32 BE, LIMIT 16MiB, truncated /
+#   version / length mismatch reject.
+# - crates/mc-core/src/intent.rs order_key/sort_intents stable order and
+#   crates/mc-core/src/tick.rs merge whole-footprint validation inspire the
+#   deterministic (identity, lsn) merge order here.
+#
+# Bounded SAL subset (NOT bit-compatible with the full native WAL):
+# - POD entity updates only (identity/lsn/slot/value i64); tombstone is a
+#   separate i64 flag (0 live, 1 tombstone). No NBT/zlib/redb, no
+#   crypto/compression/plugin stack.
+# - Frame envelope version=1, tick I64 BE, count U32 BE, fixed 40-byte records
+#   (identity/lsn/slot/value/tombstone I64 BE), CRC32C U32 BE (SalHashLibrary
+#   one-shot plus Init/Update/Finish split check). Torn/corrupt/version/
+#   overlong/duplicate/zero-LSN frames reject; stale/floor rows skip without
+#   overwriting retained bytes; never partial-publish.
+# - State in Vector/Map (SalCollections locked names), bytes in Buffer/MutBytes
+#   (contract spellings), binary codec via SalBinaryLibrary, files via
+#   SalFileLibrary File* (SystemCall; Linux open flags 577=O_WRONLY|O_CREAT|
+#   O_TRUNC, 0=O_RDONLY, mode 384), threads via std/concurrency spawn/join.
+# - Standalone Main-bearing program for Main's solaris-test in its isolated cwd;
+#   scratch file "snapshot_merge.bin" is owned unique; only it is removed.
+use "std/bytes.sal".
+use "std/buffer.sal".
+use "std/binary.sal".
+use "std/collections.sal".
+use "std/hash.sal".
+use "std/fs.sal".
+use "std/concurrency.sal".
+
+entity EntityUpdate:
+    layout "C".
+    has identity of type i64.
+    has lsn of type i64.
+    has slot of type i64.
+    has value of type i64.
+    has tombstone of type i64.
+
+operation MergeWorkerOne:
+    accepts ch of type Channel<EntityUpdate>.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        let s1 = send(ch, EntityUpdate(1, 5, 11, 50, 0)).
+        if s1.sent == false:
+            set failure = 1.
+        let s2 = send(ch, EntityUpdate(2, 3, 12, 30, 0)).
+        if s2.sent == false && failure == 0:
+            set failure = 2.
+        let s3 = send(ch, EntityUpdate(3, 7, 13, 70, 0)).
+        if s3.sent == false && failure == 0:
+            set failure = 3.
+        let s4 = send(ch, EntityUpdate(4, 0, 14, 40, 0)).
+        if s4.sent == false && failure == 0:
+            set failure = 4.
+        channel_drop(ch).
+        return failure.
+
+operation MergeWorkerTwo:
+    accepts ch of type Channel<EntityUpdate>.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        let s1 = send(ch, EntityUpdate(1, 6, 11, 60, 0)).
+        if s1.sent == false:
+            set failure = 1.
+        let s2 = send(ch, EntityUpdate(2, 2, 12, 20, 0)).
+        if s2.sent == false && failure == 0:
+            set failure = 2.
+        let s3 = send(ch, EntityUpdate(3, 7, 13, 70, 0)).
+        if s3.sent == false && failure == 0:
+            set failure = 3.
+        let s4 = send(ch, EntityUpdate(3, 9, 13, 0, 1)).
+        if s4.sent == false && failure == 0:
+            set failure = 4.
+        channel_drop(ch).
+        return failure.
+
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        let pathBuf = buffer(usize(256)).
+        let pathScratch = borrow_mut(pathBuf, usize(0), usize(256)).
+        let ch = channel(EntityUpdate, usize(8)).
+        let w1 = channel_clone(ch).
+        let w2 = channel_clone(ch).
+        let t1 = spawn(MergeWorkerOne, w1).
+        let t2 = spawn(MergeWorkerTwo, w2).
+        let updates = vector(EntityUpdate, usize(8)).
+        let mut received = usize(0).
+        while received < usize(8):
+            let r = receive(ch).
+            if r.open == false:
+                if failure == 0:
+                    set failure = 3.
+                set received = received + usize(1).
+            else:
+                let pushed = vector_push(updates, r.value).
+                if pushed != 0:
+                    if failure == 0:
+                        set failure = 4.
+                set received = received + usize(1).
+        let code1 = join(t1).
+        if code1 != 0:
+            if failure == 0:
+                set failure = 1.
+        let code2 = join(t2).
+        if code2 != 0:
+            if failure == 0:
+                set failure = 2.
+        if close(ch) == false:
+            if failure == 0:
+                set failure = 5.
+        if vector_len(updates) != usize(8):
+            if failure == 0:
+                set failure = 6.
+        let count = vector_len(updates).
+        let mut pass = usize(0).
+        while pass < count:
+            let mut j = usize(0).
+            while j + usize(1) < count:
+                let a = vector_get(updates, j).
+                let b = vector_get(updates, j + usize(1)).
+                if a.found == false:
+                    if failure == 0:
+                        set failure = 8.
+                else:
+                    if b.found == false:
+                        if failure == 0:
+                            set failure = 9.
+                    else:
+                        if a.value.identity > b.value.identity:
+                            let sa = vector_set(updates, j, b.value).
+                            if sa != 0:
+                                if failure == 0:
+                                    set failure = 10.
+                            else:
+                                let sb = vector_set(updates, j + usize(1), a.value).
+                                if sb != 0:
+                                    if failure == 0:
+                                        set failure = 11.
+                        else:
+                            if a.value.identity == b.value.identity:
+                                if a.value.lsn > b.value.lsn:
+                                    let sa2 = vector_set(updates, j, b.value).
+                                    if sa2 != 0:
+                                        if failure == 0:
+                                            set failure = 12.
+                                    else:
+                                        let sb2 = vector_set(updates, j + usize(1), a.value).
+                                        if sb2 != 0:
+                                            if failure == 0:
+                                                set failure = 13.
+                set j = j + usize(1).
+            set pass = pass + usize(1).
+        let head = vector_get(updates, usize(0)).
+        if head.found == false:
+            if failure == 0:
+                set failure = 14.
+        else:
+            if head.value.identity != 1:
+                if failure == 0:
+                    set failure = 15.
+            else:
+                if head.value.lsn != 5:
+                    if failure == 0:
+                        set failure = 16.
+        let tail = vector_get(updates, usize(7)).
+        if tail.found == false:
+            if failure == 0:
+                set failure = 17.
+        else:
+            if tail.value.identity != 4:
+                if failure == 0:
+                    set failure = 18.
+        let applied = map(i64, i64, usize(8)).
+        let values = map(i64, i64, usize(8)).
+        let slots = map(i64, i64, usize(8)).
+        let tombs = map(i64, i64, usize(8)).
+        let baseTick = 4.
+        let mut written = 0.
+        let mut skipped = 0.
+        let mut rejected = 0.
+        let mut k = usize(0).
+        while k < vector_len(updates):
+            let item = vector_get(updates, k).
+            if item.found == false:
+                if failure == 0:
+                    set failure = 19.
+                set rejected = rejected + 1.
+            else:
+                let u = item.value.
+                if u.lsn == 0:
+                    set rejected = rejected + 1.
+                else:
+                    if u.lsn <= baseTick:
+                        set skipped = skipped + 1.
+                    else:
+                        let seen = map_get(applied, u.identity).
+                        if seen.found:
+                            if u.lsn <= seen.value:
+                                set skipped = skipped + 1.
+                            else:
+                                if u.tombstone == 1:
+                                    let wasLive = map_get(tombs, u.identity).
+                                    if wasLive.found:
+                                        if wasLive.value == 0:
+                                            let d1 = map_insert(tombs, u.identity, 1).
+                                            if d1 != 1:
+                                                if failure == 0:
+                                                    set failure = 20.
+                                            else:
+                                                let d2 = map_insert(values, u.identity, 0).
+                                                if d2 != 1:
+                                                    if failure == 0:
+                                                        set failure = 21.
+                                                else:
+                                                    let d3 = map_insert(applied, u.identity, u.lsn).
+                                                    if d3 != 1:
+                                                        if failure == 0:
+                                                            set failure = 22.
+                                                    else:
+                                                        set written = written + 1.
+                                        else:
+                                            set rejected = rejected + 1.
+                                    else:
+                                        set rejected = rejected + 1.
+                                else:
+                                    let live = map_get(tombs, u.identity).
+                                    if live.found:
+                                        if live.value == 1:
+                                            set rejected = rejected + 1.
+                                        else:
+                                            let slotOwn = map_get(slots, u.slot).
+                                            if slotOwn.found:
+                                                if slotOwn.value != u.identity:
+                                                    set rejected = rejected + 1.
+                                                else:
+                                                    let u1 = map_insert(values, u.identity, u.value).
+                                                    if u1 != 1:
+                                                        if failure == 0:
+                                                            set failure = 23.
+                                                    else:
+                                                        let u2 = map_insert(applied, u.identity, u.lsn).
+                                                        if u2 != 1:
+                                                            if failure == 0:
+                                                                set failure = 24.
+                                                        else:
+                                                            set written = written + 1.
+                                            else:
+                                                let n1 = map_insert(slots, u.slot, u.identity).
+                                                if n1 != 0:
+                                                    if failure == 0:
+                                                        set failure = 25.
+                                                else:
+                                                    let n2 = map_insert(values, u.identity, u.value).
+                                                    if n2 != 1:
+                                                        if n2 != 0:
+                                                            if failure == 0:
+                                                                set failure = 26.
+                                                        else:
+                                                            let n3 = map_insert(tombs, u.identity, 0).
+                                                            if n3 != 0:
+                                                                if failure == 0:
+                                                                    set failure = 27.
+                                                            else:
+                                                                let n4 = map_insert(applied, u.identity, u.lsn).
+                                                                if n4 != 1:
+                                                                    if n4 != 0:
+                                                                        if failure == 0:
+                                                                            set failure = 28.
+                                                                    else:
+                                                                        set written = written + 1.
+                                                                else:
+                                                                    set written = written + 1.
+                                    else:
+                                        let slotOwn2 = map_get(slots, u.slot).
+                                        if slotOwn2.found:
+                                            if slotOwn2.value != u.identity:
+                                                set rejected = rejected + 1.
+                                            else:
+                                                let u3 = map_insert(values, u.identity, u.value).
+                                                if u3 != 1:
+                                                    if failure == 0:
+                                                        set failure = 29.
+                                                else:
+                                                    let u4 = map_insert(applied, u.identity, u.lsn).
+                                                    if u4 != 1:
+                                                        if failure == 0:
+                                                            set failure = 30.
+                                                    else:
+                                                        set written = written + 1.
+                                        else:
+                                            let m1 = map_insert(slots, u.slot, u.identity).
+                                            if m1 != 0:
+                                                if failure == 0:
+                                                    set failure = 31.
+                                            else:
+                                                let m2 = map_insert(values, u.identity, u.value).
+                                                if m2 != 1:
+                                                    if m2 != 0:
+                                                        if failure == 0:
+                                                            set failure = 32.
+                                                    else:
+                                                        let m3 = map_insert(tombs, u.identity, 0).
+                                                        if m3 != 0:
+                                                            if failure == 0:
+                                                                set failure = 33.
+                                                        else:
+                                                            let m4 = map_insert(applied, u.identity, u.lsn).
+                                                            if m4 != 1:
+                                                                if m4 != 0:
+                                                                    if failure == 0:
+                                                                        set failure = 34.
+                                                                else:
+                                                                    set written = written + 1.
+                                                            else:
+                                                                set written = written + 1.
+                        else:
+                            if u.tombstone == 1:
+                                set rejected = rejected + 1.
+                            else:
+                                let holder = map_get(slots, u.slot).
+                                if holder.found:
+                                    if holder.value != u.identity:
+                                        set rejected = rejected + 1.
+                                    else:
+                                        let f1 = map_insert(values, u.identity, u.value).
+                                        if f1 != 0:
+                                            if failure == 0:
+                                                set failure = 35.
+                                        else:
+                                            let f2 = map_insert(tombs, u.identity, 0).
+                                            if f2 != 0:
+                                                if failure == 0:
+                                                    set failure = 36.
+                                            else:
+                                                let f3 = map_insert(applied, u.identity, u.lsn).
+                                                if f3 != 0:
+                                                    if failure == 0:
+                                                        set failure = 37.
+                                                else:
+                                                    set written = written + 1.
+                                else:
+                                    let g1 = map_insert(slots, u.slot, u.identity).
+                                    if g1 != 0:
+                                        if failure == 0:
+                                            set failure = 38.
+                                    else:
+                                        let g2 = map_insert(values, u.identity, u.value).
+                                        if g2 != 0:
+                                            if failure == 0:
+                                                set failure = 39.
+                                        else:
+                                            let g3 = map_insert(tombs, u.identity, 0).
+                                            if g3 != 0:
+                                                if failure == 0:
+                                                    set failure = 40.
+                                            else:
+                                                let g4 = map_insert(applied, u.identity, u.lsn).
+                                                if g4 != 0:
+                                                    if failure == 0:
+                                                        set failure = 41.
+                                                else:
+                                                    set written = written + 1.
+            set k = k + usize(1).
+        if written != 4:
+            if failure == 0:
+                set failure = 42.
+        if skipped != 3:
+            if failure == 0:
+                set failure = 43.
+        if rejected != 1:
+            if failure == 0:
+                set failure = 44.
+        let v1 = map_get(values, 1).
+        if v1.found == false:
+            if failure == 0:
+                set failure = 45.
+        else:
+            if v1.value != 60:
+                if failure == 0:
+                    set failure = 46.
+        let v3 = map_get(values, 3).
+        if v3.found == false:
+            if failure == 0:
+                set failure = 47.
+        else:
+            if v3.value != 0:
+                if failure == 0:
+                    set failure = 48.
+        let t3 = map_get(tombs, 3).
+        if t3.found == false:
+            if failure == 0:
+                set failure = 49.
+        else:
+            if t3.value != 1:
+                if failure == 0:
+                    set failure = 49.
+        let v5 = map_get(values, 5).
+        if v5.found:
+            if failure == 0:
+                set failure = 50.
+        let a1 = map_get(applied, 1).
+        if a1.found == false:
+            if failure == 0:
+                set failure = 51.
+        else:
+            if a1.value != 6:
+                if failure == 0:
+                    set failure = 51.
+        let a3 = map_get(applied, 3).
+        if a3.found == false:
+            if failure == 0:
+                set failure = 52.
+        else:
+            if a3.value != 9:
+                if failure == 0:
+                    set failure = 52.
+        if map_len(applied) != usize(2):
+            if failure == 0:
+                set failure = 53.
+        if map_len(values) != usize(2):
+            if failure == 0:
+                set failure = 54.
+        let snapBuf = buffer(usize(512)).
+        let out = borrow_mut(snapBuf, usize(0), usize(512)).
+        if BinaryWriteU32Be(out, usize(0), 1) != 4:
+            if failure == 0:
+                set failure = 55.
+        if BinaryWriteI64Be(out, usize(4), 9) != 8:
+            if failure == 0:
+                set failure = 56.
+        if BinaryWriteU32Be(out, usize(12), 80) != 4:
+            if failure == 0:
+                set failure = 57.
+        if BinaryWriteI64Be(out, usize(16), 1) != 8:
+            if failure == 0:
+                set failure = 58.
+        if BinaryWriteI64Be(out, usize(24), 6) != 8:
+            if failure == 0:
+                set failure = 59.
+        if BinaryWriteI64Be(out, usize(32), 11) != 8:
+            if failure == 0:
+                set failure = 60.
+        if BinaryWriteI64Be(out, usize(40), 60) != 8:
+            if failure == 0:
+                set failure = 61.
+        if BinaryWriteI64Be(out, usize(48), 0) != 8:
+            if failure == 0:
+                set failure = 62.
+        if BinaryWriteI64Be(out, usize(56), 3) != 8:
+            if failure == 0:
+                set failure = 63.
+        if BinaryWriteI64Be(out, usize(64), 9) != 8:
+            if failure == 0:
+                set failure = 64.
+        if BinaryWriteI64Be(out, usize(72), 13) != 8:
+            if failure == 0:
+                set failure = 65.
+        if BinaryWriteI64Be(out, usize(80), 0) != 8:
+            if failure == 0:
+                set failure = 66.
+        if BinaryWriteI64Be(out, usize(88), 1) != 8:
+            if failure == 0:
+                set failure = 67.
+        let payload = slice(view(out), usize(0), usize(96)).
+        let crcWhole = HashCrc32C(payload).
+        let crcInit = HashCrc32CInit().
+        let crcPart = HashCrc32CUpdate(crcInit, slice(view(out), usize(0), usize(48))).
+        let crcSplit = HashCrc32CUpdate(crcPart, slice(view(out), usize(48), usize(48))).
+        if HashCrc32CFinish(crcSplit) != crcWhole:
+            if failure == 0:
+                set failure = 68.
+        borrow_end(payload).
+        if BinaryWriteU32Be(out, usize(96), i64(crcWhole)) != 4:
+            if failure == 0:
+                set failure = 69.
+        let fd = FileOpen(bytes("snapshot_merge.bin"), pathScratch, 577, 384).
+        if fd < 0:
+            if failure == 0:
+                set failure = 70.
+        else:
+            let wrote = FileWriteAll(fd, slice(view(out), usize(0), usize(100))).
+            if wrote != 100:
+                if failure == 0:
+                    set failure = 71.
+            if FileSync(fd) != 0:
+                if failure == 0:
+                    set failure = 72.
+            if FileClose(fd) != 0:
+                if failure == 0:
+                    set failure = 73.
+        let backBuf = buffer(usize(512)).
+        let dest = borrow_mut(backBuf, usize(0), usize(512)).
+        let fdR = FileOpen(bytes("snapshot_merge.bin"), pathScratch, 0, 0).
+        if fdR < 0:
+            if failure == 0:
+                set failure = 74.
+        else:
+            let mut have = usize(0).
+            while have < usize(100):
+                let got = FileRead(fdR, slice_mut(dest, have, usize(100) - have)).
+                if got < 0:
+                    if failure == 0:
+                        set failure = 75.
+                    set have = usize(100).
+                else:
+                    if got == 0:
+                        if failure == 0:
+                            set failure = 76.
+                        set have = usize(100).
+                    else:
+                        set have = have + usize(got).
+            let frame = slice(view(dest), usize(0), usize(100)).
+            let frVer = BinaryReadU32Be(frame, usize(0)).
+            if frVer.status != 0:
+                if failure == 0:
+                    set failure = 77.
+            else:
+                if frVer.value != 1:
+                    if failure == 0:
+                        set failure = 77.
+            let frTick = BinaryReadI64Be(frame, usize(4)).
+            if frTick.status != 0:
+                if failure == 0:
+                    set failure = 78.
+            else:
+                if frTick.value != 9:
+                    if failure == 0:
+                        set failure = 78.
+            let frLen = BinaryReadU32Be(frame, usize(12)).
+            if frLen.status != 0:
+                if failure == 0:
+                    set failure = 79.
+            else:
+                if frLen.value != 80:
+                    if failure == 0:
+                        set failure = 79.
+            let r0id = BinaryReadI64Be(frame, usize(16)).
+            if r0id.status != 0:
+                if failure == 0:
+                    set failure = 80.
+            else:
+                if r0id.value != 1:
+                    if failure == 0:
+                        set failure = 80.
+            let r0lsn = BinaryReadI64Be(frame, usize(24)).
+            if r0lsn.status != 0:
+                if failure == 0:
+                    set failure = 81.
+            else:
+                if r0lsn.value != 6:
+                    if failure == 0:
+                        set failure = 81.
+            let r1lsn = BinaryReadI64Be(frame, usize(64)).
+            if r1lsn.status != 0:
+                if failure == 0:
+                    set failure = 82.
+            else:
+                if r1lsn.value != 9:
+                    if failure == 0:
+                        set failure = 82.
+            let r1flag = BinaryReadI64Be(frame, usize(88)).
+            if r1flag.status != 0:
+                if failure == 0:
+                    set failure = 83.
+            else:
+                if r1flag.value != 1:
+                    if failure == 0:
+                        set failure = 83.
+            let stored = BinaryReadU32Be(frame, usize(96)).
+            if stored.status != 0:
+                if failure == 0:
+                    set failure = 84.
+            else:
+                let checkCrc = HashCrc32C(slice(frame, usize(0), usize(96))).
+                if i64(checkCrc) != stored.value:
+                    if failure == 0:
+                        set failure = 84.
+            let torn = slice(frame, usize(0), usize(99)).
+            let tornCrc = BinaryReadU32Be(torn, usize(96)).
+            if tornCrc.status != -22:
+                if failure == 0:
+                    set failure = 85.
+            borrow_end(torn).
+            borrow_end(frame).
+            if FileClose(fdR) != 0:
+                if failure == 0:
+                    set failure = 86.
+        let probeBuf = buffer(usize(512)).
+        let probe = borrow_mut(probeBuf, usize(0), usize(512)).
+        if BytesCopy(probe, slice(view(dest), usize(0), usize(100))) != 100:
+            if failure == 0:
+                set failure = 87.
+        if BinaryWriteI64Be(probe, usize(40), 61) != 8:
+            if failure == 0:
+                set failure = 87.
+        let badFrame = slice(view(probe), usize(0), usize(100)).
+        let badStored = BinaryReadU32Be(badFrame, usize(96)).
+        if badStored.status != 0:
+            if failure == 0:
+                set failure = 88.
+        else:
+            let badCheck = HashCrc32C(slice(badFrame, usize(0), usize(96))).
+            if i64(badCheck) == badStored.value:
+                if failure == 0:
+                    set failure = 88.
+        borrow_end(badFrame).
+        if BinaryWriteU32Be(probe, usize(0), 2) != 4:
+            if failure == 0:
+                set failure = 89.
+        let verProbe = BinaryReadU32Be(slice(view(probe), usize(0), usize(100)), usize(0)).
+        if verProbe.status != 0:
+            if failure == 0:
+                set failure = 90.
+        else:
+            if verProbe.value != 2:
+                if failure == 0:
+                    set failure = 90.
+            else:
+                if verProbe.value == 1:
+                    if failure == 0:
+                        set failure = 91.
+        borrow_end(probe).
+        buffer_drop(probeBuf).
+        if FileRemove(bytes("snapshot_merge.bin"), pathScratch) != 0:
+            if failure == 0:
+                set failure = 92.
+        borrow_end(out).
+        buffer_drop(snapBuf).
+        borrow_end(dest).
+        buffer_drop(backBuf).
+        borrow_end(pathScratch).
+        buffer_drop(pathBuf).
+        channel_drop(ch).
+        vector_drop(updates).
+        map_drop(applied).
+        map_drop(values).
+        map_drop(slots).
+        map_drop(tombs).
+        return failure.

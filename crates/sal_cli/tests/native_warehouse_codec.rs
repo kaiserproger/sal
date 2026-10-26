@@ -25,9 +25,9 @@ impl Fixture {
 
     fn execute(&self, checks: &Checks) {
         let source = format!(
-            "use \"codec.sal\".\nuse \"std/bytes.sal\".\nuse \"std/linux/memory.sal\".\n\
-             operation Main:\n    returns i64.\n    effects: SystemCall, UnsafeMemory.\n    body:\n\
-             {}        return 0.\n",
+            "use \"codec.sal\".\nuse \"std/bytes.sal\".\n\
+             operation Main:\n    returns i64.\n    effects: SystemCall.\n    body:\n\
+             \x20       let mut failure = 0.\n{}        return failure.\n",
             checks.body
         );
         let source_path = self.0.join("case.sal");
@@ -100,25 +100,27 @@ impl Checks {
         assert!(code < 256, "exit codes must remain distinct");
         writeln!(
             self.body,
-            "        if {expression} != {expected}:\n            return {code}."
+            "        if failure == 0 && {expression} != {expected}:\n            set failure = {code}."
         )
         .unwrap();
     }
     fn memory(&mut self) {
         self.body.push_str(concat!(
-            "        let mapping = LinuxMapMemory(usize(4096)).\n",
-            "        if mapping < 0:\n            return 255.\n",
-            "        let buffer = usize(mapping).\n",
+            "        let store = buffer(usize(4096)).\n",
+            "        let arena = borrow_mut(store, usize(0), usize(4096)).\n",
         ));
     }
     fn finish_memory(&mut self) {
-        self.expect("LinuxUnmapMemory(buffer, usize(4096))", 0);
+        self.body.push_str(concat!(
+            "        borrow_end(arena).\n",
+            "        buffer_drop(store).\n",
+        ));
     }
     fn request(&mut self, var: &str, body: &str, needs_codes: bool, capacity: usize) {
         let needs = if needs_codes { "true" } else { "false" };
         writeln!(
             self.body,
-            "        let {var} = WarehouseDecodeRequest(bytes({}), {needs}, buffer, usize({capacity})).",
+            "        let loan{var} = slice_mut(arena, usize(0), usize({capacity})).\n        let {var} = WarehouseDecodeRequest(bytes({}), {needs}, loan{var}).\n        borrow_end(loan{var}).",
             text(body),
         )
         .unwrap();
@@ -390,26 +392,39 @@ fn limits_are_413_with_explicit_edges() {
     checks.expect("empty.status", 413);
     // Bodies are built in SAL so the 65536-byte boundary needs no giant literal.
     checks.body.push_str(concat!(
-        "        let area_map = LinuxMapMemory(usize(131072)).\n",
-        "        if area_map < 0:\n            return 255.\n",
-        "        let area = usize(area_map).\n",
-        "        let copied = BytesCopy(area, usize(131072), bytes(\"{\\\"warehouse_id\\\":1,\\\"codes\\\":[\\\"A\\\"]}\")).\n",
-        "        let mut total = copied.\n",
+        "        let bigStore = buffer(usize(131072)).\n",
+        "        let big = borrow_mut(bigStore, usize(0), usize(131072)).\n",
+        "        let frame = slice_mut(big, usize(0), usize(131072)).\n",
+        "        let copied = BytesCopy(frame, bytes(\"{\\\"warehouse_id\\\":1,\\\"codes\\\":[\\\"A\\\"]}\")).\n",
+        "        borrow_end(frame).\n",
+        "        let mut total = usize(copied).\n",
         "        while total < 65537:\n",
-        "            store8(area + usize(total), u8(32)).\n",
+        "            put(big, total, u8(32)).\n",
         "            set total = total + 1.\n",
-        "        let over_sized = WarehouseDecodeRequest(bytes_at(area, usize(65537)), true, buffer, usize(4096)).\n",
+        "        let bigHead = view(big).\n",
+        "        let overBody = slice(bigHead, usize(0), usize(65537)).\n",
+        "        let overLoan = slice_mut(arena, usize(0), usize(4096)).\n",
+        "        let over_sized = WarehouseDecodeRequest(overBody, true, overLoan).\n",
+        "        borrow_end(overLoan).\n",
+        "        borrow_end(bigHead).\n",
+        "        borrow_end(overBody).\n",
     ));
     checks.expect("over_sized.status", 413);
-    checks.expect(
-        "WarehouseDecodeRequest(bytes_at(area, usize(65536)), true, buffer, usize(4096)).status",
-        0,
-    );
-    checks.expect(
-        "WarehouseDecodeRequest(bytes_at(area, usize(65536)), true, buffer, usize(4096)).code_count",
-        1,
-    );
-    checks.expect("LinuxUnmapMemory(area, usize(131072))", 0);
+    checks.body.push_str(concat!(
+        "        let bigHead2 = view(big).\n",
+        "        let exactBody = slice(bigHead2, usize(0), usize(65536)).\n",
+        "        let exactLoan = slice_mut(arena, usize(0), usize(4096)).\n",
+        "        let exact = WarehouseDecodeRequest(exactBody, true, exactLoan).\n",
+        "        borrow_end(exactLoan).\n",
+        "        borrow_end(bigHead2).\n",
+        "        borrow_end(exactBody).\n",
+    ));
+    checks.expect("exact.status", 0);
+    checks.expect("exact.code_count", 1);
+    checks.body.push_str(concat!(
+        "        borrow_end(big).\n",
+        "        buffer_drop(bigStore).\n",
+    ));
     checks.finish_memory();
     Fixture::new().execute(&checks);
 }

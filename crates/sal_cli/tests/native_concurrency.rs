@@ -7,6 +7,8 @@
 //!   usize capacity; `channel_clone(c)` borrows; `channel_drop(c)` consumes
 //!   (Void); `close(c)` borrows and returns bool; `send(c, v)` and
 //!   `receive(c)` borrow. All via `use "std/concurrency.sal".`
+//!   The safe surface needs only `effects: SystemCall.`; erased runtime
+//!   pointer entry points remain unsafe and are never a safe-handle factory.
 //! - `spawn(Worker, value)` takes a bare operation name; `join(t)` consumes.
 //!   Each worker takes one scalar / C-record / `Channel<T>` and returns `i64`.
 //!   A `Channel<T>` spawn argument moves; the worker consumes it. Clone the
@@ -72,6 +74,7 @@ impl Fixture {
         Command::new(env!("CARGO_BIN_EXE_sal"))
             .arg("build-exe")
             .arg(source)
+            .arg("--strict")
             .arg("--out")
             .arg(self.0.join(out_dir))
             .output()
@@ -183,7 +186,7 @@ fn bounded_buffered_send_receive_drain_then_close_reports_typed_outcomes() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ch = channel(i64, usize(2)).
@@ -245,7 +248,7 @@ fn rendezvous_channel_moves_through_native_thread_send_join() {
 operation EchoWorker:
     accepts ch of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let got = receive(ch).
         channel_drop(ch).
@@ -254,7 +257,7 @@ operation EchoWorker:
         return got.value + 1.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ch = channel(i64, usize(0)).
@@ -290,7 +293,7 @@ fn wait_for_commits_exactly_one_ready_arm_without_loss_or_double_consume() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let left = channel(i64, usize(1)).
@@ -380,7 +383,7 @@ entity Pair:
     has y of type i64.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ready = channel(Pair, usize(1)).
@@ -471,7 +474,7 @@ entity Pair:
     has y of type i64.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let data = channel(Pair, usize(1)).
@@ -597,7 +600,7 @@ fn otherwise_fallback_reports_arm_count_without_blocking() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ch = channel(i64, usize(1)).
@@ -630,7 +633,7 @@ fn timeout_fallback_then_close_drain_covers_time_and_close_races() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ch = channel(i64, usize(0)).
@@ -674,7 +677,7 @@ fn blocked_wait_wakes_exactly_once_without_lost_wakeup() {
 operation Sender:
     accepts ch of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let sent = send(ch, 99).
         channel_drop(ch).
@@ -684,7 +687,7 @@ operation Sender:
             return 0.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ch = channel(i64, usize(0)).
@@ -730,7 +733,7 @@ fn double_close_and_send_on_closed_preserves_original_value() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ch = channel(i64, usize(1)).
@@ -784,7 +787,7 @@ fn two_ready_arms_share_selection_over_repeated_waits() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let left = channel(i64, usize(1)).
@@ -863,24 +866,25 @@ fn wait_send_value_is_evaluated_exactly_once() {
     let source = fixture.source(
         "eval_once.sal",
         r#"use "std/concurrency.sal".
-use "std/linux/memory.sal".
+use "std/buffer.sal".
 operation Next:
-    accepts cell of type usize.
+    accepts cell of type MutBytes.
     returns i64.
-    effects: UnsafeMemory.
+    requires:
+        len(cell) == usize(1).
     body:
-        let n = load64(cell).
-        store64(cell, n + usize(1)).
+        let observed = view(cell).
+        let n = byte(observed, usize(0)).
+        borrow_end(observed).
+        put(cell, usize(0), n + u8(1)).
         return i64(n).
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mapping = LinuxMapMemory(usize(4096)).
-        if mapping < 0:
-            return 1.
-        let cell = usize(mapping).
-        store64(cell, usize(0)).
+        let arena = buffer(usize(1)).
+        let cell = borrow_mut(arena, usize(0), usize(1)).
+        put(cell, usize(0), u8(0)).
         let mut failure = 0.
         let ch = channel(i64, usize(1)).
         let winner = wait_for(send(ch, Next(cell)), timeout(usize(50))).
@@ -896,7 +900,7 @@ operation Main:
         if winner.arm0.value != 0:
             if failure == 0:
                 set failure = 5.
-        if load64(cell) != usize(1):
+        if byte(view(cell), usize(0)) != u8(1):
             if failure == 0:
                 set failure = 6.
         let got = receive(ch).
@@ -907,10 +911,8 @@ operation Main:
             if failure == 0:
                 set failure = 8.
         channel_drop(ch).
-        let unmapped = LinuxUnmapMemory(cell, usize(4096)).
-        if unmapped != 0:
-            if failure == 0:
-                set failure = 9.
+        borrow_end(cell).
+        buffer_drop(arena).
         return failure.
 "#,
     );
@@ -930,7 +932,7 @@ fn concurrent_rendezvous_select_commits_exactly_one_then_drains_loser() {
 operation SenderOne:
     accepts ch of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let sent = send(ch, 1).
         channel_drop(ch).
@@ -941,7 +943,7 @@ operation SenderOne:
 operation SenderTwo:
     accepts ch of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let sent = send(ch, 2).
         channel_drop(ch).
@@ -951,7 +953,7 @@ operation SenderTwo:
             return 0.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let a = channel(i64, usize(0)).
@@ -1034,12 +1036,12 @@ fn join_preserves_negative_worker_return_without_checked_trap() {
 operation Fail:
     accepts value of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return 0 - 7.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let thread = spawn(Fail, 3).
@@ -1066,12 +1068,12 @@ fn worker_checked_overflow_traps_the_whole_group() {
 operation Overflow:
     accepts value of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return value + 1.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let thread = spawn(Overflow, 9223372036854775807).
         let code = join(thread).
@@ -1101,7 +1103,7 @@ fn close_before_wait_reports_closed_every_iteration_under_stress() {
 operation Closer:
     accepts ch of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         if close(ch) == false:
             channel_drop(ch).
@@ -1110,7 +1112,7 @@ operation Closer:
         return 0.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let mut round = 0.
@@ -1160,7 +1162,7 @@ fn send_payload_type_mismatch_is_rejected() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         let sent = send(ch, bytes("hi")).
@@ -1180,7 +1182,7 @@ fn bytes_payload_channel_is_rejected() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(Bytes, usize(1)).
         channel_drop(ch).
@@ -1206,7 +1208,7 @@ entity Blob:
     has data of type Bytes.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(Blob, usize(1)).
         channel_drop(ch).
@@ -1233,7 +1235,7 @@ entity Carrier:
     has ch of type Channel<i64>.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(Carrier, usize(1)).
         channel_drop(ch).
@@ -1256,7 +1258,7 @@ fn channel_use_after_drop_is_rejected() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         channel_drop(ch).
@@ -1276,7 +1278,7 @@ fn leaked_channel_without_drop_is_rejected() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         let sent = send(ch, 1).
@@ -1300,7 +1302,7 @@ operation Identity:
         return v.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         let x = Identity(ch).
@@ -1321,14 +1323,14 @@ fn channel_use_after_spawn_move_is_rejected() {
 operation Take:
     accepts ch of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let got = receive(ch).
         channel_drop(ch).
         return 0.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(0)).
         let worker_ch = channel_clone(ch).
@@ -1352,13 +1354,13 @@ fn ordinary_channel_callee_consume_then_caller_reuse_is_rejected() {
 operation Consume:
     accepts ch of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         channel_drop(ch).
         return 0.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         let freed = Consume(ch).
@@ -1383,7 +1385,7 @@ fn branch_partial_drop_then_use_is_rejected() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         if true:
@@ -1408,7 +1410,7 @@ fn concurrent_close_wakes_blocked_waiter_with_closed_status() {
 operation Closer:
     accepts ch of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         if close(ch) == false:
             channel_drop(ch).
@@ -1417,7 +1419,7 @@ operation Closer:
         return 0.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ch = channel(i64, usize(0)).
@@ -1465,12 +1467,12 @@ fn double_join_of_the_same_thread_is_rejected() {
 operation Worker:
     accepts value of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return value.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let thread = spawn(Worker, 7).
         let first = join(thread).
@@ -1493,12 +1495,12 @@ fn spawned_thread_without_join_is_rejected() {
 operation Worker:
     accepts value of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return value.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let thread = spawn(Worker, 7).
         return 0.
@@ -1578,13 +1580,77 @@ fn atomic_boundary_without_unsafe_memory_is_rejected() {
 }
 
 #[test]
+fn erased_runtime_handles_cannot_bypass_the_safe_api() {
+    for (index, call) in [
+        "SalChannelClone(usize(4096))",
+        "SalChannelDrop(usize(4096))",
+        "SalChannelClose(usize(4096))",
+        "SalThreadJoin(usize(4096))",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let fixture = Fixture::new();
+        let source = fixture.source(
+            "raw_handle.sal",
+            &format!(
+                r#"use "std/concurrency.sal".
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        {call}.
+        return 0.
+"#
+            ),
+        );
+        let output_dir = format!("out-raw-{index}");
+        let build = fixture.build(&source, &output_dir);
+        assert_rejected_code(
+            &build,
+            &fixture.0.join(output_dir).join("raw_handle"),
+            "EFF203",
+        );
+    }
+}
+
+#[test]
+fn generated_wrappers_cannot_be_called_with_forged_handles() {
+    for call in [
+        "SalConcChannelClone(usize(4096))",
+        "SalConcChannelDrop(usize(4096))",
+        "SalConcChannelClose(usize(4096))",
+        "SalConcThreadJoin(usize(4096))",
+    ] {
+        let fixture = Fixture::new();
+        let source = fixture.source(
+            "forged_handle.sal",
+            &format!(
+                r#"use "std/concurrency.sal".
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let channel = channel(i64, usize(1)).
+        {call}.
+        channel_drop(channel).
+        return 0.
+"#
+            ),
+        );
+        let build = fixture.build(&source, "out-forged");
+        assert_rejected_code(&build, &fixture.0.join("out-forged/forged_handle"), "E0004");
+    }
+}
+
+#[test]
 fn operation_address_with_wrong_callback_signature_is_rejected() {
     let fixture = Fixture::new();
     let source = fixture.source(
         "bad_entry.sal",
         r#"operation BadWorker:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return 0.
 operation Main:
@@ -1638,23 +1704,19 @@ fn repeated_spawn_join_reclaims_stacks_with_bounded_regression() {
     let source = fixture.source(
         "stress.sal",
         r#"use "std/concurrency.sal".
-entity Limits:
-    layout "C".
-    has current of type usize.
-    has maximum of type usize.
+use "std/linux/process.sal".
 operation One:
     accepts value of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return value + 1.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
-        let cap = Limits(usize(67108864), usize(67108864)).
-        if syscall(160, 9, address(cap), 0, 0, 0, 0) != 0:
+        if LinuxSetAddressSpaceLimit(usize(67108864)) != 0:
             return 70.
         let mut total = 0.
         let mut index = 0.
@@ -1714,12 +1776,12 @@ fn channel_drop_on_thread_instead_of_join_is_rejected() {
 operation Worker:
     accepts value of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return value.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let thread = spawn(Worker, 7).
         channel_drop(thread).
@@ -1738,7 +1800,7 @@ fn dead_handle_usize_cast_after_drop_is_rejected() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         channel_drop(ch).
@@ -1758,7 +1820,7 @@ fn returns_channel_body_returns_usize_is_rejected() {
         r#"use "std/concurrency.sal".
 operation Make:
     returns Channel<i64>.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return usize(0).
 operation Main:
@@ -1779,7 +1841,7 @@ fn returns_usize_body_returns_channel_is_rejected() {
         r#"use "std/concurrency.sal".
 operation Make:
     returns usize.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         return ch.
@@ -1801,7 +1863,7 @@ fn early_return_while_channel_live_is_rejected() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         if true:
@@ -1822,14 +1884,14 @@ fn callee_returning_channel_leaking_second_is_rejected() {
         r#"use "std/concurrency.sal".
 operation Make:
     returns Channel<i64>.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let a = channel(i64, usize(1)).
         let b = channel(i64, usize(1)).
         return a.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = Make().
         channel_drop(ch).
@@ -1850,14 +1912,14 @@ operation Two:
     accepts a of type Channel<i64>.
     accepts b of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         channel_drop(a).
         channel_drop(b).
         return 0.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         let x = Two(ch, ch).
@@ -1878,13 +1940,13 @@ fn channel_i64_passed_as_channel_bool_is_rejected() {
 operation TakeBool:
     accepts b of type Channel<bool>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         channel_drop(b).
         return 0.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         let x = TakeBool(ch).
@@ -1904,7 +1966,7 @@ fn loop_inner_channel_break_leaks_is_rejected() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut index = 0.
         while index < 1:
@@ -1929,13 +1991,13 @@ fn shortcircuit_conditional_move_then_use_is_rejected() {
 operation Consume:
     accepts ch of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         channel_drop(ch).
         return 0.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         if false && Consume(ch) == 0:
@@ -1957,13 +2019,13 @@ fn ordinary_callee_returned_channel_receives_and_drops() {
         r#"use "std/concurrency.sal".
 operation Make:
     returns Channel<i64>.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         return ch.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ch = Make().
@@ -2019,7 +2081,7 @@ operation Check:
         return 0.
 operation Pick:
     returns WaitResult<i64, i64>.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let left = channel(i64, usize(1)).
         let right = channel(i64, usize(1)).
@@ -2031,7 +2093,7 @@ operation Pick:
         return winner.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let w = Pick().
@@ -2085,7 +2147,7 @@ entity Note:
     has text of type Text.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ch = channel(i64, usize(1)).
@@ -2125,7 +2187,7 @@ fn wait_send_on_u8_channel_reports_narrow_value() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ch = channel(u8, usize(1)).
@@ -2205,7 +2267,7 @@ operation Check:
         return 0.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         let sent = send(ch, 41).
@@ -2229,32 +2291,32 @@ fn owned_temporaries_are_consumed_by_spawn_join_and_typed_calls() {
         r#"use "std/concurrency.sal".
 operation Make:
     returns Channel<i64>.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return channel(i64, usize(1)).
 operation Worker:
     accepts ch of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         channel_drop(ch).
         return 7.
 operation Join:
     accepts thread of type Thread<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return join(thread).
 operation Take:
     accepts ch of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         channel_drop(ch).
         return 9.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         let first = spawn(Worker, channel_clone(ch)).
@@ -2319,7 +2381,7 @@ operation Milliseconds:
         return usize(result.arm0.value).
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let a = channel(i64, usize(1)).
         let b = channel(i64, usize(1)).
@@ -2348,7 +2410,7 @@ fn timeout_arithmetic_retains_unsigned_checked_context() {
         r#"use "std/concurrency.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let ch = channel(i64, usize(1)).
         let selected = wait_for(send(ch, 7), timeout(1 - 2)).
@@ -2360,4 +2422,114 @@ operation Main:
     success(&build);
     let output = run_bounded(&fixture.0.join("out-timeoutunderflow/timeoutunderflow"));
     assert_eq!(output.status.signal(), Some(4), "{output:?}");
+}
+
+#[test]
+fn concurrency_composes_with_collections_and_signed_binary_codecs() {
+    let fixture = Fixture::new();
+    let source = fixture.source(
+        "composition.sal",
+        r#"use "std/concurrency.sal".
+use "std/collections.sal".
+use "std/binary.sal".
+use "std/buffer.sal".
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        let ch = channel(i64, usize(1)).
+        let values = map(i64, i64, usize(2)).
+        let arena = buffer(usize(8)).
+        let scratch = borrow_mut(arena, usize(0), usize(8)).
+        let sent = send(ch, bits_as(i64, u64(42))).
+        let got = receive(ch).
+        if sent.sent == false || got.open == false:
+            set failure = 1.
+        if map_insert(values, 7, got.value) != 0:
+            set failure = 2.
+        let found = map_get(values, 7).
+        if found.found == false || found.value + 1 != 43:
+            set failure = 3.
+        if BinaryWriteI64Be(scratch, usize(0), 0 - 1) != 8:
+            set failure = 4.
+        let decoded = BinaryReadI64Be(view(scratch), usize(0)).
+        if decoded.status != 0 || decoded.value != 0 - 1:
+            set failure = 5.
+        borrow_end(scratch).
+        buffer_drop(arena).
+        map_drop(values).
+        channel_drop(ch).
+        return failure.
+"#,
+    );
+    let build = fixture.build(&source, "out-composition");
+    success(&build);
+    success(&run_bounded(&fixture.0.join("out-composition/composition")));
+}
+
+#[test]
+fn warehouse_qa_builders_preserve_exact_nonnetwork_wire_bytes() {
+    let fixture = Fixture::new();
+    let helpers = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/warehouse/tests");
+    std::fs::copy(
+        helpers.join("qa_payloads.sal"),
+        fixture.0.join("qa_payloads.sal"),
+    )
+    .expect("copy real QA payload builders");
+    let probe = r#"use "qa_payloads.sal".
+operation Expect:
+    accepts failure of type i64.
+    accepts code of type i64.
+    accepts holds of type bool.
+    returns i64.
+    requires:
+        failure == 0 otherwise failure.
+        holds otherwise code.
+    body:
+        return 0.
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let arena = buffer(usize(65600)).
+        let work = borrow_mut(arena, usize(0), usize(65600)).
+        let mut failure = 0.
+        let raw = QaHexBody(slice_mut(work, usize(0), len(work)), bytes("7b22636f646573223a5b22ff225d7d")).
+        set failure = Expect(failure, 1, len(raw) == usize(15) && byte(raw, usize(11)) == u8(255) && BytesStartsWith(raw, bytes("{\"codes\":[\""))).
+        borrow_end(raw).
+        let spaces = QaSpaces(slice_mut(work, usize(0), len(work)), 65537).
+        set failure = Expect(failure, 2, len(spaces) == usize(65537) && byte(spaces, usize(0)) == u8(32) && byte(spaces, usize(65536)) == u8(32)).
+        borrow_end(spaces).
+        let long = QaLongCodeBody(slice_mut(work, usize(0), len(work)), 129).
+        set failure = Expect(failure, 3, len(long) == usize(143) && BytesFind(long, bytes("xx\"]}")) == 138).
+        borrow_end(long).
+        let many = QaCodesBody(slice_mut(work, usize(0), len(work)), bytes("BATCH-"), 3, true).
+        set failure = Expect(failure, 4, many == bytes("{\"codes\":[\"BATCH-2\",\"BATCH-1\",\"BATCH-0\"]}")).
+        borrow_end(many).
+        let code = QaCodeBody(slice_mut(work, usize(0), len(work)), bytes("q\"\\\n")).
+        set failure = Expect(failure, 5, code == bytes("{\"codes\":[\"q\\\"\\\\\\u000a\"]}")).
+        borrow_end(code).
+        let marker = QaCountMarker(slice_mut(work, usize(0), len(work)), bytes("SKU-RED-M"), 10, 3).
+        set failure = Expect(failure, 6, marker == bytes("\"code\":\"SKU-RED-M\",\"quantity\":10,\"reserved\":3,\"available_quantity\":7}")).
+        borrow_end(marker).
+        let stock = QaStockBody(slice_mut(work, usize(0), len(work)), 99999).
+        set failure = Expect(failure, 7, stock == bytes("{\"warehouse_id\":99999}")).
+        borrow_end(stock).
+        let bound = QaBindThree(slice_mut(work, usize(0), len(work)), bytes("O'R"), bytes(""), bytes("Ё")).
+        set failure = Expect(failure, 8, len(bound) == usize(17) && byte(bound, usize(3)) == u8(3) && byte(bound, usize(10)) == u8(0) && byte(bound, usize(14)) == u8(2)).
+        borrow_end(bound).
+        let head = QaRenamedHead(slice_mut(work, usize(0), len(work)), bytes("A\t")).
+        set failure = Expect(failure, 9, head == bytes("{\"warehouse\":{\"id\":1,\"name\":\"A\\u0009\",\"available\":true},\"items\":[")).
+        borrow_end(head).
+        let row = QaQuotedRow(slice_mut(work, usize(0), len(work)), bytes("n"), bytes("s"), bytes("c")).
+        set failure = Expect(failure, 10, row == bytes("{\"name\":\"n\",\"size\":\"s\",\"code\":\"c\",\"quantity\":2,\"reserved\":0,\"available_quantity\":2}")).
+        borrow_end(row).
+        borrow_end(work).
+        buffer_drop(arena).
+        return failure.
+"#;
+    let source = fixture.source("qa_builders.sal", probe);
+    success(&fixture.build(&source, "out-qa-builders"));
+    success(&run_bounded(&fixture.0.join("out-qa-builders/qa_builders")));
 }

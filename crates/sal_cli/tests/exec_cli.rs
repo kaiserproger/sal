@@ -1,4 +1,4 @@
-//! Integration test: `sal build-exe --ang examples/ang/hello.ang` compiles to a
+//! Integration test: `sal build-exe examples/native/hello.sal` compiles to a
 //! runnable binary printing exactly `Hello, world!` with exit 0.
 //!
 //! Drives the built `sal` binary via `CARGO_BIN_EXE_sal`; std only. The output
@@ -37,21 +37,18 @@ fn run(cmd: &mut Command) -> Output {
 
 #[test]
 fn hello_builds_and_prints() {
-    let ang = root_path("examples/ang/hello.ang");
-    assert!(ang.is_file(), "missing fixture: {}", ang.display());
+    let sal = root_path("examples/native/hello.sal");
+    assert!(sal.is_file(), "missing fixture: {}", sal.display());
     let out_dir = unique_out_dir();
 
     let build: Output = run(Command::new(sal_bin())
         .arg("build-exe")
-        .arg("--ang")
-        .arg(&ang)
+        .arg(&sal)
         .arg("--out")
         .arg(&out_dir));
     assert!(
         build.status.success(),
-        "build-exe failed: status={} stdout={} stderr={}",
-        build.status,
-        String::from_utf8_lossy(&build.stdout),
+        "build-exe failed: {}",
         String::from_utf8_lossy(&build.stderr)
     );
 
@@ -98,16 +95,15 @@ fn server_rejects_non_http1_versions() {
     let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve port");
     let port = reservation.local_addr().unwrap().port();
     let out_dir = unique_out_dir();
-    let ang = out_dir.join("tupoi.ang");
+    let tupoi = out_dir.join("tupoi.sal");
     std::fs::write(
-        &ang,
-        include_str!("../../../examples/ang/tupoi.ang").replace("8081", &port.to_string()),
+        &tupoi,
+        include_str!("../../../examples/native/tupoi.sal").replace("8081", &port.to_string()),
     )
     .expect("write server fixture");
     let build = run(Command::new(sal_bin())
         .arg("build-exe")
-        .arg("--ang")
-        .arg(&ang)
+        .arg(&tupoi)
         .arg("--backend")
         .arg("rust-std")
         .arg("--out")

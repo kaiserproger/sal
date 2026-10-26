@@ -32,6 +32,7 @@ impl Fixture {
         for name in [
             "postgres.sal",
             "bytes.sal",
+            "binary.sal",
             "linux/io.sal",
             "linux/memory.sal",
             "linux/net.sal",
@@ -142,8 +143,7 @@ fn check(output: &Output, expected: i64) {
 fn shared_prelude() -> &'static str {
     concat!(
         "use \"postgres.sal\".\n",
-        "use \"linux/memory.sal\".\n",
-        "use \"linux/net.sal\".\n",
+        "use \"linux/io.sal\".\n",
         "operation ReadFd:\n",
         "    returns i64.\n",
         "    body:\n",
@@ -188,7 +188,7 @@ fn malformed_lengths_auth_eof_have_no_partial_output() {
     let fixture = Fixture::new();
     let probe = fixture.probe(
         &format!(
-            "{}\noperation Main:\n    returns i64.\n    effects: SystemCall, UnsafeMemory.\n    body:\n        let mapping = LinuxMapMemory(usize(65536)).\n        if mapping < 0:\n            return 90.\n        let scratch = usize(mapping).\n        let probe = PgReadMessage(ReadFd(), scratch, usize(65536)).\n        let digits = BytesDecimal(probe, scratch + 60000, usize(64)).\n        LinuxWriteAll(1, bytes_at(scratch + 60000, usize(digits))).\n        return 0.\n",
+            "{}\noperation Main:\n    returns i64.\n    effects: SystemCall.\n    body:\n        let store = buffer(usize(65536)).\n        let scratch = borrow_mut(store, usize(0), usize(65536)).\n        let probe = PgReadMessage(ReadFd(), scratch).\n        let digitsOut = slice_mut(scratch, usize(60000), usize(64)).\n        let digits = BytesDecimal(probe, digitsOut).\n        borrow_end(digitsOut).\n        let digitsView = view(scratch).\n        let digitsBytes = slice(digitsView, usize(60000), usize(digits)).\n        LinuxWriteAll(1, digitsBytes).\n        borrow_end(digitsBytes).\n        borrow_end(digitsView).\n        borrow_end(scratch).\n        buffer_drop(store).\n        return 0.\n",
             shared_prelude()
         ),
         "length",
@@ -224,7 +224,7 @@ fn startup_rejects_unsupported_auth_and_requires_ok_before_ready() {
     let fixture = Fixture::new();
     let probe = fixture.probe(
         &format!(
-            "{}\noperation Main:\n    returns i64.\n    effects: SystemCall, UnsafeMemory.\n    body:\n        let mapping = LinuxMapMemory(usize(65536)).\n        if mapping < 0:\n            return 90.\n        let scratch = usize(mapping).\n        let started = PgStartup(ReadFd(), bytes(\"u\"), bytes(\"db\"), scratch, usize(65536)).\n        let digits = BytesDecimal(started, scratch + 60000, usize(64)).\n        LinuxWriteAll(1, bytes_at(scratch + 60000, usize(digits))).\n        return 0.\n",
+            "{}\noperation Main:\n    returns i64.\n    effects: SystemCall.\n    body:\n        let store = buffer(usize(65536)).\n        let scratch = borrow_mut(store, usize(0), usize(65536)).\n        let started = PgStartup(ReadFd(), bytes(\"u\"), bytes(\"db\"), scratch).\n        let digitsOut = slice_mut(scratch, usize(60000), usize(64)).\n        let digits = BytesDecimal(started, digitsOut).\n        borrow_end(digitsOut).\n        let digitsView = view(scratch).\n        let digitsBytes = slice(digitsView, usize(60000), usize(digits)).\n        LinuxWriteAll(1, digitsBytes).\n        borrow_end(digitsBytes).\n        borrow_end(digitsView).\n        borrow_end(scratch).\n        buffer_drop(store).\n        return 0.\n",
             shared_prelude()
         ),
         "startup",
@@ -262,15 +262,21 @@ fn send_query_rejects_missing_parameters_and_query_nul_before_network() {
         r#"{}
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mapping = LinuxMapMemory(usize(65536)).
-        if mapping < 0:
-            return 90.
-        let scratch = usize(mapping).
-        let sent = PgSendQuery(ReadFd(), bytes("SELECT 1"), 1, bytes(""), scratch, usize(65536)).
-        let digits = BytesDecimal(sent, scratch + 61000, usize(64)).
-        LinuxWriteAll(1, bytes_at(scratch + 61000, usize(digits))).
+        let store = buffer(usize(65536)).
+        let scratch = borrow_mut(store, usize(0), usize(65536)).
+        let sent = PgSendQuery(ReadFd(), bytes("SELECT 1"), 1, bytes(""), scratch).
+        let digitsOut = slice_mut(scratch, usize(61000), usize(64)).
+        let digits = BytesDecimal(sent, digitsOut).
+        borrow_end(digitsOut).
+        let digitsView = view(scratch).
+        let digitsBytes = slice(digitsView, usize(61000), usize(digits)).
+        LinuxWriteAll(1, digitsBytes).
+        borrow_end(digitsBytes).
+        borrow_end(digitsView).
+        borrow_end(scratch).
+        buffer_drop(store).
         return 0.
 "#,
         shared_prelude()
@@ -289,7 +295,7 @@ operation Main:
     // NUL inside the query text is rejected before any network output.
     let probe = fixture.probe(
         &format!(
-            "{}\noperation Main:\n    returns i64.\n    effects: SystemCall, UnsafeMemory.\n    body:\n        let mapping = LinuxMapMemory(usize(65536)).\n        if mapping < 0:\n            return 90.\n        let scratch = usize(mapping).\n        store8(scratch + 60000, u8(83)).\n        store8(scratch + 60001, u8(0)).\n        store8(scratch + 60002, u8(76)).\n        let sent = PgSendQuery(ReadFd(), bytes_at(scratch + 60000, usize(3)), 0, bytes(\"\"), scratch, usize(65536)).\n        let digits = BytesDecimal(sent, scratch + 61000, usize(64)).\n        LinuxWriteAll(1, bytes_at(scratch + 61000, usize(digits))).\n        return 0.\n",
+            "{}\noperation Main:\n    returns i64.\n    effects: SystemCall.\n    body:\n        let store = buffer(usize(65536)).\n        let scratch = borrow_mut(store, usize(0), usize(65536)).\n        let querySlot = slice_mut(scratch, usize(60000), usize(64)).\n        put(querySlot, usize(0), u8(83)).\n        put(querySlot, usize(1), u8(0)).\n        put(querySlot, usize(2), u8(76)).\n        borrow_end(querySlot).\n        let queryView = view(scratch).\n        let query = slice(queryView, usize(60000), usize(3)).\n        let sent = PgSendQuery(ReadFd(), query, 0, bytes(\"\"), scratch).\n        borrow_end(query).\n        borrow_end(queryView).\n        let digitsOut = slice_mut(scratch, usize(61000), usize(64)).\n        let digits = BytesDecimal(sent, digitsOut).\n        borrow_end(digitsOut).\n        let digitsView = view(scratch).\n        let digitsBytes = slice(digitsView, usize(61000), usize(digits)).\n        LinuxWriteAll(1, digitsBytes).\n        borrow_end(digitsBytes).\n        borrow_end(digitsView).\n        borrow_end(scratch).\n        buffer_drop(store).\n        return 0.\n",
             shared_prelude()
         ),
         "nul",
@@ -308,10 +314,7 @@ operation Main:
 fn parameter_encoding_round_trips_null_empty_quotes_and_unicode() {
     let fixture = Fixture::new();
     let probe = fixture.probe(
-        &format!(
-            "{}\noperation Main:\n    returns i64.\n    effects: SystemCall, UnsafeMemory.\n    body:\n        let mapping = LinuxMapMemory(usize(65536)).\n        if mapping < 0:\n            return 90.\n        let scratch = usize(mapping).\n        let first = PgPutParameter(bytes(\"a'b\\\";--\"), scratch, usize(64)).\n        if first != 11:\n            return 1.\n        let second = PgPutParameter(bytes(\"caf\\u{{e9}}\"), scratch + 64, usize(64)).\n        if second != 9:\n            return 2.\n        let empty = PgPutParameter(bytes(\"\"), scratch + 128, usize(64)).\n        if empty != 4:\n            return 3.\n        let null = PgPutNull(scratch + 192, usize(64)).\n        if null != 4:\n            return 4.\n        if load8(scratch + 192) != 255:\n            return 5.\n        if load8(scratch + 193) != 255:\n            return 6.\n        if load8(scratch + 128) != 0:\n            return 7.\n        # Exact self placement writes only the length prefix in place.\n        let decoded = usize(scratch + 1024).\n        store8(decoded + 4, u8(120)).\n        let placed = PgPutParameter(bytes_at(decoded + 4, usize(1)), decoded, usize(64)).\n        if placed != 5:\n            return 8.\n        if load8(decoded) != 0:\n            return 9.\n        if load8(decoded + 4) != 120:\n            return 10.\n        LinuxWriteAll(1, bytes(\"ok\")).\n        return 0.\n",
-            shared_prelude()
-        ),
+        "use \"postgres.sal\".\nuse \"linux/io.sal\".\n# Parameter framing is data, never SQL text: quotes/unicode/NUL pass through.\noperation Main:\n    returns i64.\n    effects: SystemCall.\n    body:\n        let mut failure = 0.\n        let store = buffer(usize(65536)).\n        let scratch = borrow_mut(store, usize(0), usize(65536)).\n        let firstSlot = slice_mut(scratch, usize(0), usize(64)).\n        let first = PgPutParameter(bytes(\"a'b\\\";--\"), firstSlot).\n        borrow_end(firstSlot).\n        if failure == 0 && first != 11:\n            set failure = 1.\n        let secondSlot = slice_mut(scratch, usize(64), usize(64)).\n        let second = PgPutParameter(bytes(\"caf\\u{e9}\"), secondSlot).\n        borrow_end(secondSlot).\n        if failure == 0 && second != 9:\n            set failure = 2.\n        let emptySlot = slice_mut(scratch, usize(128), usize(64)).\n        let empty = PgPutParameter(bytes(\"\"), emptySlot).\n        borrow_end(emptySlot).\n        if failure == 0 && empty != 4:\n            set failure = 3.\n        let nullSlot = slice_mut(scratch, usize(192), usize(64)).\n        let null = PgPutNull(nullSlot).\n        borrow_end(nullSlot).\n        if failure == 0 && null != 4:\n            set failure = 4.\n        let nullView = view(scratch).\n        let nullHi = slice(nullView, usize(192), usize(2)).\n        if failure == 0 && byte(nullHi, usize(0)) != 255:\n            set failure = 5.\n        if failure == 0 && byte(nullHi, usize(1)) != 255:\n            set failure = 6.\n        let emptyView = slice(nullView, usize(128), usize(4)).\n        if failure == 0 && byte(emptyView, usize(0)) != 0:\n            set failure = 7.\n        borrow_end(emptyView).\n        borrow_end(nullHi).\n        borrow_end(nullView).\n        if failure == 0:\n            LinuxWriteAll(1, bytes(\"ok\")).\n        borrow_end(scratch).\n        buffer_drop(store).\n        return failure.\n",
         "params",
     );
     let (child, _) = spawn_pair(&probe);
@@ -325,13 +328,142 @@ fn parameter_encoding_round_trips_null_empty_quotes_and_unicode() {
 }
 
 #[test]
+fn byte_staging_and_sql_literal_helpers_preserve_arbitrary_payloads() {
+    let fixture = Fixture::new();
+    let probe = fixture.probe(
+        r#"use "postgres.sal".
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        let store = buffer(usize(128)).
+        let output = borrow_mut(store, usize(0), usize(64)).
+        let input = borrow_mut(store, usize(64), usize(64)).
+        if BytesFill(output, u8(32)) != 64:
+            set failure = 1.
+        let filled = view(output).
+        if failure == 0 && byte(filled, usize(63)) != 32:
+            set failure = 2.
+        borrow_end(filled).
+        if failure == 0 && BytesDecodeHex(bytes("00fF41"), input) != 3:
+            set failure = 3.
+        let decoded = view(input).
+        if failure == 0 && byte(decoded, usize(0)) != 0:
+            set failure = 4.
+        if failure == 0 && byte(decoded, usize(1)) != 255:
+            set failure = 5.
+        if failure == 0 && byte(decoded, usize(2)) != 65:
+            set failure = 6.
+        let nul = slice(decoded, usize(0), usize(1)).
+        if failure == 0 && PgQuoteLiteral(nul, output) != -22:
+            set failure = 7.
+        borrow_end(nul).
+        borrow_end(decoded).
+        if failure == 0 && BytesDecodeHex(bytes("f"), input) != -22:
+            set failure = 8.
+        if failure == 0 && BytesDecodeHex(bytes("x0"), input) != -22:
+            set failure = 9.
+        let empty = slice_mut(input, usize(0), usize(0)).
+        if failure == 0 && BytesDecodeHex(bytes("00"), empty) != -28:
+            set failure = 10.
+        if failure == 0 && BytesDecodeHex(bytes(""), empty) != 0:
+            set failure = 11.
+        if failure == 0 && BytesFill(empty, u8(9)) != 0:
+            set failure = 12.
+        borrow_end(empty).
+        let exact = slice_mut(output, usize(0), usize(11)).
+        if failure == 0 && PgQuoteLiteral(bytes("a'b\\é"), exact) != 11:
+            set failure = 13.
+        let quoted = view(exact).
+        if failure == 0 && quoted != bytes("E'a''b\\\\é'"):
+            set failure = 14.
+        borrow_end(quoted).
+        borrow_end(exact).
+        let short = slice_mut(output, usize(0), usize(10)).
+        if failure == 0 && PgQuoteLiteral(bytes("a'b\\é"), short) != -28:
+            set failure = 15.
+        borrow_end(short).
+        let minimum = slice_mut(output, usize(0), usize(3)).
+        if failure == 0 && PgQuoteLiteral(bytes(""), minimum) != 3:
+            set failure = 16.
+        let blank = view(minimum).
+        if failure == 0 && blank != bytes("E''"):
+            set failure = 17.
+        borrow_end(blank).
+        borrow_end(minimum).
+        borrow_end(input).
+        borrow_end(output).
+        buffer_drop(store).
+        return failure.
+"#,
+        "byte-helpers",
+    );
+    let (child, _) = spawn_pair(&probe);
+    success(&child.wait());
+}
+
+#[test]
+fn binary_adapters_preserve_guard_precedence_and_failed_cursor_bytes() {
+    let fixture = Fixture::new();
+    let probe = fixture.probe(
+        r#"use "postgres.sal".
+operation Expect:
+    accepts actual of type i64.
+    accepts expected of type i64.
+    returns i64.
+    requires:
+        actual == expected.
+    body:
+        return 0.
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let store = buffer(usize(8)).
+        let output = borrow_mut(store, usize(0), usize(8)).
+        Expect(BytesFill(output, u8(120)), 8).
+        Expect(PgWrite16At(output, usize(9), -1), -22).
+        Expect(PgWrite16At(output, usize(9), 1), -28).
+        Expect(PgWrite16At(output, usize(7), 1), -28).
+        Expect(PgWrite32At(output, usize(9), -2), -22).
+        Expect(PgWrite32At(output, usize(9), 2147483648), -75).
+        Expect(PgWrite32At(output, usize(9), -1), -28).
+        Expect(PgWrite32At(output, usize(5), -1), -28).
+        Expect(PgAppend16(output, -71, -1), -71).
+        Expect(PgAppend32(output, -75, -2), -75).
+        let unchanged = view(output).
+        SalContractAssert(unchanged == bytes("xxxxxxxx")).
+        Expect(PgReadU16(unchanged, usize(8)), -71).
+        Expect(PgReadU32(unchanged, usize(9)), -71).
+        borrow_end(unchanged).
+        Expect(PgAppend16(output, 0, 65535), 2).
+        Expect(PgAppend32(output, 2, -1), 6).
+        let framed = view(output).
+        Expect(PgReadU16(framed, usize(0)), 65535).
+        Expect(PgReadU32(framed, usize(2)), 4294967295).
+        SalContractAssert(slice(framed, usize(6), usize(2)) == bytes("xx")).
+        let null = slice(framed, usize(2), usize(4)).
+        SalContractAssert(PgParametersValid(null, 1)).
+        SalContractAssert(!PgParametersValid(null, 0)).
+        SalContractAssert(!PgParametersValid(null, 2)).
+        borrow_end(null).
+        borrow_end(framed).
+        borrow_end(output).
+        buffer_drop(store).
+        return 0.
+"#,
+        "binary-adapters",
+    );
+    let (child, _) = spawn_pair(&probe);
+    success(&child.wait());
+}
+
+#[test]
 fn row_field_validates_every_field_and_borrows_views() {
     let fixture = Fixture::new();
     let probe = fixture.probe(
-        &format!(
-            "{}\noperation Main:\n    returns i64.\n    effects: SystemCall, UnsafeMemory.\n    body:\n        let mapping = LinuxMapMemory(usize(65536)).\n        if mapping < 0:\n            return 90.\n        let scratch = usize(mapping).\n        store8(scratch, u8(68)).\n        store8(scratch + 1, u8(0)).\n        store8(scratch + 2, u8(0)).\n        store8(scratch + 3, u8(0)).\n        store8(scratch + 4, u8(15)).\n        store8(scratch + 5, u8(0)).\n        store8(scratch + 6, u8(2)).\n        store8(scratch + 7, u8(255)).\n        store8(scratch + 8, u8(255)).\n        store8(scratch + 9, u8(255)).\n        store8(scratch + 10, u8(255)).\n        store8(scratch + 11, u8(0)).\n        store8(scratch + 12, u8(0)).\n        store8(scratch + 13, u8(0)).\n        store8(scratch + 14, u8(1)).\n        store8(scratch + 15, u8(65)).\n        let row = bytes_at(scratch, usize(16)).\n        let missing = PgRowField(row, 2).\n        if missing.length != -71:\n            return 1.\n        let null = PgRowField(row, 0).\n        if null.length != -1:\n            return 2.\n        if null.pointer != usize(0):\n            return 3.\n        let value = PgRowField(row, 1).\n        if value.length != 1:\n            return 4.\n        if load8(value.pointer) != 65:\n            return 5.\n        # Trailing byte after the declared fields fails closed.\n        store8(scratch + 16, u8(0)).\n        let trailing = PgRowField(bytes_at(scratch, usize(17)), 0).\n        if trailing.length != -71:\n            return 6.\n        LinuxWriteAll(1, bytes(\"ok\")).\n        return 0.\n",
-            shared_prelude()
-        ),
+        "use \"postgres.sal\".\nuse \"linux/io.sal\".\n# Every field validates even when one is selected; views borrow the message.\noperation Main:\n    returns i64.\n    effects: SystemCall.\n    body:\n        let mut failure = 0.\n        let store = buffer(usize(65536)).\n        let scratch = borrow_mut(store, usize(0), usize(65536)).\n        let frame = slice_mut(scratch, usize(0), usize(16)).\n        put(frame, usize(0), u8(68)).\n        put(frame, usize(1), u8(0)).\n        put(frame, usize(2), u8(0)).\n        put(frame, usize(3), u8(0)).\n        put(frame, usize(4), u8(15)).\n        put(frame, usize(5), u8(0)).\n        put(frame, usize(6), u8(2)).\n        put(frame, usize(7), u8(255)).\n        put(frame, usize(8), u8(255)).\n        put(frame, usize(9), u8(255)).\n        put(frame, usize(10), u8(255)).\n        put(frame, usize(11), u8(0)).\n        put(frame, usize(12), u8(0)).\n        put(frame, usize(13), u8(0)).\n        put(frame, usize(14), u8(1)).\n        put(frame, usize(15), u8(65)).\n        borrow_end(frame).\n        let frameView = view(scratch).\n        let row = slice(frameView, usize(0), usize(16)).\n        let missing = PgRowField(row, 2).\n        if failure == 0 && missing.length != -71:\n            set failure = 1.\n        let null = PgRowField(row, 0).\n        if failure == 0 && null.length != -1:\n            set failure = 2.\n        if failure == 0 && null.offset != usize(0):\n            set failure = 3.\n        let value = PgRowField(row, 1).\n        if failure == 0 && value.length != 1:\n            set failure = 4.\n        let valueBytes = PgFieldBytes(row, value).\n        if failure == 0 && byte(valueBytes, usize(0)) != 65:\n            set failure = 5.\n        borrow_end(valueBytes).\n        borrow_end(row).\n        borrow_end(frameView).\n        let extra = slice_mut(scratch, usize(16), usize(1)).\n        put(extra, usize(0), u8(0)).\n        borrow_end(extra).\n        let wideView = view(scratch).\n        let trailing = slice(wideView, usize(0), usize(17)).\n        let trailingField = PgRowField(trailing, 0).\n        borrow_end(trailing).\n        borrow_end(wideView).\n        if failure == 0 && trailingField.length != -71:\n            set failure = 6.\n        if failure == 0:\n            LinuxWriteAll(1, bytes(\"ok\")).\n        borrow_end(scratch).\n        buffer_drop(store).\n        return failure.\n",
         "row",
     );
     let (child, _) = spawn_pair(&probe);
@@ -349,7 +481,7 @@ fn error_and_drain_preserve_first_sqlstate_until_ready() {
     let fixture = Fixture::new();
     let probe = fixture.probe(
         &format!(
-            "{}\noperation Main:\n    returns i64.\n    effects: SystemCall, UnsafeMemory.\n    body:\n        let mapping = LinuxMapMemory(usize(65536)).\n        if mapping < 0:\n            return 90.\n        let scratch = usize(mapping).\n        let drained = PgDrain(ReadFd(), scratch, usize(65536)).\n        let digits = BytesDecimal(drained, scratch + 60000, usize(64)).\n        LinuxWriteAll(1, bytes_at(scratch + 60000, usize(digits))).\n        return 0.\n",
+            "{}\noperation Main:\n    returns i64.\n    effects: SystemCall.\n    body:\n        let store = buffer(usize(65536)).\n        let scratch = borrow_mut(store, usize(0), usize(65536)).\n        let drained = PgDrain(ReadFd(), scratch).\n        let digitsOut = slice_mut(scratch, usize(60000), usize(64)).\n        let digits = BytesDecimal(drained, digitsOut).\n        borrow_end(digitsOut).\n        let digitsView = view(scratch).\n        let digitsBytes = slice(digitsView, usize(60000), usize(digits)).\n        LinuxWriteAll(1, digitsBytes).\n        borrow_end(digitsBytes).\n        borrow_end(digitsView).\n        borrow_end(scratch).\n        buffer_drop(store).\n        return 0.\n",
             shared_prelude()
         ),
         "drain",
@@ -368,10 +500,7 @@ fn error_and_drain_preserve_first_sqlstate_until_ready() {
 fn sqlstate_decoding_rejects_malformed_frames() {
     let fixture = Fixture::new();
     let probe = fixture.probe(
-        &format!(
-            "{}\noperation Main:\n    returns i64.\n    effects: SystemCall, UnsafeMemory.\n    body:\n        let mapping = LinuxMapMemory(usize(65536)).\n        if mapping < 0:\n            return 90.\n        let scratch = usize(mapping).\n        store8(scratch, u8(69)).\n        store8(scratch + 1, u8(0)).\n        store8(scratch + 2, u8(0)).\n        store8(scratch + 3, u8(0)).\n        store8(scratch + 4, u8(12)).\n        store8(scratch + 5, u8(67)).\n        store8(scratch + 6, u8(50)).\n        store8(scratch + 7, u8(51)).\n        store8(scratch + 8, u8(53)).\n        store8(scratch + 9, u8(48)).\n        store8(scratch + 10, u8(53)).\n        store8(scratch + 11, u8(0)).\n        store8(scratch + 12, u8(0)).\n        let code = PgErrorCode(bytes_at(scratch, usize(13))).\n        if code != 215607488565:\n            return 1.\n        store8(scratch + 10, u8(33)).\n        let bad = PgErrorCode(bytes_at(scratch, usize(13))).\n        if bad != -71:\n            return 2.\n        LinuxWriteAll(1, bytes(\"ok\")).\n        return 0.\n",
-            shared_prelude()
-        ),
+        "use \"postgres.sal\".\nuse \"linux/io.sal\".\n# The packed C-field SQLSTATE validates framing; corruption fails closed.\noperation Main:\n    returns i64.\n    effects: SystemCall.\n    body:\n        let mut failure = 0.\n        let store = buffer(usize(65536)).\n        let scratch = borrow_mut(store, usize(0), usize(65536)).\n        let frame = slice_mut(scratch, usize(0), usize(13)).\n        put(frame, usize(0), u8(69)).\n        put(frame, usize(1), u8(0)).\n        put(frame, usize(2), u8(0)).\n        put(frame, usize(3), u8(0)).\n        put(frame, usize(4), u8(12)).\n        put(frame, usize(5), u8(67)).\n        put(frame, usize(6), u8(50)).\n        put(frame, usize(7), u8(51)).\n        put(frame, usize(8), u8(53)).\n        put(frame, usize(9), u8(48)).\n        put(frame, usize(10), u8(53)).\n        put(frame, usize(11), u8(0)).\n        put(frame, usize(12), u8(0)).\n        borrow_end(frame).\n        let frameView = view(scratch).\n        let message = slice(frameView, usize(0), usize(13)).\n        let code = PgErrorCode(message).\n        if failure == 0 && code != 215607488565:\n            set failure = 1.\n        borrow_end(message).\n        borrow_end(frameView).\n        let corrupt = slice_mut(scratch, usize(10), usize(1)).\n        put(corrupt, usize(0), u8(33)).\n        borrow_end(corrupt).\n        let wideView = view(scratch).\n        let wide = slice(wideView, usize(0), usize(13)).\n        let bad = PgErrorCode(wide).\n        borrow_end(wide).\n        borrow_end(wideView).\n        if failure == 0 && bad != -71:\n            set failure = 2.\n        if failure == 0:\n            LinuxWriteAll(1, bytes(\"ok\")).\n        borrow_end(scratch).\n        buffer_drop(store).\n        return failure.\n",
         "sqlstate",
     );
     let (child, _) = spawn_pair(&probe);
@@ -401,47 +530,76 @@ fn live_postgres_round_trip_through_unix_socket() {
     let sal = concat!(
         "operation Main:\n",
         "    returns i64.\n",
-        "    effects: SystemCall, UnsafeMemory.\n",
+        "    effects: SystemCall.\n",
         "    body:\n",
-        "        let mapping = LinuxMapMemory(usize(131072)).\n",
-        "        if mapping < 0:\n",
-        "            return 90.\n",
-        "        let scratch = usize(mapping).\n",
-        "        let output = scratch + 65536.\n",
-        "        let quoted = PgPutParameter(bytes(\"a'b\\\";--\"), output, usize(4096)).\n",
-        "        if quoted != 11:\n",
-        "            return 96.\n",
-        "        let uni = PgPutParameter(bytes(\"caf\\u{e9}\"), output + 64, usize(4032)).\n",
-        "        if uni != 9:\n",
-        "            return 97.\n",
-        "        let halted = PgPutParameter(bytes(\"\"), output + 128, usize(3968)).\n",
-        "        if halted != 4:\n",
-        "            return 98.\n",
-        "        let null = PgPutNull(output + 192, usize(3904)).\n",
-        "        if null != 4:\n",
-        "            return 99.\n",
-        "        let fd = LinuxUnixConnect(bytes(\"{escaped}\"), scratch + 131000).\n",
-        "        if fd < 0:\n",
-        "            return 91.\n",
-        "        if LinuxSocketTimeouts(fd, 5) < 0:\n",
-        "            return 92.\n",
-        "        if PgStartup(fd, bytes(\"warehouse\"), bytes(\"warehouse\"), scratch, usize(65536)) != 0:\n",
-        "            return 93.\n",
-        "        if PgSendQuery(fd, bytes(\"SELECT 1\"), 0, bytes(\"\"), scratch, usize(65536)) < 0:\n",
-        "            return 94.\n",
-        "        if PgDrain(fd, scratch, usize(65536)) != 0:\n",
-        "            return 95.\n",
-        "        if PgSendQuery(fd, bytes(\"SELECT error\"), 0, bytes(\"\"), scratch, usize(65536)) < 0:\n",
-        "            return 105.\n",
-        "        let drained = PgDrain(fd, scratch, usize(65536)).\n",
-        "        if drained >= -4095:\n",
-        "            return 106.\n",
-        "        if PgSendQuery(fd, bytes(\"ROLLBACK\"), 0, bytes(\"\"), scratch, usize(65536)) < 0:\n",
-        "            return 107.\n",
-        "        if PgDrain(fd, scratch, usize(65536)) != 0:\n",
-        "            return 108.\n",
-        "        LinuxWriteAll(1, bytes(\"ok\")).\n",
-        "        return 0.\n",
+        "        let mut failure = 0.\n",
+        "        let store = buffer(usize(131072)).\n",
+        "        let scratch = borrow_mut(store, usize(0), usize(131072)).\n",
+        "        let paramArea = slice_mut(scratch, usize(65536), usize(65536)).\n",
+        "        let quotedSlot = slice_mut(paramArea, usize(0), usize(4096)).\n",
+        "        let quoted = PgPutParameter(bytes(\"a'b\\\";--\"), quotedSlot).\n",
+        "        borrow_end(quotedSlot).\n",
+        "        if failure == 0 && quoted != 11:\n",
+        "            set failure = 96.\n",
+        "        let uniSlot = slice_mut(paramArea, usize(4096), usize(4032)).\n",
+        "        let uni = PgPutParameter(bytes(\"caf\\u{e9}\"), uniSlot).\n",
+        "        borrow_end(uniSlot).\n",
+        "        if failure == 0 && uni != 9:\n",
+        "            set failure = 97.\n",
+        "        let haltedSlot = slice_mut(paramArea, usize(8192), usize(3968)).\n",
+        "        let halted = PgPutParameter(bytes(\"\"), haltedSlot).\n",
+        "        borrow_end(haltedSlot).\n",
+        "        if failure == 0 && halted != 4:\n",
+        "            set failure = 98.\n",
+        "        let nullSlot = slice_mut(paramArea, usize(12288), usize(3904)).\n",
+        "        let null = PgPutNull(nullSlot).\n",
+        "        borrow_end(nullSlot).\n",
+        "        if failure == 0 && null != 4:\n",
+        "            set failure = 99.\n",
+        "        borrow_end(paramArea).\n",
+        "        let pathSlot = slice_mut(scratch, usize(131000), usize(72)).\n",
+        "        let fd = LinuxUnixConnect(bytes(\"{escaped}\"), pathSlot).\n",
+        "        borrow_end(pathSlot).\n",
+        "        if failure == 0 && fd < 0:\n",
+        "            set failure = 91.\n",
+        "        if failure == 0 && LinuxSocketTimeouts(fd, 5) < 0:\n",
+        "            set failure = 92.\n",
+        "        let ioWindow = slice_mut(scratch, usize(0), usize(65536)).\n",
+        "        if failure == 0 && PgStartup(fd, bytes(\"warehouse\"), bytes(\"warehouse\"), ioWindow) != 0:\n",
+        "            set failure = 93.\n",
+        "        borrow_end(ioWindow).\n",
+        "        let queryWindow = slice_mut(scratch, usize(0), usize(65536)).\n",
+        "        if failure == 0 && PgSendQuery(fd, bytes(\"SELECT 1\"), 0, bytes(\"\"), queryWindow) < 0:\n",
+        "            set failure = 94.\n",
+        "        borrow_end(queryWindow).\n",
+        "        let drainWindow = slice_mut(scratch, usize(0), usize(65536)).\n",
+        "        if failure == 0 && PgDrain(fd, drainWindow) != 0:\n",
+        "            set failure = 95.\n",
+        "        borrow_end(drainWindow).\n",
+        "        let errorWindow = slice_mut(scratch, usize(0), usize(65536)).\n",
+        "        if failure == 0 && PgSendQuery(fd, bytes(\"SELECT error\"), 0, bytes(\"\"), errorWindow) < 0:\n",
+        "            set failure = 105.\n",
+        "        borrow_end(errorWindow).\n",
+        "        let failedWindow = slice_mut(scratch, usize(0), usize(65536)).\n",
+        "        let mut drained = 0.\n",
+        "        if failure == 0:\n",
+        "            set drained = PgDrain(fd, failedWindow).\n",
+        "        borrow_end(failedWindow).\n",
+        "        if failure == 0 && drained >= -4095:\n",
+        "            set failure = 106.\n",
+        "        let rollbackWindow = slice_mut(scratch, usize(0), usize(65536)).\n",
+        "        if failure == 0 && PgSendQuery(fd, bytes(\"ROLLBACK\"), 0, bytes(\"\"), rollbackWindow) < 0:\n",
+        "            set failure = 107.\n",
+        "        borrow_end(rollbackWindow).\n",
+        "        let finalWindow = slice_mut(scratch, usize(0), usize(65536)).\n",
+        "        if failure == 0 && PgDrain(fd, finalWindow) != 0:\n",
+        "            set failure = 108.\n",
+        "        borrow_end(finalWindow).\n",
+        "        if failure == 0:\n",
+        "            LinuxWriteAll(1, bytes(\"ok\")).\n",
+        "        borrow_end(scratch).\n",
+        "        buffer_drop(store).\n",
+        "        return failure.\n",
     );
     let source = format!("{}{}", shared_prelude(), sal.replace("{escaped}", &escaped));
     let probe = fixture.probe(&source, "live");

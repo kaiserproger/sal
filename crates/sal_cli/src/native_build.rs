@@ -5,9 +5,7 @@ use std::process::Command;
 
 use sal_backend_native::{emit_native, NativeTarget};
 
-use crate::{
-    bad_args, binary_stem, has_failures, read_source, report, run_checks, sources::Sources,
-};
+use crate::{bad_args, binary_stem, has_failures, report, run_checks, sources::Sources};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -17,36 +15,22 @@ enum Backend {
 
 struct Args {
     source: String,
-    anglish: bool,
     out: PathBuf,
     strict: bool,
     backend: Backend,
-    model: crate::anglish::Model,
     links: Vec<PathBuf>,
 }
 
 fn parse(rest: &[String], library: bool) -> Args {
     let mut source = None;
-    let mut anglish = false;
     let mut out = None;
     let mut strict = false;
     let mut backend = Backend::Native;
-    let mut model = crate::anglish::Model::default();
     let mut links = Vec::new();
     let mut args = rest.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--strict" => strict = true,
-            "--ang" => {
-                let value = args
-                    .next()
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| bad_args("--ang needs a file".into()));
-                if source.replace(value.clone()).is_some() {
-                    bad_args("provide exactly one SAL or Anglish input".into());
-                }
-                anglish = true;
-            }
             "--out" => {
                 let value = args
                     .next()
@@ -65,18 +49,6 @@ fn parse(rest: &[String], library: bool) -> Args {
                     bad_args(format!("cannot resolve --link input '{value}': {error}"))
                 }));
             }
-            "--model-command" => {
-                let value = args
-                    .next()
-                    .unwrap_or_else(|| bad_args("--model-command needs an executable".into()));
-                model.program(value.clone());
-            }
-            "--model-arg" => {
-                let value = args
-                    .next()
-                    .unwrap_or_else(|| bad_args("--model-arg needs an argument".into()));
-                model.argument(value.clone());
-            }
             "--backend" => {
                 backend = match args.next().map(String::as_str) {
                     Some("native") => Backend::Native,
@@ -90,25 +62,19 @@ fn parse(rest: &[String], library: bool) -> Args {
             value if value.starts_with('-') => bad_args(format!("unknown build flag '{value}'")),
             value => {
                 if source.replace(value.to_owned()).is_some() {
-                    bad_args("provide exactly one SAL or Anglish input".into());
+                    bad_args("provide exactly one SAL input".into());
                 }
             }
         }
-    }
-    model.validate();
-    if model.enabled() && !anglish {
-        bad_args("--model-command is an Anglish frontend option and requires --ang".into());
     }
     if !links.is_empty() && (library || backend != Backend::Native) {
         bad_args("--link is only supported for native executables; archive consumers link foreign inputs themselves".into());
     }
     Args {
-        source: source.unwrap_or_else(|| bad_args("missing <file.sal> or --ang <file.ang>".into())),
-        anglish,
+        source: source.unwrap_or_else(|| bad_args("missing <file.sal>".into())),
         out: out.unwrap_or_else(|| bad_args("missing --out <dir>".into())),
         strict,
         backend,
-        model,
         links,
     }
 }
@@ -136,26 +102,7 @@ fn execute(tool: &str, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr
 
 pub fn build(rest: &[String], library: bool) {
     let args = parse(rest, library);
-    let mut source = if args.anglish {
-        let input = read_source(&args.source);
-        let (translated, diagnostics) = args
-            .model
-            .translate(&input)
-            .unwrap_or_else(|error| fail(error));
-        for diagnostic in &diagnostics {
-            eprintln!(
-                "{}:\n{}",
-                args.source,
-                sal_syntax::format_diagnostic(diagnostic, &input)
-            );
-        }
-        if has_failures(&diagnostics, args.strict) {
-            std::process::exit(1);
-        }
-        Sources::from_text(Path::new(&args.source), translated)
-    } else {
-        Sources::load(&args.source)
-    };
+    let mut source = Sources::load(&args.source);
     if args.backend == Backend::Native && !library && !has_failures(&source.diagnostics, false) {
         match crate::server_frontend::lower(&source.file) {
             Ok(Some(generated)) => {
@@ -179,11 +126,6 @@ pub fn build(rest: &[String], library: bool) {
     report(&diagnostics, &source);
     if has_failures(&diagnostics, args.strict) {
         std::process::exit(1);
-    }
-    if args.model.enabled() {
-        eprintln!(
-            "sal: model proposal passed structural checks; preservation of intent is not proved"
-        );
     }
     let stem = binary_stem(&args.source);
     match args.backend {

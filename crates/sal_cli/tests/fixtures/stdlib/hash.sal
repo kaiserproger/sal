@@ -1,0 +1,100 @@
+use "std/hash.sal".
+
+# Keeps the first failing check number: a check that already failed stays
+# recorded, otherwise the new code is recorded exactly when `failed` holds.
+operation FirstFailure:
+    accepts current of type i64.
+    accepts failed of type bool.
+    accepts code of type i64.
+    returns i64.
+    requires:
+        current == 0 otherwise current.
+        failed == false otherwise code.
+    body:
+        return 0.
+
+# Executable SAL fixture for stdlib/hash.sal. Non-cryptographic checksums
+# only: deterministic accidental-corruption detection, no authentication
+# or collision-resistance claim and no throughput promise. Returns 0 when
+# every check holds, otherwise the first failing check number. Asserts
+# only observable hash values and incremental-chaining equalities against
+# external-known vectors, never source text or wiring. The Buffer scratch
+# allocates through the SAL OS runtime, so Main declares SystemCall (the
+# hash algorithms themselves stay Pure); binary NUL/FF bytes are built in
+# that owned scratch with put and consumed through views; the loan is
+# ended before drop.
+operation HashExpected:
+    accepts high of type u64.
+    accepts low of type u64.
+    returns u64.
+    body:
+        return high * u64(4294967296) + low.
+
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        set failure = FirstFailure(failure, HashFnv1a64(bytes("")) != HashExpected(u64(3421674724), u64(2216829733)), 1).
+        set failure = FirstFailure(failure, HashFnv1a64(bytes("a")) != HashExpected(u64(2942557260), u64(2248273036)), 2).
+        set failure = FirstFailure(failure, HashFnv1a64(bytes("123456789")) != HashExpected(u64(114644793), u64(600231420)), 3).
+        set failure = FirstFailure(failure, HashFnv1a64(bytes("foobar")) != HashExpected(u64(2241085809), u64(4147734504)), 4).
+        set failure = FirstFailure(failure, HashFnv1a64(bytes("hello")) != HashExpected(u64(2754664518), u64(2158673163)), 5).
+        set failure = FirstFailure(failure, HashFnv1a64Update(HashFnv1a64Init(), bytes("123456789")) != HashFnv1a64(bytes("123456789")), 6).
+        let splitSeed = HashFnv1a64Update(HashFnv1a64Init(), bytes("12345")).
+        set failure = FirstFailure(failure, HashFnv1a64Update(splitSeed, bytes("6789")) != HashFnv1a64(bytes("123456789")), 7).
+        set failure = FirstFailure(failure, HashCrc32Ieee(bytes("")) != u32(0), 8).
+        set failure = FirstFailure(failure, HashCrc32Ieee(bytes("a")) != u32(3904355907), 9).
+        set failure = FirstFailure(failure, HashCrc32Ieee(bytes("123456789")) != u32(3421780262), 10).
+        set failure = FirstFailure(failure, HashCrc32Ieee(bytes("foobar")) != u32(2666930069), 11).
+        set failure = FirstFailure(failure, HashCrc32Ieee(bytes("hello")) != u32(907060870), 12).
+        let ieeeSplit = HashCrc32IeeeUpdate(HashCrc32IeeeInit(), bytes("12345")).
+        let ieeeJoined = HashCrc32IeeeUpdate(ieeeSplit, bytes("6789")).
+        let ieeeWhole = HashCrc32IeeeUpdate(HashCrc32IeeeInit(), bytes("123456789")).
+        set failure = FirstFailure(failure, HashCrc32IeeeFinish(ieeeJoined) != HashCrc32Ieee(bytes("123456789")), 13).
+        set failure = FirstFailure(failure, ieeeJoined != ieeeWhole, 14).
+        set failure = FirstFailure(failure, HashCrc32IeeeInit() != u32(4294967295), 15).
+        set failure = FirstFailure(failure, HashCrc32IeeeFinish(u32(4294967295)) != u32(0), 16).
+        set failure = FirstFailure(failure, HashCrc32C(bytes("")) != u32(0), 17).
+        set failure = FirstFailure(failure, HashCrc32C(bytes("a")) != u32(3251651376), 18).
+        set failure = FirstFailure(failure, HashCrc32C(bytes("123456789")) != u32(3808858755), 19).
+        set failure = FirstFailure(failure, HashCrc32C(bytes("foobar")) != u32(224353407), 20).
+        set failure = FirstFailure(failure, HashCrc32C(bytes("hello")) != u32(2591144780), 21).
+        let castSplit = HashCrc32CUpdate(HashCrc32CInit(), bytes("12345")).
+        let castJoined = HashCrc32CUpdate(castSplit, bytes("6789")).
+        let castWhole = HashCrc32CUpdate(HashCrc32CInit(), bytes("123456789")).
+        set failure = FirstFailure(failure, HashCrc32CFinish(castJoined) != HashCrc32C(bytes("123456789")), 22).
+        set failure = FirstFailure(failure, castJoined != castWhole, 23).
+        set failure = FirstFailure(failure, HashCrc32CInit() != u32(4294967295), 24).
+        set failure = FirstFailure(failure, HashCrc32CFinish(u32(4294967295)) != u32(0), 25).
+        set failure = FirstFailure(failure, HashCrc32IeeeReflectedPoly() != u32(3988292384), 26).
+        set failure = FirstFailure(failure, HashCrc32CReflectedPoly() != u32(2197175160), 27).
+        set failure = FirstFailure(failure, HashCrc32IeeeReflectedPoly() == HashCrc32CReflectedPoly(), 28).
+        set failure = FirstFailure(failure, HashCrc32Ieee(bytes("123456789")) == HashCrc32C(bytes("123456789")), 29).
+        let arena = buffer(usize(8)).
+        let scratch = borrow_mut(arena, usize(0), usize(8)).
+        put(scratch, usize(0), u8(0)).
+        set failure = FirstFailure(failure, HashFnv1a64(view(slice_mut(scratch, usize(0), usize(1)))) != HashExpected(u64(2942549324), u64(2248259551)), 30).
+        set failure = FirstFailure(failure, HashCrc32Ieee(view(slice_mut(scratch, usize(0), usize(1)))) != u32(3523407757), 31).
+        set failure = FirstFailure(failure, HashCrc32C(view(slice_mut(scratch, usize(0), usize(1)))) != u32(1383945041), 32).
+        put(scratch, usize(1), u8(255)).
+        set failure = FirstFailure(failure, HashFnv1a64(view(slice_mut(scratch, usize(1), usize(1)))) != HashExpected(u64(2942595660), u64(2248338286)), 33).
+        set failure = FirstFailure(failure, HashCrc32Ieee(view(slice_mut(scratch, usize(1), usize(1)))) != u32(4278190080), 34).
+        set failure = FirstFailure(failure, HashCrc32C(view(slice_mut(scratch, usize(1), usize(1)))) != u32(4278190080), 35).
+        set failure = FirstFailure(failure, HashFnv1a64(view(slice_mut(scratch, usize(0), usize(2)))) != HashExpected(u64(137480455), u64(3035245408)), 36).
+        set failure = FirstFailure(failure, HashCrc32Ieee(view(slice_mut(scratch, usize(0), usize(2)))) != u32(1826356594), 37).
+        set failure = FirstFailure(failure, HashCrc32C(view(slice_mut(scratch, usize(0), usize(2)))) != u32(1545348227), 38).
+        let bothC = HashCrc32C(view(slice_mut(scratch, usize(0), usize(2)))).
+        let nulSplit = HashCrc32CUpdate(HashCrc32CInit(), view(slice_mut(scratch, usize(0), usize(1)))).
+        let ffSplit = HashCrc32CUpdate(nulSplit, view(slice_mut(scratch, usize(1), usize(1)))).
+        set failure = FirstFailure(failure, HashCrc32CFinish(ffSplit) != bothC, 39).
+        let bothIeee = HashCrc32Ieee(view(slice_mut(scratch, usize(0), usize(2)))).
+        let ieeeNulSplit = HashCrc32IeeeUpdate(HashCrc32IeeeInit(), view(slice_mut(scratch, usize(0), usize(1)))).
+        let ieeeFfSplit = HashCrc32IeeeUpdate(ieeeNulSplit, view(slice_mut(scratch, usize(1), usize(1)))).
+        set failure = FirstFailure(failure, HashCrc32IeeeFinish(ieeeFfSplit) != bothIeee, 40).
+        let bothFnv = HashFnv1a64(view(slice_mut(scratch, usize(0), usize(2)))).
+        let fnvNulSplit = HashFnv1a64Update(HashFnv1a64Init(), view(slice_mut(scratch, usize(0), usize(1)))).
+        set failure = FirstFailure(failure, HashFnv1a64Update(fnvNulSplit, view(slice_mut(scratch, usize(1), usize(1)))) != bothFnv, 41).
+        borrow_end(scratch).
+        buffer_drop(arena).
+        return failure.

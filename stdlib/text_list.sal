@@ -1,0 +1,167 @@
+# Generic checked TextList runtime: ordered UTF-8 strings in one bounded frame.
+#
+# Layout (also the ordinary PG text-parameter frame encoding, but this module
+# has no PG dependency): data holds count entries, each a 4-byte big-endian
+# unsigned length followed by that many decoded UTF-8 bytes. No raw pointers,
+# no per-entry allocation; framing advance and tail slicing are O(1) with no
+# copy, while each step validates the head payload bytes (UTF8 scan), so a
+# step costs O(head bytes).
+#
+# Status model: TextListStep.valid false means malformed framing, truncated
+# data, a length running past the end, non-UTF8 payload, or a count that does
+# not match the framed entries. A TextList forged from arbitrary safe Bytes
+# via the TextList constructor therefore still fails safely: Next reports
+# valid false and never traps. Empty (data empty, count 0) reports valid true
+# with has false. On valid false or has false, value is "" and next echoes
+# the input list, so callers never advance past garbage or past the end.
+#
+# TextList declares `iterates Text using TextListNext.` for declaration-driven
+# For lowering (the lowerer advances before the user body and checks valid via
+# SalContractAssert). Hand-written loops use while plus TextListNext directly.
+#
+# Semantic helpers are all Pure with no allocation: TextListLen echoes the
+# count metadata only (it does not validate framing); TextListEachNonEmpty,
+# TextListEachAtMost (per-item decoded byte bound, literal: limit 0 passes
+# only all-empty lists), TextListNoNul and TextListUnique (byte-exact after
+# escape decoding) each return false on malformed input. The JSON decoder's
+# own max_item_bytes parameter treats 0 as unbounded; that is decoder policy,
+# not this helper. Unknown-field and bound-excess policy lives in the JSON
+# decoder, not here.
+#
+# Provenance: TextListNext returns TextListStep from list; value and next
+# borrow list.data transitively. No views are fabricated and no views escape
+# except through the declared return. No UnsafeMemory in this file: framing
+# goes through BinaryReadU32Be and validation through TextValidate.
+use "binary.sal".
+use "text.sal".
+
+entity TextList:
+    has data of type Bytes.
+    has count of type usize.
+    iterates Text using TextListNext.
+
+entity TextListStep:
+    has valid of type bool.
+    has has of type bool.
+    has value of type Text.
+    has next of type TextList.
+
+# Head step. Framing advance and the readonly tail are O(1) with no copy;
+# each step validates the head payload bytes (UTF8 scan), so a step costs
+# O(head bytes). Terminal count consistency is enforced now: a step with an
+# empty tail is valid only when the remaining count is exactly 1, and a step
+# with remaining bytes is valid only when the remaining count exceeds 1, so
+# count 1 plus an extra frame and count above 1 with an empty tail both fail
+# closed at the current step.
+operation TextListNext:
+    accepts list of type TextList.
+    returns TextListStep from list.
+    requires:
+        len(list.data) != usize(0) || list.count != usize(0) otherwise TextListStep(true, false, "", list).
+        len(list.data) >= usize(4) otherwise TextListStep(false, false, "", list).
+        list.count != usize(0) otherwise TextListStep(false, false, "", list).
+    body:
+        let data = list.data.
+        let count = list.count.
+        let head = BinaryReadU32Be(data, usize(0)).
+        if head.status != 0:
+            return TextListStep(false, false, "", TextList(data, count)).
+        let length = usize(head.value).
+        if len(data) - usize(4) < length:
+            return TextListStep(false, false, "", TextList(data, count)).
+        if TextValidate(slice(data, usize(4), length)) == false:
+            return TextListStep(false, false, "", TextList(data, count)).
+        let consumed = usize(4) + length.
+        let rest = slice(data, consumed, len(data) - consumed).
+        let tail = count - usize(1).
+        if (len(rest) == usize(0) && tail != usize(0)):
+            return TextListStep(false, false, "", TextList(data, count)).
+        if (len(rest) > usize(0) && tail == usize(0)):
+            return TextListStep(false, false, "", TextList(data, count)).
+        let payload = slice(data, usize(4), length).
+        return TextListStep(true, true, text(payload), TextList(rest, tail)).
+
+# Count metadata only; framing is validated by Next and the helpers.
+operation TextListLen:
+    accepts list of type TextList.
+    returns usize.
+    body:
+        return list.count.
+
+# True when every framed string is non-empty; false on malformed input.
+operation TextListEachNonEmpty:
+    accepts list of type TextList.
+    returns bool.
+    body:
+        let mut cursor = list.
+        while true:
+            let step = TextListNext(cursor).
+            if step.valid == false:
+                return false.
+            if step.has == false:
+                return true.
+            if len(bytes(step.value)) == usize(0):
+                return false.
+            set cursor = step.next.
+
+# True when every framed string decodes to at most limit bytes; false on
+# malformed input.
+operation TextListEachAtMost:
+    accepts list of type TextList.
+    accepts limit of type usize.
+    returns bool.
+    body:
+        let mut cursor = list.
+        while true:
+            let step = TextListNext(cursor).
+            if step.valid == false:
+                return false.
+            if step.has == false:
+                return true.
+            if len(bytes(step.value)) > limit:
+                return false.
+            set cursor = step.next.
+
+# True when no framed string holds a NUL byte; false on malformed input.
+operation TextListNoNul:
+    accepts list of type TextList.
+    returns bool.
+    body:
+        let mut cursor = list.
+        while true:
+            let step = TextListNext(cursor).
+            if step.valid == false:
+                return false.
+            if step.has == false:
+                return true.
+            let raw = bytes(step.value).
+            let mut index = usize(0).
+            while index < len(raw):
+                if byte(raw, index) == 0:
+                    return false.
+                set index = index + 1.
+            set cursor = step.next.
+
+# True when no two framed strings are byte-equal; false on malformed input.
+operation TextListUnique:
+    accepts list of type TextList.
+    returns bool.
+    body:
+        let mut outer = list.
+        while true:
+            let first = TextListNext(outer).
+            if first.valid == false:
+                return false.
+            if first.has == false:
+                return true.
+            let mut inner = first.next.
+            while true:
+                let second = TextListNext(inner).
+                if second.valid == false:
+                    return false.
+                if second.has == false:
+                    break.
+                if bytes(first.value) == bytes(second.value):
+                    return false.
+                set inner = second.next.
+            set outer = first.next.

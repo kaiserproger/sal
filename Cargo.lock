@@ -34,7 +34,6 @@ dependencies = [
  "sal_backend_native",
  "sal_backend_rust",
  "sal_ir",
- "sal_semfront",
  "sal_syntax",
 ]
 
@@ -42,14 +41,6 @@ dependencies = [
 name = "sal_ir"
 version = "0.1.0"
 dependencies = [
- "sal_syntax",
-]
-
-[[package]]
-name = "sal_semfront"
-version = "0.1.0"
-dependencies = [
- "sal_ir",
  "sal_syntax",
 ]
 

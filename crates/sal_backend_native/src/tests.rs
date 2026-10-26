@@ -8,8 +8,13 @@ fn ir(source: &str) -> Ir {
     ir
 }
 
+// Native rejection may come from the shared pre-native passes (which
+// emit_native re-runs and reports) or from native lowering itself.
 fn rejected(source: &str, target: NativeTarget, code: &str) {
-    let errors = emit_native(&ir(source), target).expect_err("unsupported program was accepted");
+    let (file, diagnostics) = sal_syntax::parse(source);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let errors =
+        emit_native(&sal_ir::build(&file).0, target).expect_err("unsupported program was accepted");
     assert!(
         errors.iter().any(|error| error.code == code),
         "expected {code}: {errors:?}"
@@ -75,14 +80,57 @@ fn refuses_server_for_and_foreign_or_aggregate_operations() {
 #[test]
 fn export_boundary_rejects_unsafe_types_contracts_effects_and_duplicates() {
     rejected("operation Main:\n    exports \"C\" as \"sal_text\".\n    returns Text.\n    responds with \"unsafe span\".\n", NativeTarget::StaticLibrary, "N100");
-    rejected("operation First:\n    exports \"C\" as \"same\".\n    returns i64.\n    body:\n        return 1.\noperation Second:\n    exports \"C\" as \"same\".\n    returns i64.\n    body:\n        return 2.\n", NativeTarget::StaticLibrary, "N102");
-    rejected("operation Main:\n    returns Text.\n    requires:\n        caller is trusted.\n    responds with \"unchecked\".\n", NativeTarget::Executable, "N104");
+    rejected("operation Buf:\n    exports \"C\" as \"sal_buf\".\n    accepts owner of type Buffer.\n    returns i64.\n    body:\n        return 1.\n", NativeTarget::StaticLibrary, "N100");
+    rejected("operation Held:\n    exports \"C\" as \"sal_held\".\n    accepts slot of type Borrow<Buffer>.\n    returns i64.\n    body:\n        return 1.\n", NativeTarget::StaticLibrary, "N100");
+    // Header contracts are lowered to ordinary guards by the declarations pass:
+    // a violated bare `requires:` is a runtime trap, not a native rejection.
+    let program = emit_native(&ir("operation Main:\n    returns Text.\n    requires:\n        false.\n    responds with \"checked\".\n"), NativeTarget::Executable).unwrap();
+    assert!(program.assembly.contains("ud2"));
+    // Contract conditions must still type-check as bool.
+    rejected("operation Main:\n    returns Text.\n    requires:\n        1.\n    responds with \"mistyped\".\n", NativeTarget::Executable, "DEC204");
     rejected("operation Helper:\n    returns i64.\n    effects: HTTPAccess.\n    body:\n        return 2.\noperation Main:\n    returns Text.\n    responds with \"ignored helper still rejected\".\n", NativeTarget::Executable, "N104");
     rejected(
         "operation Only:\n    returns i64.\n    body:\n        return 1.\n",
         NativeTarget::StaticLibrary,
         "N106",
     );
+}
+
+#[test]
+fn memory_disjoint_guards_view_bytes_locals_of_the_same_root() {
+    // The memory pass guards a new mutable window against every live span
+    // local of the same root with `view(existing)`; `existing` may be a plain
+    // Bytes result (here a Static-rooted helper return) and must lower.
+    let source = "operation Line:\n    accepts status of type i64.\n    returns Bytes.\n    body:\n        if status == 1:\n            return bytes(\"a\").\n        return bytes(\"\").\noperation Fill:\n    accepts status of type i64.\n    accepts scratch of type MutBytes.\n    returns i64.\n    body:\n        let line = Line(status).\n        if len(line) == 0:\n            return -22.\n        let window = slice_mut(scratch, usize(0), len(scratch)).\n        borrow_end(window).\n        return 0.\noperation Main:\n    returns i64.\n    body:\n        return 0.\n";
+    emit_native(&ir(source), NativeTarget::Executable).unwrap();
+}
+
+#[test]
+fn break_free_while_true_diverges_but_breaking_loops_still_fall_through() {
+    emit_native(
+        &ir("operation Main:\n    returns i64.\n    body:\n        let mut i = 0.\n        while true:\n            if i > 3:\n                return i.\n            set i = i + 1.\n"),
+        NativeTarget::Executable,
+    )
+    .unwrap();
+    // A break reaches the code after the loop, which has no return.
+    rejected("operation Main:\n    returns i64.\n    body:\n        while true:\n            break.\n", NativeTarget::Executable, "B106");
+    // A break in a nested loop exits only that loop; the outer one diverges.
+    emit_native(
+        &ir("operation Main:\n    returns i64.\n    body:\n        while true:\n            while true:\n                break.\n            return 1.\n"),
+        NativeTarget::Executable,
+    )
+    .unwrap();
+}
+
+#[test]
+fn borrowed_buffer_params_support_non_consuming_owner_operations_only() {
+    let fill = "operation Fill:\n    accepts arena of type Buffer.\n    borrows arena.\n    returns i64.\n    body:\n        let span = borrow_mut(arena, usize(0), usize(4)).\n        put(span, usize(0), u8(7)).\n        borrow_end(span).\n        let head = view(arena).\n        let size = len(arena).\n        borrow_end(head).\n        return i64(size).\n";
+    // The runtime allocator is supplied by the CLI source loader, so the
+    // unit fixture only exercises the borrowing callee (end-to-end: native_memory).
+    let main = "operation Main:\n    returns i64.\n    body:\n        return 0.\n";
+    emit_native(&ir(&format!("{fill}{main}")), NativeTarget::Executable).unwrap();
+    // Dropping through a borrow is consuming and stays rejected.
+    rejected("operation Fill:\n    accepts arena of type Buffer.\n    borrows arena.\n    returns i64.\n    effects: SystemCall.\n    body:\n        buffer_drop(arena).\n        return 0.\noperation Main:\n    returns i64.\n    body:\n        return 0.\n", NativeTarget::Executable, "MEM203");
 }
 
 #[test]
@@ -158,8 +206,29 @@ fn syscall_arity_effects_and_reserved_names_follow_contract() {
     assert!(program.assembly.contains(".Lsal_fn_"));
     // Intrinsic names are reserved even as declarations.
     for name in [
-        "len", "bytes", "byte", "slice", "usize", "i64", "u8", "syscall", "address", "bytes_at",
-        "load8", "store8",
+        "len",
+        "bytes",
+        "byte",
+        "slice",
+        "usize",
+        "i64",
+        "u8",
+        "syscall",
+        "address",
+        "bytes_at",
+        "load8",
+        "store8",
+        "buffer",
+        "buffer_drop",
+        "borrow_mut",
+        "slice_mut",
+        "view",
+        "put",
+        "borrow_end",
+        "borrow",
+        "text",
+        "SalContractAssert",
+        "SalMemoryAssertDisjoint",
     ] {
         let (file, diagnostics) =
             sal_syntax::parse(&format!("operation {name}:\n    returns i64.\n"));
@@ -280,10 +349,14 @@ fn rejects_loop_control_outside_loops() {
 #[test]
 fn short_circuit_rhs_stays_statically_checked_and_loop_jumps_do_not_return() {
     rejected("operation Touch:\n    returns bool.\n    effects: UnsafeMemory.\n    body:\n        store8(usize(0), u8(1)).\n        return true.\noperation Main:\n    returns i64.\n    effects: Pure.\n    body:\n        if false && Touch():\n            return 1.\n        return 0.\n", NativeTarget::Executable, "EFF203");
-    for jump in ["break", "continue"] {
-        let source = format!("operation Main:\n    returns i64.\n    body:\n        while true:\n            {jump}.\n");
-        rejected(&source, NativeTarget::Executable, "B106");
-    }
+    // `break` leaves the loop and falls off the end; `continue` is a break-free
+    // infinite loop that diverges, matching the sal_ir return-path rule.
+    rejected("operation Main:\n    returns i64.\n    body:\n        while true:\n            break.\n", NativeTarget::Executable, "B106");
+    emit_native(
+        &ir("operation Main:\n    returns i64.\n    body:\n        while true:\n            continue.\n"),
+        NativeTarget::Executable,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -311,6 +384,28 @@ fn rejects_nonbool_control_operands_and_rhs_type_errors() {
 }
 
 #[test]
+fn memory_surface_rejects_forgery_comparison_and_c_escape() {
+    // Buffer is an ABI pair, never a general span: no equality, no bytes/slice
+    // projection, no address even inside unsafe, no C boundary.
+    rejected("operation Main:\n    accepts owner of type Buffer.\n    returns bool.\n    body:\n        return owner == owner.\n", NativeTarget::Executable, "B105");
+    rejected("operation Main:\n    accepts slot of type MutBytes.\n    returns bool.\n    body:\n        return slot == slot.\n", NativeTarget::Executable, "B105");
+    rejected("operation Main:\n    accepts owner of type Buffer.\n    returns Bytes.\n    body:\n        return slice(owner, usize(0), usize(0)).\n", NativeTarget::Executable, "B107");
+    rejected("operation Main:\n    accepts owner of type Buffer.\n    returns usize.\n    effects: UnsafeMemory.\n    body:\n        unsafe:\n            return address(owner).\n", NativeTarget::Executable, "B108");
+    // MutBytes address is allowed only at an explicit unsafe raw OS boundary.
+    rejected("operation Main:\n    accepts slot of type MutBytes.\n    returns usize.\n    body:\n        return address(slot).\n", NativeTarget::Executable, "EFF203");
+    // Internal records never cross the C boundary, but address the stable
+    // frame slot like C records inside ordinary code.
+    rejected("entity Box:\n    has span of type Bytes.\noperation Main:\n    exports \"C\" as \"sal_box\".\n    accepts value of type Box.\n    returns i64.\n    body:\n        return 1.\n", NativeTarget::StaticLibrary, "N100");
+    // Vector/Map must be erased by collections lowering before native code.
+    rejected("operation Main:\n    accepts items of type Vector<i64>.\n    returns i64.\n    body:\n        return vector_len(items).\n", NativeTarget::Executable, "N100");
+    rejected(
+        "operation Main:\n    returns i64.\n    body:\n        return vector_len(1).\n",
+        NativeTarget::Executable,
+        "N100",
+    );
+}
+
+#[test]
 fn rejects_import_export_metadata_problems() {
     // Import with a SAL body is an IR metadata error surfaced natively.
     rejected("operation Foreign:\n    imports \"C\" as \"foreign_impl\".\n    returns i64.\n    effects: SystemCall, UnsafeMemory.\n    body:\n        return 1.\noperation Main:\n    returns i64.\n    body:\n        return 0.\n", NativeTarget::Executable, "E2011");
@@ -331,7 +426,6 @@ fn rejects_import_export_metadata_problems() {
     rejected("operation Helper:\n    returns i64.\noperation Main:\n    returns i64.\n    body:\n        return Helper().\n", NativeTarget::Executable, "N103");
     rejected("operation Quiet:\n    effects: Pure.\noperation Main:\n    returns i64.\n    body:\n        return 0.\n", NativeTarget::Executable, "N103");
 }
-
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod machine {
     use super::*;

@@ -1,114 +1,69 @@
 use "std/concurrency.sal".
+
+# First failure wins: keeps an earlier failure, else reports `code` when the
+# check does not hold.
+operation Expect:
+    accepts failure of type i64.
+    accepts code of type i64.
+    accepts holds of type bool.
+    returns i64.
+    requires:
+        failure == 0 otherwise failure.
+        holds otherwise code.
+    body:
+        return 0.
+
 entity Pair:
     layout "C".
     has x of type i64.
     has y of type i64.
+
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let data = channel(Pair, usize(1)).
         let stop = channel(bool, usize(1)).
         let ready = send(data, Pair(10, 20)).
-        if ready.sent == false:
-            if failure == 0:
-                set failure = 1.
+        set failure = Expect(failure, 1, ready.sent).
         let picked = wait_for(receive(data), receive(stop)).
-        if picked.status != 0:
-            if failure == 0:
-                set failure = 2.
-        if picked.index != 0:
-            if failure == 0:
-                set failure = 3.
-        if picked.arm0.selected == false:
-            if failure == 0:
-                set failure = 4.
-        if picked.arm0.open == false:
-            if failure == 0:
-                set failure = 5.
-        if picked.arm0.value.x != 10:
-            if failure == 0:
-                set failure = 6.
-        if picked.arm0.value.y != 20:
-            if failure == 0:
-                set failure = 7.
-        if picked.arm1.selected == true:
-            if failure == 0:
-                set failure = 8.
-        if picked.arm1.value == true:
-            if failure == 0:
-                set failure = 9.
+        set failure = Expect(failure, 2, picked.status == 0).
+        set failure = Expect(failure, 3, picked.index == 0).
+        set failure = Expect(failure, 4, picked.arm0.selected).
+        set failure = Expect(failure, 5, picked.arm0.open).
+        set failure = Expect(failure, 6, picked.arm0.value.x == 10).
+        set failure = Expect(failure, 7, picked.arm0.value.y == 20).
+        set failure = Expect(failure, 8, picked.arm1.selected == false).
+        set failure = Expect(failure, 9, picked.arm1.value == false).
         let idle = wait_for(receive(data), receive(stop), otherwise()).
-        if idle.status != 2:
-            if failure == 0:
-                set failure = 10.
-        if idle.index != 2:
-            if failure == 0:
-                set failure = 11.
-        if idle.arm0.selected == true:
-            if failure == 0:
-                set failure = 12.
-        if idle.arm1.selected == true:
-            if failure == 0:
-                set failure = 13.
-        if close(data) == false:
-            if failure == 0:
-                set failure = 14.
-        if close(stop) == false:
-            if failure == 0:
-                set failure = 15.
+        set failure = Expect(failure, 10, idle.status == 2).
+        set failure = Expect(failure, 11, idle.index == 2).
+        set failure = Expect(failure, 12, idle.arm0.selected == false).
+        set failure = Expect(failure, 13, idle.arm1.selected == false).
+        set failure = Expect(failure, 14, close(data)).
+        set failure = Expect(failure, 15, close(stop)).
         let gone_data = receive(data).
-        if gone_data.open == true:
-            if failure == 0:
-                set failure = 16.
+        set failure = Expect(failure, 16, gone_data.open == false).
         let gone_stop = wait_for(receive(stop), timeout(usize(20))).
-        if gone_stop.status != 1:
-            if failure == 0:
-                set failure = 17.
-        if gone_stop.index != 0:
-            if failure == 0:
-                set failure = 18.
-        if gone_stop.arm0.selected == false:
-            if failure == 0:
-                set failure = 19.
-        if gone_stop.arm0.open == true:
-            if failure == 0:
-                set failure = 20.
-        if gone_stop.arm0.value == true:
-            if failure == 0:
-                set failure = 21.
+        set failure = Expect(failure, 17, gone_stop.status == 1).
+        set failure = Expect(failure, 18, gone_stop.index == 0).
+        set failure = Expect(failure, 19, gone_stop.arm0.selected).
+        set failure = Expect(failure, 20, gone_stop.arm0.open == false).
+        set failure = Expect(failure, 21, gone_stop.arm0.value == false).
         let data_two = channel(Pair, usize(0)).
         let stop_two = channel(bool, usize(1)).
         let woke = send(stop_two, true).
-        if woke.sent == false:
-            if failure == 0:
-                set failure = 22.
+        set failure = Expect(failure, 22, woke.sent).
         let signal = wait_for(receive(data_two), receive(stop_two)).
-        if signal.status != 0:
-            if failure == 0:
-                set failure = 23.
-        if signal.index != 1:
-            if failure == 0:
-                set failure = 24.
-        if signal.arm1.selected == false:
-            if failure == 0:
-                set failure = 25.
-        if signal.arm1.open == false:
-            if failure == 0:
-                set failure = 26.
-        if signal.arm1.value == false:
-            if failure == 0:
-                set failure = 27.
-        if signal.arm0.selected == true:
-            if failure == 0:
-                set failure = 28.
-        if signal.arm0.value.x != 0:
-            if failure == 0:
-                set failure = 29.
-        if signal.arm0.value.y != 0:
-            if failure == 0:
-                set failure = 30.
+        set failure = Expect(failure, 23, signal.status == 0).
+        set failure = Expect(failure, 24, signal.index == 1).
+        set failure = Expect(failure, 25, signal.arm1.selected).
+        set failure = Expect(failure, 26, signal.arm1.open).
+        set failure = Expect(failure, 27, signal.arm1.value).
+        set failure = Expect(failure, 28, signal.arm0.selected == false).
+        set failure = Expect(failure, 29, signal.arm0.value.x == 0).
+        set failure = Expect(failure, 30, signal.arm0.value.y == 0).
         channel_drop(data_two).
         channel_drop(stop_two).
         channel_drop(data).

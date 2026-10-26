@@ -1,0 +1,176 @@
+use "std/math.sal".
+
+# Keeps the first failing check number: a check that already failed stays
+# recorded, otherwise the new code is recorded exactly when `failed` holds.
+operation FirstFailure:
+    accepts current of type i64.
+    accepts failed of type bool.
+    accepts code of type i64.
+    returns i64.
+    requires:
+        current == 0 otherwise current.
+        failed == false otherwise code.
+    body:
+        return 0.
+
+# Executable boundary proof for stdlib/math.sal. Pure checked integer
+# helpers only: no effects, no allocation, silent on success. Main returns
+# the first failing check number, 0 when every boundary holds.
+#
+# Coverage: negative block-to-chunk floor division/remainder edges around
+# multiples of 16 (chunk width), negative divisors, zero-divisor statuses,
+# i64 MIN/MAX division and multiplication edges, u64 division by zero,
+# exact and nonexact integer square roots including the u64 top corner,
+# gcd stride cases, checked power overflow edges, and min/max/clamp
+# bounds. Statuses follow the math module: 0 exact, -22 invalid
+# argument, -75 overflow.
+operation Main:
+    returns i64.
+    body:
+        let mut failure = 0.
+        let floor = 0 - 9223372036854775807 - 1.
+        let ceiling = 9223372036854775807.
+        let half = 0 - 576460752303423488.
+        let qneg = MathDivFloor(0 - 17, 16).
+        set failure = FirstFailure(failure, qneg.status != 0 || qneg.value != 0 - 2, 1).
+        let rneg = MathModFloor(0 - 17, 16).
+        set failure = FirstFailure(failure, rneg.status != 0 || rneg.value != 15, 2).
+        set failure = FirstFailure(failure, qneg.value * 16 + rneg.value != 0 - 17, 3).
+        let qedge = MathDivFloor(0 - 16, 16).
+        set failure = FirstFailure(failure, qedge.status != 0 || qedge.value != 0 - 1, 4).
+        set failure = FirstFailure(failure, MathModFloor(0 - 16, 16).value != 0, 5).
+        let qone = MathDivFloor(0 - 1, 16).
+        set failure = FirstFailure(failure, qone.status != 0 || qone.value != 0 - 1, 6).
+        set failure = FirstFailure(failure, MathModFloor(0 - 1, 16).value != 15, 7).
+        set failure = FirstFailure(failure, MathDivFloor(0, 16).value != 0, 8).
+        set failure = FirstFailure(failure, MathModFloor(0, 16).value != 0, 9).
+        set failure = FirstFailure(failure, MathDivFloor(15, 16).value != 0, 10).
+        set failure = FirstFailure(failure, MathModFloor(15, 16).value != 15, 11).
+        set failure = FirstFailure(failure, MathDivFloor(16, 16).value != 1, 12).
+        set failure = FirstFailure(failure, MathModFloor(16, 16).value != 0, 13).
+        set failure = FirstFailure(failure, MathDivFloor(17, 16).value != 1, 14).
+        set failure = FirstFailure(failure, MathModFloor(17, 16).value != 1, 15).
+        let qsign = MathDivFloor(0 - 17, 0 - 16).
+        set failure = FirstFailure(failure, qsign.status != 0 || qsign.value != 1, 16).
+        let rsign = MathModFloor(0 - 17, 0 - 16).
+        set failure = FirstFailure(failure, rsign.status != 0 || rsign.value != 0 - 1, 17).
+        let qflip = MathDivFloor(17, 0 - 16).
+        set failure = FirstFailure(failure, qflip.status != 0 || qflip.value != 0 - 2, 18).
+        set failure = FirstFailure(failure, MathModFloor(17, 0 - 16).value != 0 - 15, 19).
+        set failure = FirstFailure(failure, MathDivFloor(5, 0).status != -22, 20).
+        set failure = FirstFailure(failure, MathModFloor(5, 0).status != -22, 21).
+        let qmin = MathDivFloor(floor, 1).
+        set failure = FirstFailure(failure, qmin.status != 0 || qmin.value != floor, 22).
+        set failure = FirstFailure(failure, MathDivFloor(floor, 0 - 1).status != -75, 23).
+        let rmin = MathModFloor(floor, 0 - 1).
+        set failure = FirstFailure(failure, rmin.status != 0 || rmin.value != 0, 24).
+        set failure = FirstFailure(failure, MathDivFloor(ceiling, 0 - 1).value != 0 - ceiling, 25).
+        let qmin16 = MathDivFloor(floor, 16).
+        set failure = FirstFailure(failure, qmin16.status != 0 || qmin16.value != half, 26).
+        set failure = FirstFailure(failure, MathModFloor(floor, 16).value != 0, 27).
+        let qmax16 = MathDivFloor(ceiling, 16).
+        set failure = FirstFailure(failure, qmax16.status != 0 || qmax16.value != 576460752303423487, 28).
+        set failure = FirstFailure(failure, MathModFloor(ceiling, 16).value != 15, 29).
+        let qminone = MathDivFloor(0 - ceiling, 16).
+        set failure = FirstFailure(failure, qminone.status != 0 || qminone.value != half, 30).
+        set failure = FirstFailure(failure, MathModFloor(0 - ceiling, 16).value != 1, 31).
+        let maxu = u64(9223372036854775807) + u64(9223372036854775807) + u64(1).
+        let du = MathDivU64(u64(17), u64(16)).
+        set failure = FirstFailure(failure, du.status != 0 || du.value != u64(1), 32).
+        set failure = FirstFailure(failure, MathModU64(u64(17), u64(16)).value != u64(1), 33).
+        set failure = FirstFailure(failure, MathDivU64(u64(5), u64(0)).status != -22, 34).
+        set failure = FirstFailure(failure, MathModU64(u64(5), u64(0)).status != -22, 35).
+        let dmax = MathDivU64(maxu, u64(1)).
+        set failure = FirstFailure(failure, dmax.status != 0 || dmax.value != maxu, 36).
+        set failure = FirstFailure(failure, MathModU64(maxu, maxu).value != u64(0), 37).
+        let root = u64(4294967295).
+        let big = root * root.
+        let s0 = MathSqrtU64(u64(0)).
+        set failure = FirstFailure(failure, s0.status != 0 || s0.value != u64(0) || s0.exact == false, 38).
+        let s1 = MathSqrtU64(u64(1)).
+        set failure = FirstFailure(failure, s1.status != 0 || s1.value != u64(1) || s1.exact == false, 39).
+        let s2 = MathSqrtU64(u64(2)).
+        set failure = FirstFailure(failure, s2.status != 0 || s2.value != u64(1) || s2.exact == true, 40).
+        let s3 = MathSqrtU64(u64(3)).
+        set failure = FirstFailure(failure, s3.status != 0 || s3.value != u64(1) || s3.exact == true, 41).
+        let s4 = MathSqrtU64(u64(4)).
+        set failure = FirstFailure(failure, s4.status != 0 || s4.value != u64(2) || s4.exact == false, 42).
+        let s8 = MathSqrtU64(u64(8)).
+        set failure = FirstFailure(failure, s8.status != 0 || s8.value != u64(2) || s8.exact == true, 43).
+        let s9 = MathSqrtU64(u64(9)).
+        set failure = FirstFailure(failure, s9.status != 0 || s9.value != u64(3) || s9.exact == false, 44).
+        let s15 = MathSqrtU64(u64(15)).
+        set failure = FirstFailure(failure, s15.status != 0 || s15.value != u64(3) || s15.exact == true, 45).
+        let s16 = MathSqrtU64(u64(16)).
+        set failure = FirstFailure(failure, s16.status != 0 || s16.value != u64(4) || s16.exact == false, 46).
+        let s17 = MathSqrtU64(u64(17)).
+        set failure = FirstFailure(failure, s17.status != 0 || s17.value != u64(4) || s17.exact == true, 47).
+        let sexact = MathSqrtU64(big).
+        set failure = FirstFailure(failure, sexact.status != 0 || sexact.value != root || sexact.exact == false, 48).
+        let sbelow = MathSqrtU64(big - u64(1)).
+        set failure = FirstFailure(failure, sbelow.status != 0 || sbelow.value != root - u64(1) || sbelow.exact == true, 49).
+        let stop = MathSqrtU64(maxu).
+        set failure = FirstFailure(failure, stop.status != 0 || stop.value != root || stop.exact == true, 50).
+        set failure = FirstFailure(failure, MathGcdU64(u64(0), u64(0)).value != u64(0), 51).
+        set failure = FirstFailure(failure, MathGcdU64(u64(0), u64(16)).value != u64(16), 52).
+        set failure = FirstFailure(failure, MathGcdU64(u64(16), u64(0)).value != u64(16), 53).
+        set failure = FirstFailure(failure, MathGcdU64(u64(12), u64(18)).value != u64(6), 54).
+        set failure = FirstFailure(failure, MathGcdU64(u64(48), u64(32)).value != u64(16), 55).
+        set failure = FirstFailure(failure, MathGcdU64(u64(17), u64(5)).value != u64(1), 56).
+        set failure = FirstFailure(failure, MathGcdU64(u64(16), u64(16)).value != u64(16), 57).
+        set failure = FirstFailure(failure, MathMulI64(3, 4).value != 12, 58).
+        set failure = FirstFailure(failure, MathMulI64(0 - 3, 4).value != 0 - 12, 59).
+        set failure = FirstFailure(failure, MathMulI64(3, 0 - 4).value != 0 - 12, 60).
+        set failure = FirstFailure(failure, MathMulI64(0 - 3, 0 - 4).value != 12, 61).
+        let zmin = MathMulI64(0, floor).
+        set failure = FirstFailure(failure, zmin.status != 0 || zmin.value != 0, 62).
+        let zminb = MathMulI64(floor, 0).
+        set failure = FirstFailure(failure, zminb.status != 0 || zminb.value != 0, 63).
+        let mmax = MathMulI64(ceiling, 1).
+        set failure = FirstFailure(failure, mmax.status != 0 || mmax.value != ceiling, 64).
+        set failure = FirstFailure(failure, MathMulI64(ceiling, 2).status != -75, 65).
+        let mmin = MathMulI64(floor, 1).
+        set failure = FirstFailure(failure, mmin.status != 0 || mmin.value != floor, 66).
+        set failure = FirstFailure(failure, MathMulI64(floor, 0 - 1).status != -75, 67).
+        set failure = FirstFailure(failure, MathMulI64(floor, 2).status != -75, 68).
+        set failure = FirstFailure(failure, MathMulI64(ceiling, ceiling).status != -75, 69).
+        let wide = MathMulI64(3037000499, 3037000499).
+        set failure = FirstFailure(failure, wide.status != 0, 70).
+        set failure = FirstFailure(failure, MathDivFloor(wide.value, 3037000499).value != 3037000499, 71).
+        set failure = FirstFailure(failure, MathMulI64(3037000500, 3037000500).status != -75, 72).
+        set failure = FirstFailure(failure, MathPowI64(2, u64(10)).value != 1024, 73).
+        set failure = FirstFailure(failure, MathPowI64(2, u64(62)).value != 4611686018427387904, 74).
+        set failure = FirstFailure(failure, MathPowI64(2, u64(63)).status != -75, 75).
+        set failure = FirstFailure(failure, MathPowI64(10, u64(18)).value != 1000000000000000000, 76).
+        set failure = FirstFailure(failure, MathPowI64(10, u64(19)).status != -75, 77).
+        let pempty = MathPowI64(5, u64(0)).
+        set failure = FirstFailure(failure, pempty.status != 0 || pempty.value != 1, 78).
+        let pzero = MathPowI64(0, u64(0)).
+        set failure = FirstFailure(failure, pzero.status != 0 || pzero.value != 1, 79).
+        set failure = FirstFailure(failure, MathPowI64(0, u64(5)).value != 0, 80).
+        set failure = FirstFailure(failure, MathPowI64(0 - 2, u64(3)).value != 0 - 8, 81).
+        set failure = FirstFailure(failure, MathPowI64(0 - 2, u64(2)).value != 4, 82).
+        let pmin = MathPowI64(0 - 2, u64(63)).
+        set failure = FirstFailure(failure, pmin.status != 0 || pmin.value != floor, 83).
+        set failure = FirstFailure(failure, MathMinI64(0 - 3, 4) != 0 - 3, 84).
+        set failure = FirstFailure(failure, MathMaxI64(0 - 3, 4) != 4, 85).
+        set failure = FirstFailure(failure, MathMinI64(floor, ceiling) != floor, 86).
+        set failure = FirstFailure(failure, MathMaxI64(floor, ceiling) != ceiling, 87).
+        set failure = FirstFailure(failure, MathMinU64(u64(3), u64(4)) != u64(3), 88).
+        set failure = FirstFailure(failure, MathMaxU64(u64(3), u64(4)) != u64(4), 89).
+        set failure = FirstFailure(failure, MathMaxU64(u64(0), maxu) != maxu, 90).
+        let cinside = MathClampI64(5, 0, 10).
+        set failure = FirstFailure(failure, cinside.status != 0 || cinside.value != 5, 91).
+        set failure = FirstFailure(failure, MathClampI64(0 - 5, 0, 10).value != 0, 92).
+        set failure = FirstFailure(failure, MathClampI64(15, 0, 10).value != 10, 93).
+        set failure = FirstFailure(failure, MathClampI64(0, 0, 10).value != 0, 94).
+        set failure = FirstFailure(failure, MathClampI64(10, 0, 10).value != 10, 95).
+        set failure = FirstFailure(failure, MathClampI64(5, 10, 0).status != -22, 96).
+        let cfull = MathClampI64(floor, floor, ceiling).
+        set failure = FirstFailure(failure, cfull.status != 0 || cfull.value != floor, 97).
+        set failure = FirstFailure(failure, MathClampI64(ceiling, floor, ceiling).value != ceiling, 98).
+        let cu = MathClampU64(u64(5), u64(0), u64(10)).
+        set failure = FirstFailure(failure, cu.status != 0 || cu.value != u64(5), 99).
+        set failure = FirstFailure(failure, MathClampU64(u64(15), u64(0), u64(10)).value != u64(10), 100).
+        set failure = FirstFailure(failure, MathClampU64(u64(5), u64(10), u64(0)).status != -22, 101).
+        return failure.

@@ -1,0 +1,336 @@
+# Native SAL checked integer helpers for server coordinate and count math.
+#
+# Pure deterministic algorithms; no effects, no allocation, no floats, no
+# bitwise or wrapping primitives. All arithmetic is checked: an operation
+# that cannot produce its exact mathematical result reports it in `status`
+# instead of trapping or silently wrapping.
+#
+# Status vocabulary (shared with the bytes/json/postgres helpers):
+#   0    exact result in `value` (`exact` marks a perfect square for roots).
+#   -22  invalid argument: zero divisor, or a clamp range with lo > hi.
+#   -75  overflow: the exact result does not fit the value type.
+# Infallible helpers (min/max) return their value directly.
+#
+# Domain mapping to current Solaris world algorithms (read-only reference):
+# Solaris maps world coordinates to grid cells with div_euclid spacing and
+# to local offsets with rem_euclid spacing (chunk 16, region/grid spacings,
+# climate quarters of 4, ore cells). For the positive spacings Solaris
+# passes, Euclidean and floor division agree; MathDivFloor/MathModFloor
+# give that negative-coordinate behavior explicitly: the quotient rounds
+# toward negative infinity and the remainder takes the divisor's sign, so
+# value == quotient * divisor + remainder with 0 <= remainder < divisor
+# for divisor > 0. Examples: -17 div 16 == -2 (chunk), -17 mod 16 == 15
+# (offset inside the chunk); truncated division would give -1 and -1,
+# placing the block in the wrong chunk with a negative offset.
+#
+# Integer square root supports block-distance checks without floats:
+# compare squared integer distances against radius * radius, then recover
+# the distance with MathSqrtU64 when needed. Gcd reduces grid stride
+# ratios; checked multiply/power scale counts and sizes that must stay in
+# range; min/max/clamp bound coordinates, batch sizes and window limits.
+entity MathI64:
+    layout "C".
+    has status of type i64.
+    has value of type i64.
+
+entity MathU64:
+    layout "C".
+    has status of type i64.
+    has value of type u64.
+
+entity MathSqrt:
+    layout "C".
+    has status of type i64.
+    has value of type u64.
+    has exact of type bool.
+
+# The i64 extremes as operations, so contract lines can name them.
+operation MathI64Max:
+    returns i64.
+    body:
+        return 9223372036854775807.
+
+operation MathI64Min:
+    returns i64.
+    body:
+        return 0 - 9223372036854775807 - 1.
+
+# Exact negation: only MIN has no positive counterpart (-75).
+operation MathNegateI64:
+    accepts value of type i64.
+    returns MathI64.
+    requires:
+        value != MathI64Min() otherwise MathI64(-75, 0).
+    body:
+        return MathI64(0, 0 - value).
+
+# Truncated quotient moved down to the floor: a nonzero remainder whose sign
+# differs from the divisor's means the exact quotient is below the truncated
+# one. The subtraction cannot overflow: with a nonzero remainder the
+# truncated quotient is never MIN (that only arises with divisor 1 and a
+# zero remainder).
+operation MathFloorQuotient:
+    accepts quotient of type i64.
+    accepts rest of type i64.
+    accepts divisor of type i64.
+    returns i64.
+    requires:
+        rest != 0 otherwise quotient.
+        (rest < 0) == (divisor < 0) otherwise quotient - 1.
+    body:
+        return quotient.
+
+# Truncated remainder moved to the divisor's sign. Adding the divisor to an
+# opposite-sign remainder shrinks its magnitude below |divisor|, so the
+# adjustment cannot overflow.
+operation MathFloorRemainder:
+    accepts rest of type i64.
+    accepts divisor of type i64.
+    returns i64.
+    requires:
+        rest != 0 otherwise rest.
+        (rest < 0) == (divisor < 0) otherwise rest + divisor.
+    body:
+        return rest.
+
+# Floor division: the quotient rounds toward negative infinity. Zero
+# divisor is -22. MIN / -1 is -75 (the exact 2^63 does not fit); every
+# other pair, including MIN / 1 and MAX / -1, is exact.
+operation MathDivFloor:
+    accepts value of type i64.
+    accepts divisor of type i64.
+    returns MathI64.
+    requires:
+        divisor != 0 otherwise MathI64(-22, 0).
+        divisor != -1 otherwise MathNegateI64(value).
+    body:
+        return MathI64(0, MathFloorQuotient(value / divisor, value % divisor, divisor)).
+
+# Floor remainder: the sign follows the divisor (or zero) and the
+# magnitude stays below |divisor|. Same -22/-75 convention; MIN % -1 is
+# exactly 0 with status 0. For divisor > 0 the result always lies in
+# 0..divisor-1, the valid local-offset range inside a chunk or cell.
+operation MathModFloor:
+    accepts value of type i64.
+    accepts divisor of type i64.
+    returns MathI64.
+    requires:
+        divisor != 0 otherwise MathI64(-22, 0).
+        divisor != -1 otherwise MathI64(0, 0).
+    body:
+        return MathI64(0, MathFloorRemainder(value % divisor, divisor)).
+
+# Checked unsigned division: truncation and floor agree on u64, so only
+# the zero divisor fails (-22); every other pair is exact.
+operation MathDivU64:
+    accepts value of type u64.
+    accepts divisor of type u64.
+    returns MathU64.
+    requires:
+        divisor != u64(0) otherwise MathU64(-22, u64(0)).
+    body:
+        return MathU64(0, value / divisor).
+
+# Checked unsigned remainder with the same -22-on-zero convention.
+operation MathModU64:
+    accepts value of type u64.
+    accepts divisor of type u64.
+    returns MathU64.
+    requires:
+        divisor != u64(0) otherwise MathU64(-22, u64(0)).
+    body:
+        return MathU64(0, value % divisor).
+
+# Branch-free choice between two u64 values: `first` when `chosen`, else
+# `second`.
+operation MathSelectU64:
+    accepts chosen of type bool.
+    accepts first of type u64.
+    accepts second of type u64.
+    returns u64.
+    requires:
+        chosen otherwise second.
+    body:
+        return first.
+
+# Integer square root by binary search on [1, value]; 0 and 1 are exact
+# immediately. The midpoint comparison uses value / mid, which never
+# divides by zero (mid stays above low >= 1) and never overflows, unlike
+# mid * mid. The range halves each step, so at most 63 iterations run.
+# The final square fits because the root never exceeds 2^32 - 1.
+operation MathSqrtU64:
+    accepts value of type u64.
+    returns MathSqrt.
+    requires:
+        value > u64(1) otherwise MathSqrt(0, value, true).
+    body:
+        let mut low = u64(1).
+        let mut high = value.
+        while low + u64(1) < high:
+            let mid = low + (high - low) / u64(2).
+            let fits = mid <= value / mid.
+            set low = MathSelectU64(fits, mid, low).
+            set high = MathSelectU64(fits, high, mid).
+        return MathSqrt(0, low, low * low == value).
+
+# Greatest common divisor by Euclid's loop; the remainder divisor stays
+# nonzero by the loop guard, so no step traps. gcd(0, 0) is 0 and
+# gcd(0, b) is b by convention: no stride, or the full stride.
+operation MathGcdU64:
+    accepts first of type u64.
+    accepts second of type u64.
+    returns MathU64.
+    body:
+        let mut a = first.
+        let mut b = second.
+        while b != u64(0):
+            let rest = a % b.
+            set a = b.
+            set b = rest.
+        return MathU64(0, a).
+
+# Checked signed multiplication. Each sign quadrant is one contract line:
+# outside the quadrant, or the product stays within the i64 range (decided
+# by division before multiplying). The negative result range includes MIN
+# even when neither input is MIN. Divisions only run inside their quadrant
+# (short-circuit `||`) with a nonzero, non-(-1)-of-MIN divisor, so no
+# intermediate can overflow.
+operation MathMulI64:
+    accepts first of type i64.
+    accepts second of type i64.
+    returns MathI64.
+    requires:
+        first != 0 otherwise MathI64(0, 0).
+        second != 0 otherwise MathI64(0, 0).
+        first <= 0 || second <= 0 || first <= MathI64Max() / second otherwise MathI64(-75, 0).
+        first <= 0 || second >= 0 || second >= MathI64Min() / first otherwise MathI64(-75, 0).
+        first >= 0 || second <= 0 || first >= MathI64Min() / second otherwise MathI64(-75, 0).
+        first >= 0 || second >= 0 || first >= MathI64Max() / second otherwise MathI64(-75, 0).
+    body:
+        return MathI64(0, first * second).
+
+# One power-by-squaring multiply: the accumulator times the current factor
+# when the exponent's low bit is set, else unchanged. An earlier failure
+# propagates unchanged.
+operation MathPowFold:
+    accepts result of type MathI64.
+    accepts factor of type i64.
+    accepts rest of type u64.
+    returns MathI64.
+    requires:
+        result.status == 0 otherwise result.
+        rest % u64(2) == u64(1) otherwise result.
+    body:
+        return MathMulI64(result.value, factor).
+
+# The next factor (factor squared) while exponent bits remain; the factor
+# itself once none do, so base^1 never fails on the unused next square. An
+# earlier failure propagates unchanged.
+operation MathPowSquare:
+    accepts result of type MathI64.
+    accepts factor of type i64.
+    accepts rest of type u64.
+    returns MathI64.
+    requires:
+        result.status == 0 otherwise result.
+        rest != u64(0) otherwise MathI64(0, factor).
+    body:
+        return MathMulI64(factor, factor).
+
+# A failing square becomes the overall failure; otherwise the accumulator.
+operation MathPowCarry:
+    accepts result of type MathI64.
+    accepts square of type MathI64.
+    returns MathI64.
+    requires:
+        result.status == 0 otherwise result.
+        square.status == 0 otherwise square.
+    body:
+        return result.
+
+# Checked integer power by squaring: at most 64 loop steps for any u64
+# exponent, and every widening goes through MathMulI64, so overflow
+# reports -75 instead of trapping. 0^0 is 1, the empty product matching
+# the result identity. The loop stops at the first failing step.
+operation MathPowI64:
+    accepts base of type i64.
+    accepts exponent of type u64.
+    returns MathI64.
+    body:
+        let mut result = MathI64(0, 1).
+        let mut factor = base.
+        let mut rest = exponent.
+        while rest != u64(0) && result.status == 0:
+            set result = MathPowFold(result, factor, rest).
+            set rest = rest / u64(2).
+            let square = MathPowSquare(result, factor, rest).
+            set factor = square.value.
+            set result = MathPowCarry(result, square).
+        return result.
+
+# Smaller of two signed values; total, never fails.
+operation MathMinI64:
+    accepts first of type i64.
+    accepts second of type i64.
+    returns i64.
+    requires:
+        first <= second otherwise second.
+    body:
+        return first.
+
+# Larger of two signed values; total, never fails.
+operation MathMaxI64:
+    accepts first of type i64.
+    accepts second of type i64.
+    returns i64.
+    requires:
+        first >= second otherwise second.
+    body:
+        return first.
+
+# Smaller of two unsigned values; total, never fails.
+operation MathMinU64:
+    accepts first of type u64.
+    accepts second of type u64.
+    returns u64.
+    requires:
+        first <= second otherwise second.
+    body:
+        return first.
+
+# Larger of two unsigned values; total, never fails.
+operation MathMaxU64:
+    accepts first of type u64.
+    accepts second of type u64.
+    returns u64.
+    requires:
+        first >= second otherwise second.
+    body:
+        return first.
+
+# Signed clamp to [lo, hi]: an inverted range is -22, otherwise the
+# nearest bound (or the value itself) with status 0.
+operation MathClampI64:
+    accepts value of type i64.
+    accepts low of type i64.
+    accepts high of type i64.
+    returns MathI64.
+    requires:
+        low <= high otherwise MathI64(-22, 0).
+        value >= low otherwise MathI64(0, low).
+        value <= high otherwise MathI64(0, high).
+    body:
+        return MathI64(0, value).
+
+# Unsigned clamp to [lo, hi] with the same -22 convention.
+operation MathClampU64:
+    accepts value of type u64.
+    accepts low of type u64.
+    accepts high of type u64.
+    returns MathU64.
+    requires:
+        low <= high otherwise MathU64(-22, u64(0)).
+        value >= low otherwise MathU64(0, low).
+        value <= high otherwise MathU64(0, high).
+    body:
+        return MathU64(0, value).

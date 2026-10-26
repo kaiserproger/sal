@@ -1,0 +1,408 @@
+# SAL durable file layer for WAL/checkpoint persistence (Linux x86-64).
+#
+# All algorithms are SAL in this file. The only kernel crossings are the
+# file syscalls (open 2, close 3, read 0, write 1, lseek 8, pread64 17,
+# pwrite64 18, fsync 74, fdatasync 75, ftruncate 77, rename 82, unlink 87,
+# fcntl 72, getpid 39), each confined to a narrow audited `unsafe:` block
+# that grants UnsafeMemory to those nested statements only. Public
+# operations declare `SystemCall` where they (transitively) trap into the
+# kernel and never declare UnsafeMemory; type checks stay on everywhere.
+# No libc.
+#
+# Descriptors are explicit caller-owned i64 values, not owned handles: the
+# caller opens, owns the lifetime, and closes exactly once. Every failure
+# is a negative errno preserved unchanged (-2 missing, -9 bad descriptor,
+# -22 invalid argument, -28 scratch too small, -36 name too long). -4
+# (EINTR) retries inside short reads/writes only and never escapes them.
+#
+# Paths are borrowed read-only Bytes views validated before any trap:
+# empty is -22, embedded NUL is -22, length above 4095 is -36. The kernel
+# needs NUL termination, so every path-taking operation also borrows an
+# exclusive MutBytes scratch holding the temporary NUL-terminated copy;
+# -28 when it does not fit. No hidden allocation, no global scratch.
+# Callers frame pid-unique names with the std/bytes cursor builders
+# (BytesAppend / BytesDecimalAt) and FilePid; this file has no byte loops of
+# its own beyond the kernel retry loops.
+#
+# Every precondition is an operation header `requires:` clause whose
+# `otherwise` value is the errno returned before any trap. Cursor-style
+# results (FileCopyPath) are i64 offsets that propagate a negative errno, so
+# `FileOpen(path, scratch, flags, mode)` is one call, not an error ladder.
+#
+# Buffers are caller loans. FileRead/FileReadAt make a single attempt and
+# return short counts as-is, never hidden or padded. FileWriteAll and
+# FileWriteAt loop short writes with EINTR retry and report -5 on a zero
+# write. FileSync/FileDataSync/FileClose trap exactly once: close is never
+# retried (Linux releases the descriptor even when EINTR surfaces, so a
+# retry could close an unrelated reused descriptor) and durability errors
+# are never replaced or hidden.
+#
+# WAL protocol this supports: create tmp with O_WRONLY|O_CREAT|O_TRUNC,
+# FileWriteAll, FileSync, FileClose, FileRename, FileSyncDir on the
+# containing directory, then serve readers with FileOpen/FileReadAt and
+# reclaim with FileRemove. FileSyncDir opens O_RDONLY|O_DIRECTORY itself,
+# so callers never forge directory descriptors.
+#
+# Flag words (compose with +; negative words are -22, never trapped):
+# O_RDONLY 0, O_WRONLY 1, O_RDWR 2, O_CREAT 64, O_EXCL 128, O_TRUNC 512,
+# O_APPEND 1024, O_DIRECTORY 65536. Mode 0600 is 384. Whence: SET 0,
+# CUR 1, END 2. pwrite on an O_APPEND descriptor appends regardless of
+# offset (Linux man pwrite BUGS), so FileWriteAt rejects O_APPEND
+# descriptors with -22 (flag word read once via fcntl F_GETFL); use
+# FileWriteAll for appends.
+
+use "bytes.sal".
+
+# Process id for pid-unique scratch names. getpid never fails on Linux.
+operation FilePid:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut pid = i64(0).
+        unsafe:
+            set pid = syscall(i64(39), i64(0), i64(0), i64(0), i64(0), i64(0), i64(0)).
+        return pid.
+
+# Copy path plus its NUL terminator into scratch at the signed cursor `at`.
+# Returns the cursor one past the NUL, or the negative errno: an earlier
+# negative cursor propagates unchanged, -22 on empty/embedded-NUL, -36 when
+# the path alone exceeds 4095 bytes, -28 when the copy and terminator do not
+# fit. The whole path is prevalidated for embedded NUL before the first
+# byte is written, so every failure leaves the scratch exactly untouched.
+operation FileCopyPath:
+    accepts path of type Bytes.
+    accepts scratch of type MutBytes.
+    accepts at of type i64.
+    returns i64.
+    requires:
+        at >= 0 otherwise at.
+        len(path) > usize(0) otherwise -22.
+        len(path) <= usize(4095) otherwise -36.
+        usize(at) <= len(scratch) otherwise -28.
+        len(path) + usize(1) <= len(scratch) - usize(at) otherwise -28.
+        BytesFind(path, bytes("\u{0}")) < 0 otherwise -22.
+    body:
+        let end = BytesAppend(scratch, at, path).
+        put(scratch, usize(end), u8(0)).
+        return end + 1.
+
+# Open the NUL-terminated path already placed in scratch (`placed` is the
+# FileCopyPath cursor, negative errno propagates).
+operation FileOpenPlaced:
+    accepts scratch of type MutBytes.
+    accepts placed of type i64.
+    accepts flags of type i64.
+    accepts mode of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        placed >= 0 otherwise placed.
+    body:
+        let mut fd = i64(0).
+        unsafe:
+            set fd = syscall(i64(2), address(scratch), flags, mode, i64(0), i64(0), i64(0)).
+        return fd.
+
+# Open a validated path with the given flag word and mode. Returns the new
+# caller-owned descriptor, or the negative errno. scratch must hold the
+# path plus its NUL terminator. Negative flags or modes outside 0..4095
+# are -22 before any trap.
+operation FileOpen:
+    accepts path of type Bytes.
+    accepts scratch of type MutBytes.
+    accepts flags of type i64.
+    accepts mode of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        flags >= 0 otherwise -22.
+        mode >= 0 otherwise -22.
+        mode <= 4095 otherwise -22.
+    body:
+        return FileOpenPlaced(scratch, FileCopyPath(path, scratch, 0), flags, mode).
+
+# Single read attempt into the destination loan. Returns the byte count
+# (0 is end of file, including empty spans) or the negative errno. EINTR
+# retries; short reads are returned, never hidden or padded.
+operation FileRead:
+    accepts fd of type i64.
+    accepts destination of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        len(destination) > usize(0) otherwise 0.
+    body:
+        let mut received = i64(-4).
+        while received == -4:
+            unsafe:
+                set received = syscall(i64(0), fd, address(destination), i64(len(destination)), i64(0), i64(0), i64(0)).
+        return received.
+
+# Cursor step of a short-write loop: the running byte count plus this call's
+# syscall result. A zero-byte write makes no progress (-5); a negative result
+# is the errno and propagates unchanged.
+operation FileAdvance:
+    accepts done of type i64.
+    accepts written of type i64.
+    returns i64.
+    requires:
+        written != 0 otherwise -5.
+        written >= 0 otherwise written.
+    body:
+        return done + written.
+
+# Write the whole span, looping short writes. Returns len(data), or the
+# negative errno, or -5 on a zero write. EINTR retries, never escapes.
+operation FileWriteAll:
+    accepts fd of type i64.
+    accepts data of type Bytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let total = i64(len(data)).
+        let mut done = 0.
+        while done >= 0 && done < total:
+            let remaining = slice(data, usize(done), len(data) - usize(done)).
+            let mut written = i64(-4).
+            while written == -4:
+                unsafe:
+                    set written = syscall(i64(1), fd, address(remaining), i64(len(remaining)), i64(0), i64(0), i64(0)).
+            set done = FileAdvance(done, written).
+        return done.
+
+# Single positioned read that never moves the file offset. Returns the
+# byte count (0 is end of file, including empty spans) or the negative
+# errno. Negative offsets are -22 before any trap; EINTR retries.
+operation FileReadAt:
+    accepts fd of type i64.
+    accepts offset of type i64.
+    accepts destination of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        offset >= 0 otherwise -22.
+        len(destination) > usize(0) otherwise 0.
+    body:
+        let mut received = i64(-4).
+        while received == -4:
+            unsafe:
+                set received = syscall(i64(17), fd, address(destination), i64(len(destination)), offset, i64(0), i64(0)).
+        return received.
+
+# Descriptor status flags (fcntl F_GETFL), or the negative errno.
+operation FileFlags:
+    accepts fd of type i64.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut flags = i64(0).
+        unsafe:
+            set flags = syscall(i64(72), fd, i64(3), i64(0), i64(0), i64(0), i64(0)).
+        return flags.
+
+# Positioned write loop for a descriptor whose flag word was already read:
+# a negative flag word is the errno from that read, O_APPEND is -22.
+operation FileWriteAtFlagged:
+    accepts fd of type i64.
+    accepts offset of type i64.
+    accepts data of type Bytes.
+    accepts flags of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        flags >= 0 otherwise flags.
+        bit_and(flags, i64(1024)) == 0 otherwise -22.
+    body:
+        let total = i64(len(data)).
+        let mut done = 0.
+        while done >= 0 && done < total:
+            let remaining = slice(data, usize(done), len(data) - usize(done)).
+            let at = offset + done.
+            let mut written = i64(-4).
+            while written == -4:
+                unsafe:
+                    set written = syscall(i64(18), fd, address(remaining), i64(len(remaining)), at, i64(0), i64(0)).
+            set done = FileAdvance(done, written).
+        return done.
+
+# Positioned write of the whole span. O_APPEND descriptors are rejected
+# with -22 before any write: on Linux pwrite appends regardless of offset
+# (man pwrite BUGS), so positioning cannot be honored there. The flag word
+# is read once at entry with fcntl F_GETFL; any other negative errno from
+# that read is preserved unchanged. The descriptor stays caller-owned and
+# its flags must not be mutated concurrently with this call. Returns
+# len(data), the negative errno, or -5 on a zero write. Negative offsets
+# are -22 before any trap; EINTR retries.
+operation FileWriteAt:
+    accepts fd of type i64.
+    accepts offset of type i64.
+    accepts data of type Bytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        offset >= 0 otherwise -22.
+    body:
+        return FileWriteAtFlagged(fd, offset, data, FileFlags(fd)).
+
+# Reposition the file offset. whence is SET 0, CUR 1, END 2; anything else
+# is -22 before any trap. Returns the new offset or the negative errno.
+operation FileSeek:
+    accepts fd of type i64.
+    accepts offset of type i64.
+    accepts whence of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        whence >= 0 otherwise -22.
+        whence <= 2 otherwise -22.
+    body:
+        let mut position = i64(0).
+        unsafe:
+            set position = syscall(i64(8), fd, offset, whence, i64(0), i64(0), i64(0)).
+        return position.
+
+# Resize an open file; a larger length zero-fills the extension. Negative
+# lengths are -22 before any trap. Returns 0 or the negative errno.
+operation FileTruncate:
+    accepts fd of type i64.
+    accepts length of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        length >= 0 otherwise -22.
+    body:
+        let mut code = i64(0).
+        unsafe:
+            set code = syscall(i64(77), fd, length, i64(0), i64(0), i64(0), i64(0)).
+        return code.
+
+# Durably persist file data and metadata: exactly one attempt, and EINTR
+# surfaces as -4 instead of being retried, so an interrupted sync is never
+# mistaken for durability. Returns 0 or the negative errno.
+operation FileSync:
+    accepts fd of type i64.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut code = i64(0).
+        unsafe:
+            set code = syscall(i64(74), fd, i64(0), i64(0), i64(0), i64(0), i64(0)).
+        return code.
+
+# Durably persist file data (metadata only when needed for access): same
+# single-attempt contract as FileSync. Returns 0 or the negative errno.
+operation FileDataSync:
+    accepts fd of type i64.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut code = i64(0).
+        unsafe:
+            set code = syscall(i64(75), fd, i64(0), i64(0), i64(0), i64(0), i64(0)).
+        return code.
+
+# Release one descriptor with exactly one trap, never retried: Linux has
+# already released it even when EINTR surfaces, so a retry could close an
+# unrelated descriptor reused by another thread. The caller must not reuse
+# the descriptor whatever this returns. Returns 0 or the negative errno.
+operation FileClose:
+    accepts fd of type i64.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut code = i64(0).
+        unsafe:
+            set code = syscall(i64(3), fd, i64(0), i64(0), i64(0), i64(0), i64(0)).
+        return code.
+
+# Rename the two NUL-terminated names already placed in scratch (`first`
+# and `second` are the FileCopyPath cursors; the first negative errno
+# propagates, old name before new name).
+operation FileRenamePlaced:
+    accepts scratch of type MutBytes.
+    accepts first of type i64.
+    accepts second of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        first >= 0 otherwise first.
+        second >= 0 otherwise second.
+    body:
+        let mut code = i64(0).
+        unsafe:
+            set code = syscall(i64(82), address(scratch), address(scratch) + usize(first), i64(0), i64(0), i64(0), i64(0)).
+        return code.
+
+# Atomically rename a path. Both names are validated and NUL-terminated
+# into scratch (old first, new second), so scratch must hold both plus
+# two terminators. Returns 0 or the negative errno. The parent directory
+# is NOT synced here: WAL durability needs FileSyncDir after this.
+operation FileRename:
+    accepts oldpath of type Bytes.
+    accepts newpath of type Bytes.
+    accepts scratch of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let first = FileCopyPath(oldpath, scratch, 0).
+        return FileRenamePlaced(scratch, first, FileCopyPath(newpath, scratch, first)).
+
+# Unlink the NUL-terminated path already placed in scratch.
+operation FileRemovePlaced:
+    accepts scratch of type MutBytes.
+    accepts placed of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        placed >= 0 otherwise placed.
+    body:
+        let mut code = i64(0).
+        unsafe:
+            set code = syscall(i64(87), address(scratch), i64(0), i64(0), i64(0), i64(0), i64(0)).
+        return code.
+
+# Remove a name. scratch must hold the path plus its NUL terminator.
+# Returns 0 or the negative errno (notably -2 when already gone).
+operation FileRemove:
+    accepts path of type Bytes.
+    accepts scratch of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        return FileRemovePlaced(scratch, FileCopyPath(path, scratch, 0)).
+
+# The first failure of two ordered steps: an earlier negative errno wins,
+# otherwise the later result.
+operation FileFirstFailure:
+    accepts first of type i64.
+    accepts second of type i64.
+    returns i64.
+    requires:
+        first >= 0 otherwise first.
+    body:
+        return second.
+
+# Sync then close an opened directory descriptor (a negative `fd` is the
+# open errno and propagates). A sync failure is returned even when the close
+# also fails; a close failure is returned only when the sync succeeded.
+operation FileSyncClose:
+    accepts fd of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        fd >= 0 otherwise fd.
+    body:
+        let code = FileSync(fd).
+        return FileFirstFailure(code, FileClose(fd)).
+
+# Durably persist a directory's entries after renames: opens the directory
+# O_RDONLY|O_DIRECTORY itself, syncs exactly once, then closes. A sync
+# failure is returned even when the close also fails; a close failure is
+# returned only when the sync succeeded. Returns 0 or the negative errno.
+operation FileSyncDir:
+    accepts path of type Bytes.
+    accepts scratch of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        return FileSyncClose(FileOpenPlaced(scratch, FileCopyPath(path, scratch, 0), 65536, 0)).

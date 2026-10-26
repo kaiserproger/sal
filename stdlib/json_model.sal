@@ -1,0 +1,515 @@
+# Generic declarative-JSON runtime: cursor plus typed per-type readers/writers.
+#
+# The derived per-entity decoder (owned by the declaration lowerer) iterates
+# fields with JsonModelBegin/Next/KeyEquals, decodes each field value with one
+# JsonModelRead* call (or the array reader), skips unknowns with the existing
+# JsonValueEnd, then continues with JsonModelCursor(read_end,false). Read
+# helpers return values rooted in caller storage; write helpers frame into a
+# caller target span and report the next offset. Status vocabulary:
+# 0 success, -22 malformed input, -28 capacity or decoded-bound excess,
+# -75 integer overflow. Readers parse one value only and stop at its end;
+# whole-input trailing validation is the derived decoder's job. Writers
+# preflight their full framing before the first put, so -28 leaves the target
+# prefix byte-identical and -22 writes nothing; success is never truncated.
+#
+# Pure, safe spans, no allocation, no UnsafeMemory: grammar via std/json.sal,
+# framing via std/binary.sal, text validity via std/text.sal, lists via
+# std/text_list.sal. Reads take immutable Bytes views; decoded payloads go to
+# MutBytes loans owned by the caller. No warehouse values hardcoded: limits
+# arrive as parameters, key scratch is caller-sized. No hidden Rust runtime.
+# Parameter-only failures are ordered header contracts; writer result counts
+# advance signed cursors through BytesAdvance without losing negative statuses.
+use "binary.sal".
+use "bytes.sal".
+use "json.sal".
+use "text.sal".
+use "text_list.sal".
+
+entity JsonModelCursor:
+    has offset of type usize.
+    has first of type bool.
+
+entity JsonModelStart:
+    has status of type i64.
+    has cursor of type JsonModelCursor.
+
+entity JsonModelMember:
+    has status of type i64.
+    has present of type bool.
+    has key_length of type i64.
+    has value_start of type usize.
+    has read_end of type usize.
+
+entity JsonI64Value:
+    has status of type i64.
+    has value of type i64.
+    has read_end of type usize.
+    has written of type usize.
+
+entity JsonU64Value:
+    has status of type i64.
+    has value of type u64.
+    has read_end of type usize.
+    has written of type usize.
+
+entity JsonBoolValue:
+    has status of type i64.
+    has value of type bool.
+    has read_end of type usize.
+    has written of type usize.
+
+entity JsonTextValue:
+    has status of type i64.
+    has value of type Text.
+    has read_end of type usize.
+    has written of type usize.
+
+entity JsonTextListValue:
+    has status of type i64.
+    has value of type TextList.
+    has read_end of type usize.
+    has written of type usize.
+
+# Consume `{` after whitespace at start. Offset is the cursor for Next.
+operation JsonModelBegin:
+    accepts input of type Bytes.
+    accepts start of type usize.
+    returns JsonModelStart.
+    requires:
+        start < len(input) otherwise JsonModelStart(-22, JsonModelCursor(start, true)).
+    body:
+        let skipped = JsonWhitespaceEnd(input, start).
+        let offset = usize(skipped).
+        if offset >= len(input) || byte(input, offset) != 123:
+            return JsonModelStart(-22, JsonModelCursor(start, true)).
+        return JsonModelStart(0, JsonModelCursor(offset + 1, true)).
+
+# Parse one separator, key, and colon; never the field value. On a clean `}`
+# (only legal before the first field or after a comma) present is false and
+# read_end sits after the brace; whole-input trailing checks stay with the
+# derived top-level decoder. Trailing commas are rejected (-22). key_length is
+# the decoded key byte count, or -1 when the key is valid JSON but longer than
+# the scratch: still skippable via JsonValueEnd, never a capacity fatal.
+operation JsonModelNext:
+    accepts input of type Bytes.
+    accepts cursor of type JsonModelCursor.
+    accepts key of type MutBytes.
+    returns JsonModelMember.
+    requires:
+        cursor.offset < len(input) otherwise JsonModelMember(-22, false, 0, usize(0), cursor.offset).
+    body:
+        let skipped = JsonWhitespaceEnd(input, cursor.offset).
+        let mut offset = usize(skipped).
+        if offset >= len(input):
+            return JsonModelMember(-22, false, 0, usize(0), cursor.offset).
+        if byte(input, offset) == 125:
+            return JsonModelMember(0, false, 0, usize(0), offset + 1).
+        if cursor.first == false:
+            if byte(input, offset) != 44:
+                return JsonModelMember(-22, false, 0, usize(0), cursor.offset).
+            set offset = offset + 1.
+            let after = JsonWhitespaceEnd(input, offset).
+            set offset = usize(after).
+            if offset >= len(input):
+                return JsonModelMember(-22, false, 0, usize(0), cursor.offset).
+        if byte(input, offset) != 34:
+            return JsonModelMember(-22, false, 0, usize(0), cursor.offset).
+        let decoded = JsonDecodeStringAt(input, offset, key).
+        if decoded.status < 0 && decoded.status != -28:
+            return JsonModelMember(-22, false, 0, usize(0), cursor.offset).
+        let mut keyEnd = decoded.read_end.
+        let mut keyLength = i64(decoded.written).
+        if decoded.status == -28:
+            let validatedEnd = JsonStringEnd(input, offset).
+            if validatedEnd < 0:
+                return JsonModelMember(-22, false, 0, usize(0), cursor.offset).
+            set keyEnd = usize(validatedEnd).
+            set keyLength = -1.
+        let colon = JsonWhitespaceEnd(input, keyEnd).
+        let mut valueStart = usize(colon).
+        if valueStart >= len(input) || byte(input, valueStart) != 58:
+            return JsonModelMember(-22, false, 0, usize(0), cursor.offset).
+        set valueStart = valueStart + 1.
+        let marked = JsonWhitespaceEnd(input, valueStart).
+        set valueStart = usize(marked).
+        if valueStart >= len(input):
+            return JsonModelMember(-22, false, 0, usize(0), cursor.offset).
+        return JsonModelMember(0, true, keyLength, valueStart, valueStart).
+
+# Bounded decoded-key comparison against a schema field name. length < 0
+# (unknown too-long key) never matches; longer windows fail closed.
+operation JsonModelKeyEquals:
+    accepts key of type MutBytes.
+    accepts length of type i64.
+    accepts expected of type Text.
+    returns bool.
+    requires:
+        length >= 0 otherwise false.
+        usize(length) <= len(key) otherwise false.
+    body:
+        let raw = view(key).
+        let window = slice(raw, usize(0), usize(length)).
+        let same = window == bytes(expected).
+        borrow_end(window).
+        borrow_end(raw).
+        return same.
+
+# Strict JSON number at start: optional minus, no plus, no leading zeros,
+# integer fraction/exponent grammar validated first, then range-checked.
+# Fraction or exponent present is grammar-valid but not an integer: -22.
+operation JsonModelReadI64:
+    accepts input of type Bytes.
+    accepts start of type usize.
+    returns JsonI64Value.
+    requires:
+        start < len(input) otherwise JsonI64Value(-22, 0, start, usize(0)).
+    body:
+        let skipped = JsonWhitespaceEnd(input, start).
+        let offset = usize(skipped).
+        if offset >= len(input):
+            return JsonI64Value(-22, 0, start, usize(0)).
+        let numEnd = JsonNumberEnd(input, offset).
+        if numEnd < 0:
+            return JsonI64Value(-22, 0, start, usize(0)).
+        let raw = slice(input, offset, usize(numEnd) - offset).
+        let mut index = usize(0).
+        if byte(raw, usize(0)) == 45:
+            set index = usize(1).
+        let mut scan = index.
+        while scan < len(raw):
+            let ch = byte(raw, scan).
+            if ch == 46 || ch == 101 || ch == 69:
+                return JsonI64Value(-22, 0, start, usize(0)).
+            set scan = scan + 1.
+        let digits = slice(raw, index, len(raw) - index).
+        let negate = index == usize(1).
+        let mut value = 0.
+        let mut at = usize(0).
+        while at < len(digits):
+            let ch = byte(digits, at).
+            let digit = i64(ch) - 48.
+            if negate:
+                if value < 0 - 922337203685477580 || (value == 0 - 922337203685477580 && digit > 8):
+                    return JsonI64Value(-75, 0, start, usize(0)).
+                set value = value * 10 - digit.
+            else:
+                if value > 922337203685477580 || (value == 922337203685477580 && digit > 7):
+                    return JsonI64Value(-75, 0, start, usize(0)).
+                set value = value * 10 + digit.
+            set at = at + 1.
+        return JsonI64Value(0, value, usize(numEnd), usize(0)).
+
+# Strict unsigned JSON integer; minus is grammar-valid JSON but -22 here.
+operation JsonModelReadU64:
+    accepts input of type Bytes.
+    accepts start of type usize.
+    returns JsonU64Value.
+    requires:
+        start < len(input) otherwise JsonU64Value(-22, u64(0), start, usize(0)).
+    body:
+        let skipped = JsonWhitespaceEnd(input, start).
+        let offset = usize(skipped).
+        if offset >= len(input):
+            return JsonU64Value(-22, u64(0), start, usize(0)).
+        let numEnd = JsonNumberEnd(input, offset).
+        if numEnd < 0:
+            return JsonU64Value(-22, u64(0), start, usize(0)).
+        let raw = slice(input, offset, usize(numEnd) - offset).
+        if byte(raw, usize(0)) == 45:
+            return JsonU64Value(-22, u64(0), start, usize(0)).
+        let mut scan = usize(0).
+        while scan < len(raw):
+            let ch = byte(raw, scan).
+            if ch == 46 || ch == 101 || ch == 69:
+                return JsonU64Value(-22, u64(0), start, usize(0)).
+            set scan = scan + 1.
+        let mut value = u64(0).
+        let mut at = usize(0).
+        while at < len(raw):
+            let ch = byte(raw, at).
+            let digit = u64(ch) - u64(48).
+            if value > u64(1844674407370955161) || (value == u64(1844674407370955161) && digit > u64(5)):
+                return JsonU64Value(-75, u64(0), start, usize(0)).
+            set value = value * u64(10) + digit.
+            set at = at + 1.
+        return JsonU64Value(0, value, usize(numEnd), usize(0)).
+
+# Lowercase literals true/false only; anything else is -22.
+operation JsonModelReadBool:
+    accepts input of type Bytes.
+    accepts start of type usize.
+    returns JsonBoolValue.
+    requires:
+        start < len(input) otherwise JsonBoolValue(-22, false, start, usize(0)).
+    body:
+        let skipped = JsonWhitespaceEnd(input, start).
+        let offset = usize(skipped).
+        if offset >= len(input):
+            return JsonBoolValue(-22, false, start, usize(0)).
+        let raw = slice(input, offset, len(input) - offset).
+        return JsonModelBoolLiteral(raw, offset, start).
+
+operation JsonModelBoolLiteral:
+    accepts raw of type Bytes.
+    accepts offset of type usize.
+    accepts start of type usize.
+    returns JsonBoolValue.
+    requires:
+        BytesStartsWith(raw, bytes("true")) == false otherwise JsonBoolValue(0, true, offset + usize(4), usize(0)).
+        BytesStartsWith(raw, bytes("false")) == false otherwise JsonBoolValue(0, false, offset + usize(5), usize(0)).
+    body:
+        return JsonBoolValue(-22, false, start, usize(0)).
+
+# Decoded string into output[0..written]; value = text(view) of those bytes.
+# Output too small is -28 with value unusable; value is valid only on 0.
+operation JsonModelReadText:
+    accepts input of type Bytes.
+    accepts start of type usize.
+    accepts output of type MutBytes.
+    returns JsonTextValue from output.
+    requires:
+        start < len(input) otherwise JsonTextValue(-22, "", start, usize(0)).
+    body:
+        let skipped = JsonWhitespaceEnd(input, start).
+        let offset = usize(skipped).
+        if offset >= len(input):
+            return JsonTextValue(-22, "", start, usize(0)).
+        if byte(input, offset) != 34:
+            return JsonTextValue(-22, "", start, usize(0)).
+        let decoded = JsonDecodeStringAt(input, offset, output).
+        if decoded.status == -28:
+            return JsonTextValue(-28, "", start, usize(0)).
+        if decoded.status != 0:
+            return JsonTextValue(-22, "", start, usize(0)).
+        let written = decoded.written.
+        let raw = view(output).
+        let payload = slice(raw, usize(0), written).
+        let frozen = text(payload).
+        borrow_end(payload).
+        borrow_end(raw).
+        return JsonTextValue(0, frozen, decoded.read_end, written).
+
+# Array of strings decoded directly into BE32-framed TextList payload at
+# output[0..written]. max_items/max_item_bytes 0 mean unbounded except caller
+# capacity; otherwise the first bound excess returns -28 before later input is
+# scanned, matching bounded-request behavior. Decoded values borrow output.
+operation JsonModelReadTextList:
+    accepts input of type Bytes.
+    accepts start of type usize.
+    accepts output of type MutBytes.
+    accepts max_items of type usize.
+    accepts max_item_bytes of type usize.
+    returns JsonTextListValue from output.
+    requires:
+        start < len(input) otherwise JsonTextListValue(-22, TextList(bytes(""), usize(0)), start, usize(0)).
+    body:
+        let skipped = JsonWhitespaceEnd(input, start).
+        let mut offset = usize(skipped).
+        if offset >= len(input) || byte(input, offset) != 91:
+            return JsonTextListValue(-22, TextList(bytes(""), usize(0)), start, usize(0)).
+        set offset = offset + 1.
+        let mut written = usize(0).
+        let mut count = usize(0).
+        let head = JsonWhitespaceEnd(input, offset).
+        set offset = usize(head).
+        if offset >= len(input):
+            return JsonTextListValue(-22, TextList(bytes(""), usize(0)), start, usize(0)).
+        if byte(input, offset) == 93:
+            let raw = view(output).
+            let framed = slice(raw, usize(0), written).
+            let snap = TextList(framed, count).
+            borrow_end(framed).
+            borrow_end(raw).
+            return JsonTextListValue(0, snap, offset + 1, written).
+        while true:
+            if offset >= len(input):
+                return JsonTextListValue(-22, TextList(bytes(""), usize(0)), start, usize(0)).
+            if (max_items != usize(0) && count >= max_items):
+                return JsonTextListValue(-28, TextList(bytes(""), usize(0)), start, usize(0)).
+            if byte(input, offset) != 34:
+                return JsonTextListValue(-22, TextList(bytes(""), usize(0)), start, usize(0)).
+            if len(output) - written < usize(4):
+                return JsonTextListValue(-28, TextList(bytes(""), usize(0)), start, usize(0)).
+            let headRoom = written + usize(4).
+            let mut room = len(output) - headRoom.
+            if room > usize(4294967295):
+                set room = usize(4294967295).
+            if max_item_bytes != usize(0) && room > max_item_bytes:
+                set room = max_item_bytes.
+            let window = slice_mut(output, headRoom, room).
+            let decoded = JsonDecodeStringAt(input, offset, window).
+            borrow_end(window).
+            if decoded.status == -28:
+                return JsonTextListValue(-28, TextList(bytes(""), usize(0)), start, usize(0)).
+            if decoded.status != 0:
+                return JsonTextListValue(-22, TextList(bytes(""), usize(0)), start, usize(0)).
+            let part = decoded.written.
+            let frame = slice_mut(output, written, usize(4)).
+            BinaryWriteU32Be(frame, usize(0), i64(part)).
+            borrow_end(frame).
+            set written = written + part + usize(4).
+            set count = count + 1.
+            let after = JsonWhitespaceEnd(input, decoded.read_end).
+            set offset = usize(after).
+            if offset >= len(input):
+                return JsonTextListValue(-22, TextList(bytes(""), usize(0)), start, usize(0)).
+            if byte(input, offset) == 44:
+                set offset = offset + 1.
+                let gap = JsonWhitespaceEnd(input, offset).
+                set offset = usize(gap).
+                continue.
+            if byte(input, offset) == 93:
+                let raw = view(output).
+                let framed = slice(raw, usize(0), written).
+                let snap = TextList(framed, count).
+                borrow_end(framed).
+                borrow_end(raw).
+                return JsonTextListValue(0, snap, offset + 1, written).
+            return JsonTextListValue(-22, TextList(bytes(""), usize(0)), start, usize(0)).
+
+# Raw framed slice appended at offset: preflighted, never truncated success.
+operation JsonModelWriteLiteral:
+    accepts value of type Bytes.
+    accepts target of type MutBytes.
+    accepts offset of type usize.
+    returns i64.
+    requires:
+        offset <= len(target) otherwise -22.
+        len(target) - offset >= len(value) otherwise -28.
+    body:
+        let window = slice_mut(target, offset, len(value)).
+        let copied = BytesCopy(window, value).
+        borrow_end(window).
+        return BytesAdvance(i64(offset), copied).
+
+# Comma (unless first) plus quoted name plus colon at offset. The name is
+# escaped and quoted by JsonWriteString, so control bytes and quotes
+# round-trip; output too small returns -28 (bytes past offset are scratch).
+operation JsonModelWriteField:
+    accepts name of type Text.
+    accepts first of type bool.
+    accepts target of type MutBytes.
+    accepts offset of type usize.
+    returns i64.
+    requires:
+        offset <= len(target) otherwise -22.
+    body:
+        let mut next = i64(offset).
+        if first == false:
+            set next = JsonModelWriteLiteralAt(bytes(","), target, next).
+        set next = JsonModelWriteTextAt(name, target, next).
+        return JsonModelWriteLiteralAt(bytes(":"), target, next).
+
+# Internal signed-cursor adapters preserve the compiler-facing usize APIs.
+# A failed step reaches subsequent header contracts without another write.
+operation JsonModelWriteLiteralAt:
+    accepts value of type Bytes.
+    accepts target of type MutBytes.
+    accepts at of type i64.
+    returns i64.
+    requires:
+        at >= 0 otherwise at.
+    body:
+        return JsonModelWriteLiteral(value, target, usize(at)).
+
+operation JsonModelWriteTextAt:
+    accepts value of type Text.
+    accepts target of type MutBytes.
+    accepts at of type i64.
+    returns i64.
+    requires:
+        at >= 0 otherwise at.
+    body:
+        return JsonModelWriteText(value, target, usize(at)).
+
+# Signed decimal framing at offset; MIN handled without negating MIN.
+operation JsonModelWriteI64:
+    accepts value of type i64.
+    accepts target of type MutBytes.
+    accepts offset of type usize.
+    returns i64.
+    requires:
+        offset <= len(target) otherwise -22.
+    body:
+        let window = slice_mut(target, offset, len(target) - offset).
+        let count = BytesDecimal(value, window).
+        borrow_end(window).
+        return BytesAdvance(i64(offset), count).
+
+# Unsigned decimal framing at offset; JsonUnsigned rejects negatives, so the
+# writer builds digits directly and preflights the 1..20 width.
+operation JsonModelWriteU64:
+    accepts value of type u64.
+    accepts target of type MutBytes.
+    accepts offset of type usize.
+    returns i64.
+    requires:
+        offset <= len(target) otherwise -22.
+    body:
+        let mut width = usize(1).
+        let mut scan = value.
+        while scan >= u64(10):
+            set scan = scan / u64(10).
+            set width = width + 1.
+        if len(target) - offset < width:
+            return -28.
+        let mut rest = value.
+        let mut at = offset + width.
+        while at > offset:
+            set at = at - 1.
+            put(target, at, u8(48 + i64(rest % u64(10)))).
+            set rest = rest / u64(10).
+        return i64(offset + width).
+
+operation JsonModelWriteBool:
+    accepts value of type bool.
+    accepts target of type MutBytes.
+    accepts offset of type usize.
+    returns i64.
+    body:
+        if value:
+            return JsonModelWriteLiteral(bytes("true"), target, offset).
+        return JsonModelWriteLiteral(bytes("false"), target, offset).
+
+# Quoted decoded-text framing at offset via JsonWriteString; the Text arrives
+# as checked UTF-8 already, so only framing can fail (-28).
+operation JsonModelWriteText:
+    accepts value of type Text.
+    accepts target of type MutBytes.
+    accepts offset of type usize.
+    returns i64.
+    requires:
+        offset <= len(target) otherwise -22.
+    body:
+        let window = slice_mut(target, offset, len(target) - offset).
+        let count = JsonWriteString(bytes(value), window).
+        borrow_end(window).
+        return BytesAdvance(i64(offset), count).
+
+# Array framing of a TextList at offset: `[` then comma-separated quoted
+# strings then `]`; preflight framing characters plus each item.
+operation JsonModelWriteTextList:
+    accepts value of type TextList.
+    accepts target of type MutBytes.
+    accepts offset of type usize.
+    returns i64.
+    requires:
+        offset <= len(target) otherwise -22.
+        len(target) - offset >= usize(2) otherwise -28.
+    body:
+        let mut next = JsonModelWriteLiteral(bytes("["), target, offset).
+        let mut cursor = value.
+        let mut first = true.
+        while true:
+            let step = TextListNext(cursor).
+            if step.valid == false:
+                return -22.
+            if step.has == false:
+                return JsonModelWriteLiteralAt(bytes("]"), target, next).
+            if first == false:
+                set next = JsonModelWriteLiteralAt(bytes(","), target, next).
+            set first = false.
+            set next = JsonModelWriteTextAt(step.value, target, next).
+            if next < 0:
+                return next.
+            set cursor = step.next.

@@ -17,6 +17,6 @@ operation WarehouseDatabaseUser:
 
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return ServerRun(u64(0), i64(8080), usize(2097152), i64(32)).

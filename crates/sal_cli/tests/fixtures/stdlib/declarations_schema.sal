@@ -1,0 +1,171 @@
+use "std/json_model.sal".
+use "std/text_list.sal".
+use "std/buffer.sal".
+
+# Executable fixture: typed JSON schemas (round trips, malformed, bounds).
+#
+# Schema under test (declared, never hand-parsed here):
+# - MutationInput{warehouse_id: i64 (default 1), codes: TextList} with
+#   requires: warehouse_id > 0; len(codes) > 0; len(codes) <= 64
+#   otherwise -28; TextListEachNonEmpty; TextListEachAtMost(128)
+#   otherwise -28; TextListNoNul; TextListUnique.
+# Covers with observable statuses/values only (no source pins):
+# - round trip: decode then encode yields the canonical payload bytes.
+# - defaults: missing warehouse_id decodes to 1.
+# - required: missing codes field fails -22.
+# - malformed JSON fails -22; duplicate decoded field names fail -22;
+#   unknown fields are validated then ignored.
+# - over-64 codes fail -28; a code over 128 decoded bytes fails -28;
+#   empty code / NUL / duplicate codes / non-positive IDs fail -22.
+# - top-level Decode rejects trailing bytes; DecodeAt permits them.
+# Every check is one `Expect` line: the first failing check number is the
+# exit status, 0 when every check holds. Each probe helper ends the decoded
+# DTO before returning a plain scalar, so the caller's storage loan is free
+# again for the next probe and the arena drops once at the end.
+entity MutationInput:
+    encoding JSON.
+    has warehouse_id of type i64.
+    has codes of type TextList.
+    defaults warehouse_id to 1.
+    requires:
+        warehouse_id > 0.
+        len(codes) > 0.
+        len(codes) <= 64 otherwise -28.
+        TextListEachNonEmpty(codes).
+        TextListEachAtMost(codes, usize(128)) otherwise -28.
+        TextListNoNul(codes).
+        TextListUnique(codes).
+
+# First failure wins: keeps an earlier failure, else reports `code` when the
+# check does not hold.
+operation Expect:
+    accepts failure of type i64.
+    accepts code of type i64.
+    accepts holds of type bool.
+    returns i64.
+    requires:
+        failure == 0 otherwise failure.
+        holds otherwise code.
+    body:
+        return 0.
+
+operation DecodeStatus:
+    accepts input of type Bytes.
+    accepts storage of type MutBytes.
+    returns i64.
+    body:
+        let decoded = MutationInputDecodeJson(input, storage).
+        let status = decoded.status.
+        borrow_end(decoded).
+        return status.
+
+operation DecodeAtStatus:
+    accepts input of type Bytes.
+    accepts start of type usize.
+    accepts storage of type MutBytes.
+    returns i64.
+    body:
+        let decoded = MutationInputDecodeJsonAt(input, start, storage).
+        let status = decoded.status.
+        borrow_end(decoded).
+        return status.
+
+operation DecodedId:
+    accepts input of type Bytes.
+    accepts storage of type MutBytes.
+    returns i64.
+    body:
+        let decoded = MutationInputDecodeJson(input, storage).
+        let id = decoded.value.warehouse_id.
+        borrow_end(decoded).
+        return id.
+
+operation DecodedCount:
+    accepts input of type Bytes.
+    accepts storage of type MutBytes.
+    returns i64.
+    body:
+        let decoded = MutationInputDecodeJson(input, storage).
+        let count = i64(TextListLen(decoded.value.codes)).
+        borrow_end(decoded).
+        return count.
+
+# True when the first `wrote` bytes of target equal expected.
+operation WrittenEquals:
+    accepts target of type MutBytes.
+    accepts wrote of type i64.
+    accepts expected of type Bytes.
+    returns bool.
+    requires:
+        wrote >= 0 otherwise false.
+        usize(wrote) <= len(target) otherwise false.
+    body:
+        let written = view(target).
+        let prefix = slice(written, usize(0), usize(wrote)).
+        let same = prefix == expected.
+        borrow_end(prefix).
+        borrow_end(written).
+        return same.
+
+# Decode into storage, re-encode the decoded DTO into target, compare.
+operation EncodedEquals:
+    accepts input of type Bytes.
+    accepts expected of type Bytes.
+    accepts storage of type MutBytes.
+    accepts target of type MutBytes.
+    returns bool.
+    body:
+        let decoded = MutationInputDecodeJson(input, storage).
+        let wrote = MutationInputEncodeJson(decoded.value, target).
+        borrow_end(decoded).
+        return WrittenEquals(target, wrote, expected).
+
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let arena = buffer(usize(2048)).
+        let storage = borrow_mut(arena, usize(0), usize(1024)).
+        let target = borrow_mut(arena, usize(1024), usize(1024)).
+        let mut failure = 0.
+        # Minimal valid object; the default warehouse_id applies.
+        set failure = Expect(failure, 1, DecodeStatus(bytes("{\"codes\": [\"ab\"]}"), storage) == 0).
+        set failure = Expect(failure, 2, DecodedId(bytes("{\"codes\": [\"ab\"]}"), storage) == 1).
+        set failure = Expect(failure, 3, DecodedCount(bytes("{\"codes\": [\"ab\"]}"), storage) == 1).
+        set failure = Expect(failure, 4, DecodedId(bytes("{\"warehouse_id\": 7, \"codes\": [\"ab\"]}"), storage) == 7).
+        # Round trip through the derived encoder yields canonical bytes.
+        set failure = Expect(failure, 5, EncodedEquals(bytes("{ \"codes\" : [ \"ab\" , \"c\\u0064\" ] }"), bytes("{\"warehouse_id\":1,\"codes\":[\"ab\",\"cd\"]}"), storage, target)).
+        # Duplicate decoded field names are rejected (post-escape).
+        set failure = Expect(failure, 6, DecodeStatus(bytes("{\"codes\": [\"a\"], \"codes\": [\"b\"]}"), storage) == -22).
+        set failure = Expect(failure, 7, DecodeStatus(bytes("{\"codes\": [\"a\"], \"c\\u006fdes\": [\"b\"]}"), storage) == -22).
+        # Malformed JSON and missing required fields fail -22.
+        set failure = Expect(failure, 8, DecodeStatus(bytes("{\"codes\": ["), storage) == -22).
+        set failure = Expect(failure, 9, DecodeStatus(bytes("{\"warehouse_id\": 2}"), storage) == -22).
+        set failure = Expect(failure, 10, DecodeStatus(bytes("{\"codes\": \"ab\"}"), storage) == -22).
+        # Unknown fields are validated then ignored.
+        set failure = Expect(failure, 11, DecodedCount(bytes("{\"codes\": [\"q\"], \"zzz\": {\"k\": [1, null]}}"), storage) == 1).
+        set failure = Expect(failure, 12, DecodeStatus(bytes("{\"codes\": [\"q\"], \"zzz\": [1,]}"), storage) == -22).
+        # Schema requires: shape violations are -22, declared limits -28.
+        set failure = Expect(failure, 13, DecodeStatus(bytes("{\"codes\": []}"), storage) == -22).
+        set failure = Expect(failure, 14, DecodeStatus(bytes("{\"codes\": [\"\"]}"), storage) == -22).
+        set failure = Expect(failure, 15, DecodeStatus(bytes("{\"codes\": [\"a\\u0000b\"]}"), storage) == -22).
+        set failure = Expect(failure, 16, DecodeStatus(bytes("{\"codes\": [\"a\", \"\\u0061\"]}"), storage) == -22).
+        set failure = Expect(failure, 17, DecodeStatus(bytes("{\"warehouse_id\": 0, \"codes\": [\"a\"]}"), storage) == -22).
+        set failure = Expect(failure, 18, DecodeStatus(bytes("{\"codes\": [\"QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ\"]}"), storage) == -28).
+        set failure = Expect(failure, 19, DecodeStatus(bytes("{\"codes\": [\"QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ\"]}"), storage) == 0).
+        set failure = Expect(failure, 20, DecodeStatus(bytes("{\"codes\": [\"0\",\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"7\",\"8\",\"9\",\"10\",\"11\",\"12\",\"13\",\"14\",\"15\",\"16\",\"17\",\"18\",\"19\",\"20\",\"21\",\"22\",\"23\",\"24\",\"25\",\"26\",\"27\",\"28\",\"29\",\"30\",\"31\",\"32\",\"33\",\"34\",\"35\",\"36\",\"37\",\"38\",\"39\",\"40\",\"41\",\"42\",\"43\",\"44\",\"45\",\"46\",\"47\",\"48\",\"49\",\"50\",\"51\",\"52\",\"53\",\"54\",\"55\",\"56\",\"57\",\"58\",\"59\",\"60\",\"61\",\"62\",\"63\",\"64\"]}"), storage) == -28).
+        set failure = Expect(failure, 21, DecodedCount(bytes("{\"codes\": [\"0\",\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"7\",\"8\",\"9\",\"10\",\"11\",\"12\",\"13\",\"14\",\"15\",\"16\",\"17\",\"18\",\"19\",\"20\",\"21\",\"22\",\"23\",\"24\",\"25\",\"26\",\"27\",\"28\",\"29\",\"30\",\"31\",\"32\",\"33\",\"34\",\"35\",\"36\",\"37\",\"38\",\"39\",\"40\",\"41\",\"42\",\"43\",\"44\",\"45\",\"46\",\"47\",\"48\",\"49\",\"50\",\"51\",\"52\",\"53\",\"54\",\"55\",\"56\",\"57\",\"58\",\"59\",\"60\",\"61\",\"62\",\"63\"]}"), storage) == 64).
+        # Too little storage for key scratch plus payload is a capacity
+        # failure (-28), never a partial decode.
+        set failure = Expect(failure, 22, DecodeStatus(bytes("{\"codes\": [\"abcdefgh\"]}"), slice_mut(storage, usize(0), usize(40))) == -28).
+        set failure = Expect(failure, 27, DecodeStatus(bytes("{\"codes\": [\"ab\"]}"), slice_mut(storage, usize(0), usize(40))) == 0).
+        set failure = Expect(failure, 28, DecodeStatus(bytes("{\"codes\": [\"ab\"]}"), slice_mut(storage, usize(0), usize(16))) == -28).
+        # Trailing bytes fail top-level Decode but not DecodeAt.
+        set failure = Expect(failure, 23, DecodeStatus(bytes("{\"codes\": [\"ab\"]} "), storage) == 0).
+        set failure = Expect(failure, 24, DecodeStatus(bytes("{\"codes\": [\"ab\"]} x"), storage) == -22).
+        set failure = Expect(failure, 25, DecodeAtStatus(bytes("{\"codes\": [\"ab\"]} x"), usize(0), storage) == 0).
+        set failure = Expect(failure, 26, DecodeAtStatus(bytes("xx{\"codes\": [\"ab\"]},"), usize(2), storage) == 0).
+        borrow_end(target).
+        borrow_end(storage).
+        buffer_drop(arena).
+        return failure.

@@ -1,18 +1,21 @@
 # Native JSON parsing is allocation-free. Offsets and counts are bytes.
-# -22 = malformed input, -28 = insufficient output capacity, -75 = overflow.
-# UnsafeMemory writers may leave partial output on ANY error; no trailing NUL.
-# The caller owns valid writable memory for the supplied output/capacity.
-# Output must not overwrite unread input (the caller controls raw-memory aliasing).
+# -22 = malformed input, -28 = insufficient output loan, -75 = overflow.
+# Safe writers take MutBytes loans; lengths come from loans, never claimed
+# capacities. No trailing NUL. The caller owns arena partition loans and keeps
+# decoded payloads disjoint from unread input. Input bounds are header
+# requires clauses carrying the same error otherwise values.
+
 use "bytes.sal".
+use "text.sal".
 
 # An endpoint start == len(input) is valid; only space, tab, CR and LF are skipped.
 operation JsonWhitespaceEnd:
     accepts input of type Bytes.
     accepts start of type usize.
     returns i64.
+    requires:
+        start <= len(input) otherwise -22.
     body:
-        if start > len(input):
-            return -22.
         let mut offset = start.
         while offset < len(input):
             let ch = byte(input, offset).
@@ -31,11 +34,10 @@ operation JsonHexQuad:
     accepts input of type Bytes.
     accepts start of type usize.
     returns i64.
+    requires:
+        start <= len(input) otherwise -22.
+        len(input) - start >= usize(4) otherwise -22.
     body:
-        if start > len(input):
-            return -22.
-        if len(input) - start < 4:
-            return -22.
         let mut value = 0.
         let mut index = usize(0).
         while index < 4:
@@ -49,121 +51,94 @@ operation JsonHexQuad:
 operation JsonScalarWidth:
     accepts scalar of type i64.
     returns usize.
+    requires:
+        scalar >= 128 otherwise usize(1).
+        scalar >= 2048 otherwise usize(2).
+        scalar >= 65536 otherwise usize(3).
     body:
-        if scalar < 128:
-            return usize(1).
-        if scalar < 2048:
-            return usize(2).
-        if scalar < 65536:
-            return usize(3).
         return usize(4).
 
-# Decode a single raw UTF-8 scalar; reject overlongs, surrogates and > U+10FFFF.
+# Decode through the shared strict UTF-8 scanner; an end step is not a scalar.
 operation JsonUtf8Scalar:
     accepts input of type Bytes.
     accepts start of type usize.
     returns i64.
     body:
-        if start >= len(input):
-            return -22.
-        let first = i64(byte(input, start)).
-        if first < 128:
-            return first.
-        if first < 194:
-            return -22.
-        let mut width = usize(2).
-        let mut value = first - 192.
-        let mut minimum = 128.
-        if first >= 224:
-            set width = usize(3).
-            set value = first - 224.
-            set minimum = 2048.
-        if first >= 240:
-            set width = usize(4).
-            set value = first - 240.
-            set minimum = 65536.
-        if first > 244:
-            return -22.
-        if len(input) - start < width:
-            return -22.
-        let mut index = usize(1).
-        while index < width:
-            let next = i64(byte(input, start + index)).
-            if next < 128:
-                return -22.
-            if next > 191:
-                return -22.
-            set value = value * 64 + next - 128.
-            set index = index + 1.
-        if value < minimum:
-            return -22.
-        if value > 1114111:
-            return -22.
-        if value >= 55296 && value <= 57343:
-            return -22.
-        return value.
+        return JsonUtf8Value(TextNext(input, start)).
+
+operation JsonUtf8Value:
+    accepts step of type TextStep.
+    returns i64.
+    requires:
+        step.status == 0 otherwise -22.
+    body:
+        return step.scalar.
 
 # start is the backslash, not the u. Paired UTF-16 escapes form one scalar.
 operation JsonEscapeScalar:
     accepts input of type Bytes.
     accepts start of type usize.
     returns i64.
+    requires:
+        start < len(input) otherwise -22.
+        len(input) - start >= usize(2) otherwise -22.
+        byte(input, start + 1) == 117 otherwise JsonSimpleEscape(byte(input, start + 1)).
     body:
-        if start >= len(input):
-            return -22.
-        if len(input) - start < 2:
-            return -22.
-        let ch = byte(input, start + 1).
-        if ch == 34:
-            return 34.
-        if ch == 92:
-            return 92.
-        if ch == 47:
-            return 47.
-        if ch == 98:
-            return 8.
-        if ch == 102:
-            return 12.
-        if ch == 110:
-            return 10.
-        if ch == 114:
-            return 13.
-        if ch == 116:
-            return 9.
-        if ch != 117:
-            return -22.
-        let high = JsonHexQuad(input, start + 2).
-        if high < 0:
-            return -22.
-        if high >= 56320 && high <= 57343:
-            return -22.
-        if high < 55296:
-            return high.
-        if high > 56319:
-            return high.
-        if len(input) - start < 12:
-            return -22.
-        if byte(input, start + 6) != 92:
-            return -22.
-        if byte(input, start + 7) != 117:
-            return -22.
-        let low = JsonHexQuad(input, start + 8).
-        if low < 56320:
-            return -22.
-        if low > 57343:
-            return -22.
+        return JsonUnicodeEscape(input, start, JsonHexQuad(input, start + 2)).
+
+# The JSON escape alphabet is a mapping, not a scanner decision tree.
+operation JsonSimpleEscape:
+    accepts ch of type u8.
+    returns i64.
+    requires:
+        ch != 34 otherwise 34.
+        ch != 92 otherwise 92.
+        ch != 47 otherwise 47.
+        ch != 98 otherwise 8.
+        ch != 102 otherwise 12.
+        ch != 110 otherwise 10.
+        ch != 114 otherwise 13.
+        ch != 116 otherwise 9.
+    body:
+        return -22.
+
+# A non-surrogate quad is complete; a high surrogate requires its low pair.
+operation JsonUnicodeEscape:
+    accepts input of type Bytes.
+    accepts start of type usize.
+    accepts high of type i64.
+    returns i64.
+    requires:
+        high >= 0 otherwise -22.
+        start <= len(input) otherwise -22.
+        high < 56320 || high > 57343 otherwise -22.
+        high >= 55296 otherwise high.
+        high <= 56319 otherwise high.
+        len(input) - start >= usize(12) otherwise -22.
+        byte(input, start + 6) == 92 otherwise -22.
+        byte(input, start + 7) == 117 otherwise -22.
+    body:
+        return JsonSurrogatePair(high, JsonHexQuad(input, start + 8)).
+
+operation JsonSurrogatePair:
+    accepts high of type i64.
+    accepts low of type i64.
+    returns i64.
+    requires:
+        low >= 56320 otherwise -22.
+        low <= 57343 otherwise -22.
+    body:
         return 65536 + (high - 55296) * 1024 + low - 56320.
 
 operation JsonCharacterScalar:
     accepts input of type Bytes.
     accepts start of type usize.
     returns i64.
+    requires:
+        start < len(input) otherwise -22.
+        byte(input, start) >= 32 otherwise -22.
     body:
-        if start >= len(input):
-            return -22.
         let ch = byte(input, start).
-        if ch < 32:
-            return -22.
         if ch == 92:
             return JsonEscapeScalar(input, start).
         return JsonUtf8Scalar(input, start).
@@ -174,13 +149,11 @@ operation JsonCharacterWidth:
     accepts start of type usize.
     accepts scalar of type i64.
     returns usize.
+    requires:
+        byte(input, start) == 92 otherwise JsonScalarWidth(scalar).
+        byte(input, start + 1) == 117 otherwise usize(2).
+        scalar < 65536 otherwise usize(12).
     body:
-        if byte(input, start) != 92:
-            return JsonScalarWidth(scalar).
-        if byte(input, start + 1) != 117:
-            return usize(2).
-        if scalar >= 65536:
-            return usize(12).
         return usize(6).
 
 # start must name an opening quote; success excludes any following bytes.
@@ -188,11 +161,10 @@ operation JsonStringEnd:
     accepts input of type Bytes.
     accepts start of type usize.
     returns i64.
+    requires:
+        start < len(input) otherwise -22.
+        byte(input, start) == 34 otherwise -22.
     body:
-        if start >= len(input):
-            return -22.
-        if byte(input, start) != 34:
-            return -22.
         let mut offset = start + 1.
         while offset < len(input):
             if byte(input, offset) == 34:
@@ -219,9 +191,9 @@ operation JsonNumberEnd:
     accepts input of type Bytes.
     accepts start of type usize.
     returns i64.
+    requires:
+        start < len(input) otherwise -22.
     body:
-        if start >= len(input):
-            return -22.
         let mut offset = start.
         if byte(input, offset) == 45:
             set offset = offset + 1.
@@ -264,12 +236,11 @@ operation JsonValueEnd:
     accepts start of type usize.
     accepts depth of type usize.
     returns i64.
+    requires:
+        depth > usize(0) otherwise -22.
+        start <= len(input) otherwise -22.
     body:
-        if depth == 0:
-            return -22.
         let skipped = JsonWhitespaceEnd(input, start).
-        if skipped < 0:
-            return -22.
         let mut offset = usize(skipped).
         if offset == len(input):
             return -22.
@@ -340,11 +311,10 @@ operation JsonValidate:
 operation JsonUnsigned:
     accepts input of type Bytes.
     returns i64.
+    requires:
+        len(input) > usize(0) otherwise -22.
+        len(input) <= usize(1) || byte(input, usize(0)) != 48 otherwise -22.
     body:
-        if len(input) == 0:
-            return -22.
-        if len(input) > 1 && byte(input, usize(0)) == 48:
-            return -22.
         # Validate the entire grammar before reporting numerical overflow.
         let mut index = usize(0).
         while index < len(input):
@@ -355,67 +325,82 @@ operation JsonUnsigned:
 
 operation JsonEmitScalar:
     accepts scalar of type i64.
-    accepts output of type usize.
-    accepts capacity of type usize.
+    accepts output of type MutBytes.
     returns i64.
-    effects: UnsafeMemory.
     body:
         let width = JsonScalarWidth(scalar).
-        if capacity < width:
+        if len(output) < width:
             return -28.
         if width == 1:
-            store8(output, u8(scalar)).
+            put(output, usize(0), u8(scalar)).
         if width == 2:
-            store8(output, u8(192 + scalar / 64)).
-            store8(output + 1, u8(128 + scalar % 64)).
+            put(output, usize(0), u8(192 + scalar / 64)).
+            put(output, usize(1), u8(128 + scalar % 64)).
         if width == 3:
-            store8(output, u8(224 + scalar / 4096)).
-            store8(output + 1, u8(128 + scalar / 64 % 64)).
-            store8(output + 2, u8(128 + scalar % 64)).
+            put(output, usize(0), u8(224 + scalar / 4096)).
+            put(output, usize(1), u8(128 + scalar / 64 % 64)).
+            put(output, usize(2), u8(128 + scalar % 64)).
         if width == 4:
-            store8(output, u8(240 + scalar / 262144)).
-            store8(output + 1, u8(128 + scalar / 4096 % 64)).
-            store8(output + 2, u8(128 + scalar / 64 % 64)).
-            store8(output + 3, u8(128 + scalar % 64)).
+            put(output, usize(0), u8(240 + scalar / 262144)).
+            put(output, usize(1), u8(128 + scalar / 4096 % 64)).
+            put(output, usize(2), u8(128 + scalar / 64 % 64)).
+            put(output, usize(3), u8(128 + scalar % 64)).
         return i64(width).
 
-operation JsonDecodeString:
+# One-pass string decoding with both output count and source cursor.
+# On failure output may hold a prefix; only status 0 makes it a full string.
+entity JsonStringRead:
+    layout "C".
+    has status of type i64.
+    has written of type usize.
+    has read_end of type usize.
+
+operation JsonDecodeStringAt:
     accepts input of type Bytes.
     accepts start of type usize.
-    accepts output of type usize.
-    accepts capacity of type usize.
-    returns i64.
-    effects: UnsafeMemory.
+    accepts output of type MutBytes.
+    returns JsonStringRead.
+    requires:
+        start < len(input) otherwise JsonStringRead(-22, usize(0), start).
+        byte(input, start) == 34 otherwise JsonStringRead(-22, usize(0), start).
     body:
-        if start >= len(input):
-            return -22.
-        if byte(input, start) != 34:
-            return -22.
         let mut offset = start + 1.
         let mut written = usize(0).
         while offset < len(input):
             if byte(input, offset) == 34:
-                return i64(written).
+                return JsonStringRead(0, written, offset + 1).
             let scalar = JsonCharacterScalar(input, offset).
             if scalar < 0:
-                return -22.
-            let count = JsonEmitScalar(scalar, output + written, capacity - written).
+                return JsonStringRead(-22, written, offset).
+            let window = slice_mut(output, written, len(output) - written).
+            let count = JsonEmitScalar(scalar, window).
+            borrow_end(window).
             if count < 0:
-                return count.
+                return JsonStringRead(count, written, offset).
             set written = written + usize(count).
             set offset = offset + JsonCharacterWidth(input, offset, scalar).
-        return -22.
+        return JsonStringRead(-22, written, offset).
+
+# Count-only decoding when the caller does not need the following cursor.
+operation JsonDecodeString:
+    accepts input of type Bytes.
+    accepts start of type usize.
+    accepts output of type MutBytes.
+    returns i64.
+    body:
+        let decoded = JsonDecodeStringAt(input, start, output).
+        if decoded.status != 0:
+            return decoded.status.
+        return i64(decoded.written).
 
 operation JsonWriteString:
     accepts value of type Bytes.
-    accepts output of type usize.
-    accepts capacity of type usize.
+    accepts output of type MutBytes.
     returns i64.
-    effects: UnsafeMemory.
+    requires:
+        len(output) > usize(0) otherwise -28.
     body:
-        if capacity == 0:
-            return -28.
-        store8(output, u8(34)).
+        put(output, usize(0), u8(34)).
         let mut written = usize(1).
         let mut offset = usize(0).
         while offset < len(value):
@@ -424,28 +409,30 @@ operation JsonWriteString:
                 return -22.
             set offset = offset + JsonScalarWidth(scalar).
             if scalar < 32:
-                if capacity - written < 6:
+                if len(output) - written < 6:
                     return -28.
-                store8(output + written, u8(92)).
-                store8(output + written + 1, u8(117)).
-                store8(output + written + 2, u8(48)).
-                store8(output + written + 3, u8(48)).
-                store8(output + written + 4, byte(bytes("0123456789abcdef"), usize(scalar / 16))).
-                store8(output + written + 5, byte(bytes("0123456789abcdef"), usize(scalar % 16))).
+                put(output, written, u8(92)).
+                put(output, written + 1, u8(117)).
+                put(output, written + 2, u8(48)).
+                put(output, written + 3, u8(48)).
+                put(output, written + 4, byte(bytes("0123456789abcdef"), usize(scalar / 16))).
+                put(output, written + 5, byte(bytes("0123456789abcdef"), usize(scalar % 16))).
                 set written = written + 6.
                 continue.
             if scalar == 34 || scalar == 92:
-                if capacity - written < 2:
+                if len(output) - written < 2:
                     return -28.
-                store8(output + written, u8(92)).
-                store8(output + written + 1, u8(scalar)).
+                put(output, written, u8(92)).
+                put(output, written + 1, u8(scalar)).
                 set written = written + 2.
                 continue.
-            let count = JsonEmitScalar(scalar, output + written, capacity - written).
+            let window = slice_mut(output, written, len(output) - written).
+            let count = JsonEmitScalar(scalar, window).
+            borrow_end(window).
             if count < 0:
                 return count.
             set written = written + usize(count).
-        if written == capacity:
+        if written == len(output):
             return -28.
-        store8(output + written, u8(34)).
+        put(output, written, u8(34)).
         return i64(written + 1).

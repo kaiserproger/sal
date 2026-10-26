@@ -1,57 +1,120 @@
 # Linux x86-64: syscall results preserve negative errno values.
-# UnsafeMemory is explicit because the kernel consumes raw buffer addresses.
+# Safe checked surface: writers take immutable Bytes, readers take exclusive
+# MutBytes loans whose length bounds the transfer. Raw addresses exist only
+# inside audited narrow unsafe blocks at the OS boundary; public effects are
+# SystemCall only, never UnsafeMemory. The caller owns fd lifetime and closes
+# established fds itself (LinuxClose); connect helpers close only a socket
+# they just created when connect fails.
+# Cursor step of a write/read loop: the running byte count plus this call's
+# syscall result. A zero-byte write makes no progress (-5); a negative result
+# is the errno and propagates unchanged.
+operation LinuxWriteAdvance:
+    accepts offset of type i64.
+    accepts written of type i64.
+    returns i64.
+    requires:
+        written != 0 otherwise -5.
+        written >= 0 otherwise written.
+    body:
+        return offset + written.
+
+# The same cursor step for reads: end of file before the span is full is
+# -61 (ENODATA).
+operation LinuxReadAdvance:
+    accepts offset of type i64.
+    accepts received of type i64.
+    returns i64.
+    requires:
+        received != 0 otherwise -61.
+        received >= 0 otherwise received.
+    body:
+        return offset + received.
+
 operation LinuxWriteAll:
     accepts fd of type i64.
     accepts data of type Bytes.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mut offset = usize(0).
-        while offset < len(data):
-            let remaining = slice(data, offset, len(data) - offset).
-            let written = syscall(1, fd, address(remaining), len(remaining), 0, 0, 0).
-            if written == -4:
-                continue.
-            if written == 0:
-                return -5.
-            if written < 0:
-                return written.
-            set offset = offset + usize(written).
-        return i64(offset).
+        let total = i64(len(data)).
+        let mut offset = 0.
+        while offset >= 0 && offset < total:
+            let remaining = slice(data, usize(offset), len(data) - usize(offset)).
+            let mut written = -4.
+            while written == -4:
+                unsafe:
+                    set written = syscall(1, fd, address(remaining), len(remaining), 0, 0, 0).
+            set offset = LinuxWriteAdvance(offset, written).
+        return offset.
 
 operation LinuxReadInto:
     accepts fd of type i64.
-    accepts buffer of type usize.
-    accepts capacity of type usize.
+    accepts destination of type MutBytes.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
+    requires:
+        len(destination) > usize(0) otherwise 0.
     body:
-        let mut result = syscall(0, fd, buffer, capacity, 0, 0, 0).
+        let mut result = -4.
         while result == -4:
-            set result = syscall(0, fd, buffer, capacity, 0, 0, 0).
+            unsafe:
+                set result = syscall(0, fd, address(view(destination)), len(destination), 0, 0, 0).
         return result.
 
 operation LinuxClose:
     accepts fd of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        return syscall(3, fd, 0, 0, 0, 0, 0).
+        let mut result = 0.
+        unsafe:
+            set result = syscall(3, fd, 0, 0, 0, 0, 0).
+        return result.
 
-# Exactly capacity bytes or a negative errno; early EOF is -61 (ENODATA).
+# New socket of the given domain and kind. `status` is the cursor of the step
+# before it (a negative earlier errno propagates unchanged and no socket is
+# created). Returns the descriptor, or the negative errno.
+operation LinuxSocketCreate:
+    accepts status of type i64.
+    accepts domain of type i64.
+    accepts kind of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        status >= 0 otherwise status.
+    body:
+        let mut created = 0.
+        unsafe:
+            set created = syscall(41, domain, kind, 0, 0, 0, 0).
+        return created.
+
+# Close a socket this caller just created when a later setup step failed, and
+# report that failure; success (or a descriptor that never existed) returns
+# the descriptor unchanged.
+operation LinuxCloseOnFailure:
+    accepts fd of type i64.
+    accepts code of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        fd >= 0 otherwise fd.
+        code < 0 otherwise fd.
+    body:
+        LinuxClose(fd).
+        return code.
+
+# Exactly len(destination) bytes or a negative errno; early EOF is -61 (ENODATA).
 operation LinuxReadExact:
     accepts fd of type i64.
-    accepts buffer of type usize.
-    accepts capacity of type usize.
+    accepts destination of type MutBytes.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mut offset = usize(0).
-        while offset < capacity:
-            let received = LinuxReadInto(fd, buffer + offset, capacity - offset).
-            if received == 0:
-                return -61.
-            if received < 0:
-                return received.
-            set offset = offset + usize(received).
-        return i64(offset).
+        let total = i64(len(destination)).
+        let mut offset = 0.
+        while offset >= 0 && offset < total:
+            let window = slice_mut(destination, usize(offset), len(destination) - usize(offset)).
+            let received = LinuxReadInto(fd, window).
+            borrow_end(window).
+            set offset = LinuxReadAdvance(offset, received).
+        return offset.

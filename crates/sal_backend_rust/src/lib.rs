@@ -3,35 +3,16 @@
 //! behavioral compiler: service `execute` bodies and operation bodies are
 //! `todo!()` stubs; requires/ensures/atomic/effects survive only as `///` doc
 //! comments with no runtime enforcement. Behavior compilation and contract
-//! enforcement at runtime are unimplemented.
-//!
-//! CONTRACT (do not change public signatures; implement bodies only):
-//! - `emit_rust` returns files sorted by path, deterministic (sort items by name):
-//!   `src/entities.rs`, `src/services.rs`, `src/operations.rs`, `src/lib.rs`,
-//!   `architecture.json`.
-//! - Type mapping: bool/String/ints/floats/usize/isize -> same; UUID -> String;
-//!   Character -> char; Word -> String (no spaces, unchecked at runtime);
-//!   Text -> String; Money<CUR> -> Money with `/// currency: CUR` doc;
-//!   Option/Vec/Result map; entity/enum refs -> same name. Unknown names pass
-//!   through verbatim (checker reports them; backend never fails).
-//! - entities.rs: `#[allow(dead_code)]`, `pub struct Money { pub amount_minor:
-//!   i64, pub currency: &'static str }`, one `pub struct` per entity (fields
-//!   `pub name: Ty`), one `pub enum` per enum (variants verbatim).
-//! - services.rs: `pub struct Name;` + impl with requires/ensures/atomic/effects
-//!   as `///` docs (unenforced) and `pub fn execute(&self) ->
-//!   Result<(), String> { todo!("SAL service Name not implemented") }`.
-//! - operations.rs: `pub fn name(p: Ty, ...) -> Ret { todo!(...) }` with effects
-//!   as docs; no-return -> `-> ()` omitted (plain `fn name(...)`).
-//! - Executable routes/serve blocks (see sal_ir executable subset) are NOT
-//!   emitted here; direct compilation to runnable programs lives in
-//!   sal_backend_exec (new crate). This crate stays scaffold-only.
-//! - lib.rs: `pub mod entities; pub mod operations; pub mod services;`
-//! - architecture.json: hand-built JSON (no serde), `{"layers":{...},"services":
-//!   {...},"modules":{...}}` with rules/effects; minimal escaping (`\` and `"`).
-//! - Never panic on any IR input.
+//! enforcement at runtime are unimplemented. Typed operation contracts
+//! (`ContractClause`/`Expr`), ownership metadata, and entity JSON/iteration
+//! metadata likewise survive only as `///` docs here; the normal shared IR
+//! declaration lowerer enforces and executes them. Never emit claims that
+//! contracts are checked if they were not lowered.
 
+use sal_ir::Expr;
 use sal_ir::Ir;
 use sal_ir::TypeRef;
+use sal_syntax::BinOp;
 use sal_syntax::LayerRule;
 
 #[derive(Debug, Clone)]
@@ -138,6 +119,8 @@ fn money_currencies(ty: &TypeRef, out: &mut Vec<String>) {
     }
 }
 
+/// Entity JSON-schema/iteration metadata renders as unenforced `///` docs
+/// only (see crate docs); field types map through `rust_ty` unchanged.
 fn emit_entities(ir: &Ir) -> String {
     let mut out = String::new();
     out.push_str("#[allow(dead_code)]\n\n");
@@ -153,6 +136,32 @@ fn emit_entities(ir: &Ir) -> String {
             for invariant in &entity.invariants {
                 out.push_str("/// invariant: ");
                 out.push_str(invariant);
+                out.push('\n');
+            }
+            if entity.json.enabled {
+                out.push_str("/// encoding: JSON\n");
+            }
+            for default in &entity.json.defaults {
+                out.push_str("/// default ");
+                out.push_str(&default.name);
+                out.push_str(" = ");
+                out.push_str(&render_contract_expr(&default.value));
+                out.push('\n');
+            }
+            for clause in &entity.json.requires {
+                out.push_str("/// requires: ");
+                out.push_str(&render_contract_expr(&clause.condition));
+                if let Some(otherwise) = &clause.otherwise {
+                    out.push_str(" otherwise ");
+                    out.push_str(&render_contract_expr(otherwise));
+                }
+                out.push('\n');
+            }
+            if let Some(iteration) = &entity.iteration {
+                out.push_str("/// iterates ");
+                out.push_str(&render_sal_ty(&iteration.item));
+                out.push_str(" using ");
+                out.push_str(&iteration.next);
                 out.push('\n');
             }
             out.push_str("pub struct ");
@@ -251,6 +260,8 @@ fn emit_services(ir: &Ir) -> String {
     out
 }
 
+/// Operation contract + ownership metadata renders as unenforced `///` docs
+/// only (see crate docs); signatures map accepts/returns unchanged.
 fn emit_operations(ir: &Ir) -> String {
     let mut out = String::new();
     out.push_str("#[allow(dead_code)]\n\n");
@@ -272,14 +283,33 @@ fn emit_operations(ir: &Ir) -> String {
                 out.push_str(currency);
                 out.push('\n');
             }
-            for req in &op.requires {
+            for clause in &op.requires {
                 out.push_str("/// requires: ");
-                out.push_str(req);
+                out.push_str(&render_contract_expr(&clause.condition));
+                if let Some(otherwise) = &clause.otherwise {
+                    out.push_str(" otherwise ");
+                    out.push_str(&render_contract_expr(otherwise));
+                }
                 out.push('\n');
             }
-            for ens in &op.ensures {
+            for ensured in &op.ensures {
                 out.push_str("/// ensures: ");
-                out.push_str(ens);
+                out.push_str(&render_contract_expr(ensured));
+                out.push('\n');
+            }
+            if !op.ownership.borrows.is_empty() {
+                out.push_str("/// borrows: ");
+                out.push_str(&op.ownership.borrows.join(", "));
+                out.push('\n');
+            }
+            if !op.ownership.consumes.is_empty() {
+                out.push_str("/// consumes: ");
+                out.push_str(&op.ownership.consumes.join(", "));
+                out.push('\n');
+            }
+            if !op.ownership.return_from.is_empty() {
+                out.push_str("/// returns from: ");
+                out.push_str(&op.ownership.return_from.join(", "));
                 out.push('\n');
             }
             if !op.effects.is_empty() {
@@ -459,4 +489,101 @@ fn emit_architecture_json(ir: &Ir) -> String {
     }
     out.push_str("}}");
     out
+}
+
+/// Render a contract expression back into SAL surface syntax for scaffold
+/// documentation. Documentation only: the Rust backend never enforces
+/// contracts at runtime (see crate docs). Never panics.
+fn render_contract_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Lit(literal) => {
+            let mut out = String::from("\"");
+            for ch in literal.chars() {
+                match ch {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    _ => {
+                        let code = ch as u32;
+                        if code < 0x20 || code == 0x7F {
+                            out.push_str(&format!("\\u{{{:x}}}", code));
+                        } else {
+                            out.push(ch);
+                        }
+                    }
+                }
+            }
+            out.push('"');
+            out
+        }
+        Expr::Int(value) => value.to_string(),
+        Expr::Float(value) => value.to_string(),
+        Expr::Bool(value) => value.to_string(),
+        Expr::Not(inner) => format!("(!{})", render_contract_expr(inner)),
+        Expr::Var(name) => name.clone(),
+        Expr::Call { name, args } => {
+            let mut out = String::new();
+            out.push_str(name);
+            out.push('(');
+            for (index, arg) in args.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&render_contract_expr(arg));
+            }
+            out.push(')');
+            out
+        }
+        Expr::Field { base, field } => format!("{}.{field}", render_contract_expr(base)),
+        Expr::Index { base, index } => format!(
+            "{}[{}]",
+            render_contract_expr(base),
+            render_contract_expr(index)
+        ),
+        Expr::BinOp { op, left, right } => {
+            let symbol = match op {
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                BinOp::Div => "/",
+                BinOp::Rem => "%",
+                BinOp::Lt => "<",
+                BinOp::Le => "<=",
+                BinOp::Gt => ">",
+                BinOp::Ge => ">=",
+                BinOp::Eq => "==",
+                BinOp::Ne => "!=",
+                BinOp::And => "&&",
+                BinOp::Or => "||",
+            };
+            format!(
+                "({} {symbol} {})",
+                render_contract_expr(left),
+                render_contract_expr(right)
+            )
+        }
+    }
+}
+
+/// Render a type back into SAL surface syntax for scaffold documentation.
+/// Documentation only; never panics.
+fn render_sal_ty(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::Named(name) => name.clone(),
+        TypeRef::Generic { name, args } => {
+            let mut out = String::new();
+            out.push_str(name);
+            out.push('<');
+            for (index, arg) in args.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&render_sal_ty(arg));
+            }
+            out.push('>');
+            out
+        }
+    }
 }

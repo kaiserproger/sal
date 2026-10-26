@@ -198,33 +198,56 @@ impl Function<'_> {
             // A single evaluation: records already leave a stable fixed-frame
             // pointer in RAX, spans leave (pointer, length). Either way RAX
             // is the address, so no spill or copy is needed or wanted.
+            // `MutBytes` is allowed only at an explicit raw OS boundary;
+            // `Buffer` addresses NEVER escape, even inside `unsafe`.
             let ty = self.expression(&args[0], None)?;
             if ty == Ty::Void {
                 return Err(self.error("N100", "Void cannot be a builtin argument"));
             }
-            if matches!(ty, Ty::Record(_)) {
+            if matches!(ty, Ty::Record(_) | Ty::Internal(_)) {
                 return Ok(Ty::Usize);
             }
-            if !ty.span() {
-                return Err(self.error("N100", "native address requires Text or Bytes"));
+            if ty != Ty::MutBytes && ty != Ty::Text && ty != Ty::Bytes {
+                return Err(self.error(
+                    "N100",
+                    "native address requires Text, Bytes, MutBytes, or a record",
+                ));
+            }
+            if ty == Ty::Text || ty == Ty::Bytes {
+                return Ok(Ty::Usize);
+            }
+            if !self.unsafe_context() {
+                return Err(self.error(
+                    "N100",
+                    "native address of MutBytes requires an explicit unsafe raw OS boundary",
+                ));
             }
             return Ok(Ty::Usize);
         }
         match name {
             "len" | "bytes" => {
                 let values = self.builtin_args(name, args, &[None])?;
-                let value = values[0];
-                if !value.ty.span() || (name == "bytes" && value.ty != Ty::Text) {
+                let mut value = values[0];
+                if name == "len" && value.ty == Ty::Borrow {
+                    // Length of the original owner slot behind a Borrow.
+                    self.load(value);
+                    self.code
+                        .push_str("    movq -8(%rax), %rdx\n    movq (%rax), %rax\n");
+                    value = Local {
+                        ty: Ty::Buffer,
+                        slot: self.allocate(Ty::Buffer),
+                        mutable: false,
+                    };
+                    self.store(value);
+                }
+                if name == "bytes" {
+                    if value.ty != Ty::Text {
+                        return Err(self.error("N100", "native bytes requires Text".to_owned()));
+                    }
+                } else if !matches!(value.ty, Ty::Text | Ty::Bytes | Ty::Buffer | Ty::MutBytes) {
                     return Err(self.error(
                         "N100",
-                        format!(
-                            "native {name} requires {}",
-                            if name == "bytes" {
-                                "Text"
-                            } else {
-                                "Text or Bytes"
-                            }
-                        ),
+                        "native len requires Text, Bytes, Buffer, or MutBytes".to_owned(),
                     ));
                 }
                 self.load(value);
@@ -233,9 +256,12 @@ impl Function<'_> {
                 }
             }
             "byte" => {
-                let values = self.builtin_args(name, args, &[Some(Ty::Bytes), Some(Ty::Usize)])?;
+                let values = self.builtin_args(name, args, &[None, Some(Ty::Usize)])?;
                 let span = values[0];
                 let index = values[1];
+                if span.ty != Ty::Bytes && span.ty != Ty::MutBytes {
+                    return Err(self.error("N100", "native byte requires Bytes or MutBytes"));
+                }
                 self.load(index);
                 let _ = writeln!(self.code, "    cmpq -{}(%rbp), %rax\n    jae .Lsal_trap_{}\n    addq -{}(%rbp), %rax\n    jc .Lsal_trap_{}\n    movzbl (%rax), %eax", span.slot + 8, self.index, span.slot, self.index);
             }

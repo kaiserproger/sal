@@ -20,8 +20,8 @@
 //!   X108 when more than one operation total; non-hello operations ignored
 //!   with W100, never an error).
 //! - Character/Word/Text: primitives (Character -> char, Word/Text -> String).
-//!   Route `:p` params are Text (any non-`/` chars incl. spaces via %20; Word
-//!   params rejected at semfront E9006). Returned Text is written verbatim.
+//!   Route `:p` params are Text (any non-`/` chars incl. spaces via %20; Word params
+//!   are rejected at IR check time). Returned Text is written verbatim.
 //! - Emitted server program: `std::net::TcpListener` on `127.0.0.1:N`, single-threaded
 //!   accept loop, parses `METHOD /path VERSION` request line only. Incoming
 //!   VERSION must be exactly `HTTP/1.0` or `HTTP/1.1`; anything else (HTTP/2,
@@ -43,15 +43,26 @@
 //!   `return "lit".` prints the literal via `println!("{}", "lit")` and returns
 //!   (a lone `return "lit"` body emits the legacy one-line program byte-shape);
 //!   `return VAR` prints the variable, other `return EXPR` prints the
-//!   rendered expression; `if` lowers to a real `if`/`else`; call/effect
-//!   statements lower to `{expr};`. Expressions: `Lit` -> escaped `"..."`,
+//!   rendered expression; `if` lowers to a real `if`/`else`, and `unsafe:` blocks
+//!   lower transparently as a plain Rust block (`{ ... }`, no `unsafe` keyword:
+//!   the legacy scaffold is safe Rust which cannot discharge UnsafeMemory);
+//!   call/effect statements lower to `{expr};`. Expressions: `Lit` -> escaped `"..."`,
 //!   Int/Float/Bool literals, `Var` -> name, `len(x)` -> `x.len()`,
 //!   `push(v, x)` -> `v.push(x)`, other calls -> `name(args)`, `a.b`,
 //!   `a[i]`, `(left OP right)` for `+`/`-`/`*`/`/`/`%`/`<`/`<=`/`>`/`>=`/`==`/`!=`.
+//!   Typed operation contracts (`requires`/`ensures`), ownership metadata, and
+//!   entity JSON/iteration metadata are NOT executed here; the normal shared IR
+//!   declaration lowerer executes them before this backend runs. Never claim
+//!   contracts are checked if they were not lowered.
 //!   `for`/`while` loops stay explicitly rejected with one B200 error each
 //!   (never a panic); reserved native intrinsics (`bytes`, `byte`, `slice`,
-//!   numeric conversions, `syscall`, `address`, `bytes_at`, `load8`, `store8`)
-//!   are intentionally rejected as explicit B201 errors rather than lowered.
+//!   `text`, `SalContractAssert`, numeric conversions, `syscall`, `address`,
+//!   `bytes_at`, `load8`, `store8`, the ten exact numeric-boundary spellings
+//!   `wrapping_add/sub/mul`, `bit_and/or/xor/not`, `shift_left/right`,
+//!   `bits_as`) are intentionally
+//!   rejected as explicit B201 errors rather than lowered, including inside
+//!   `unsafe:` bodies. `Stmt::Unsafe` never implies safety here; the legacy
+//!   backend fails closed (errors, never silent skip) on unsupported nodes.
 //! - Emitted code must compile under rustc stable with no deps and never panic
 //!   on any input bytes (all reads bounded, all indexing guarded, UTF-8 lossy).
 
@@ -143,6 +154,9 @@ fn collect_c_feature_errors(ir: &Ir, errors: &mut Vec<sal_syntax::Diagnostic>) {
                     expressions.push(iter);
                     statements.extend(body.iter().rev());
                 }
+                Stmt::Unsafe { body } => {
+                    statements.extend(body.iter().rev());
+                }
                 Stmt::Break | Stmt::Continue => {}
             }
             while let Some(expr) = expressions.pop() {
@@ -211,6 +225,7 @@ fn emit_console(ir: &Ir) -> Result<Option<String>, Vec<sal_syntax::Diagnostic>> 
                 then.iter().any(|s| matches!(s, Stmt::Return(_)))
                     || else_.iter().any(|s| matches!(s, Stmt::Return(_)))
             }
+            Stmt::Unsafe { body } => body.iter().any(|s| matches!(s, Stmt::Return(_))),
             _ => false,
         });
         if is_text && (has_literal || has_return) {
@@ -255,8 +270,9 @@ fn lower_console_body(
 }
 
 /// Walk statements collecting one B200 error per `for`/`while` loop plus one
-/// B201 error per reserved native intrinsic call. Never panics; order follows
-/// source.
+/// B201 error per reserved native intrinsic call, including contract
+/// intrinsics `text`/`SalContractAssert` used only inside executable
+/// requires/ensures. Never panics; order follows source.
 fn collect_legacy_errors(body: &[Stmt], span: &Span, errors: &mut Vec<sal_syntax::Diagnostic>) {
     for stmt in body.iter() {
         match stmt {
@@ -275,6 +291,9 @@ fn collect_legacy_errors(body: &[Stmt], span: &Span, errors: &mut Vec<sal_syntax
             Stmt::While { cond, body } => {
                 errors.push(loop_error("`while` loops are not yet lowered", span));
                 collect_expr_errors(cond, span, errors);
+                collect_legacy_errors(body, span, errors);
+            }
+            Stmt::Unsafe { body } => {
                 collect_legacy_errors(body, span, errors);
             }
             Stmt::Break | Stmt::Continue => {
@@ -311,6 +330,7 @@ fn collect_expr_errors(expr: &Expr, span: &Span, errors: &mut Vec<sal_syntax::Di
                 "bytes"
                     | "byte"
                     | "slice"
+                    | "text"
                     | "usize"
                     | "i64"
                     | "u8"
@@ -337,6 +357,44 @@ fn collect_expr_errors(expr: &Expr, span: &Span, errors: &mut Vec<sal_syntax::Di
                     | "concurrency_state"
                     | "operation_address"
                     | "thread_launch"
+                    | "wrapping_add"
+                    | "wrapping_sub"
+                    | "wrapping_mul"
+                    | "bit_and"
+                    | "bit_or"
+                    | "bit_xor"
+                    | "bit_not"
+                    | "shift_left"
+                    | "shift_right"
+                    | "bits_as"
+                    | "buffer"
+                    | "buffer_drop"
+                    | "borrow_mut"
+                    | "slice_mut"
+                    | "view"
+                    | "put"
+                    | "borrow_end"
+                    | "borrow"
+                    | "vector"
+                    | "vector_drop"
+                    | "vector_len"
+                    | "vector_capacity"
+                    | "vector_reserve"
+                    | "vector_push"
+                    | "vector_get"
+                    | "vector_set"
+                    | "vector_pop"
+                    | "map"
+                    | "map_drop"
+                    | "map_len"
+                    | "map_capacity"
+                    | "map_reserve"
+                    | "map_insert"
+                    | "map_get"
+                    | "map_remove"
+                    | "map_contains"
+                    | "SalMemoryAssertDisjoint"
+                    | "SalContractAssert"
             ) {
                 errors.push(intrinsic_error(name, span));
             }
@@ -427,6 +485,11 @@ fn emit_stmt(stmt: &Stmt, indent: usize, out: &mut String) {
         Stmt::ExprStmt(expr) => {
             let rendered: String = emit_expr(expr);
             out.push_str(&format!("{pad}{rendered};\n"));
+        }
+        Stmt::Unsafe { body } => {
+            out.push_str(&format!("{pad}{{\n"));
+            emit_stmts(body, indent + 1, out);
+            out.push_str(&format!("{pad}}}\n"));
         }
         Stmt::For { .. } | Stmt::While { .. } | Stmt::Break | Stmt::Continue => {
             out.push_str(&format!(

@@ -1,33 +1,40 @@
 use "std/concurrency.sal".
-entity Limits:
-    layout "C".
-    has current of type usize.
-    has maximum of type usize.
+use "std/linux/process.sal".
+
+# First failure wins: keeps an earlier failure, else reports `code` when the
+# check does not hold.
+operation Expect:
+    accepts failure of type i64.
+    accepts code of type i64.
+    accepts holds of type bool.
+    returns i64.
+    requires:
+        failure == 0 otherwise failure.
+        holds otherwise code.
+    body:
+        return 0.
+
 operation One:
     accepts value of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return value + 1.
+
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
-        let cap = Limits(usize(67108864), usize(67108864)).
-        if syscall(160, 9, address(cap), 0, 0, 0, 0) != 0:
+        if LinuxSetAddressSpaceLimit(usize(67108864)) != 0:
             return 70.
         let mut total = 0.
         let mut index = 0.
         while index < 32:
             let thread = spawn(One, index).
             let code = join(thread).
-            if code != index + 1:
-                if failure == 0:
-                    set failure = 1.
+            set failure = Expect(failure, 1, code == index + 1).
             set total = total + code.
             set index = index + 1.
-        if total != 528:
-            if failure == 0:
-                set failure = 2.
+        set failure = Expect(failure, 2, total == 528).
         return failure.

@@ -35,6 +35,7 @@ impl Fixture {
         std::fs::create_dir_all(fixture.0.join("linux")).expect("fixture directory");
         let stdlib = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../stdlib");
         for name in [
+            "net.sal",
             "server.sal",
             "http.sal",
             "bytes.sal",
@@ -283,54 +284,87 @@ fn map_count(pid: u32) -> usize {
 // the shared HTTP implementation. Events synchronize tests, not production
 // readiness/logging. A high arena byte verifies parent-to-child COW isolation.
 const DISPATCH: &str = r#"
+entity ProbeOptionLength:
+    layout "C".
+    has value of type u64.
 operation ProbeTimeout:
     accepts client of type i64.
     accepts option of type i64.
-    accepts scratch of type usize.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        store8(scratch + 16, u8(16)).
-        store8(scratch + 17, u8(0)).
-        store8(scratch + 18, u8(0)).
-        store8(scratch + 19, u8(0)).
-        let result = syscall(55, client, 1, option, scratch, scratch + 16, 0).
+        # Kernel output lives in fixed C-layout cells, not raw app byte loops.
+        let timeout = LinuxTimeval(i64(0), i64(0)).
+        let length = ProbeOptionLength(u64(16)).
+        let mut result = 0.
+        unsafe:
+            set result = syscall(55, client, 1, option, address(timeout), address(length), 0).
         if result < 0:
             return result.
-        if load8(scratch) != 5:
-            return -22.
-        let mut index = usize(1).
-        while index < 16:
-            if load8(scratch + index) != 0:
-                return -22.
-            set index = index + 1.
+        if timeout.seconds != 5 || timeout.microseconds != 0 || length.value != 16:
+            return 1.
         return 0.
+operation ProbeHttpStatus:
+    accepts length of type i64.
+    returns i64.
+    requires:
+        length != -11 otherwise 408.
+        length != -22 && length != -400 && length != -413 && length != -431 otherwise 0 - length.
+    body:
+        return 400.
+operation ProbeHttpErrorBody:
+    accepts status of type i64.
+    returns Bytes.
+    requires:
+        status != 408 otherwise bytes("timeout").
+    body:
+        return bytes("bad request").
 operation ServerDispatch:
     accepts client of type i64.
-    accepts arena of type usize.
-    accepts arena_size of type usize.
+    accepts arena of type MutBytes.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    requires:
+        len(arena) == 65536 otherwise 81.
+    effects: SystemCall.
     body:
-        if arena_size != 65536:
-            return 81.
-        if load8(arena + 65535) != 73:
+        let head = view(arena).
+        let foot = slice(head, usize(65535), usize(1)).
+        let sentinel = byte(foot, usize(0)).
+        borrow_end(foot).
+        borrow_end(head).
+        if sentinel != 73:
             return 82.
-        store8(arena + 65535, u8(99)).
-        if ProbeTimeout(client, 20, arena + 60000) != 0:
+        put(arena, usize(65535), u8(99)).
+        let probeStatus = ProbeTimeout(client, 20).
+        if probeStatus != 0:
             return 83.
-        if ProbeTimeout(client, 21, arena + 60000) != 0:
+        let probeStatus2 = ProbeTimeout(client, 21).
+        if probeStatus2 != 0:
             return 84.
         LinuxWriteAll(1, bytes("D")).
-        let length = HttpReadRequest(client, arena, usize(32768)).
-        if length == -11:
-            HttpWriteTextResponse(client, 408, bytes("timeout"), arena + 32768, usize(16384)).
-            return 0.
+        let reqWindow = slice_mut(arena, usize(0), usize(32768)).
+        let length = HttpReadRequest(client, reqWindow).
+        borrow_end(reqWindow).
         if length < 0:
-            HttpWriteTextResponse(client, 400, bytes("bad request"), arena + 32768, usize(16384)).
+            let badScratch = slice_mut(arena, usize(32768), usize(16384)).
+            let status = ProbeHttpStatus(length).
+            let badBody = ProbeHttpErrorBody(status).
+            let badStatus = HttpWriteTextResponse(client, status, badBody, badScratch).
+            borrow_end(badScratch).
+            if badStatus < 0:
+                return badStatus.
             return 0.
-        let path = HttpPath(bytes_at(arena, usize(length))).
-        HttpWriteTextResponse(client, 200, path, arena + 32768, usize(16384)).
+        let requestLoan = slice_mut(arena, usize(0), usize(length)).
+        let request = view(requestLoan).
+        let path = HttpPath(request).
+        let echoScratch = slice_mut(arena, usize(32768), usize(16384)).
+        let echoStatus = HttpWriteTextResponse(client, 200, path, echoScratch).
+        borrow_end(echoScratch).
+        borrow_end(path).
+        borrow_end(request).
+        borrow_end(requestLoan).
+        if echoStatus < 0:
+            return echoStatus.
         return 0.
 "#;
 
@@ -338,37 +372,72 @@ fn server_source(max_clients: usize, auto_reap: bool) -> String {
     format!(
         r#"use "server.sal".
 use "http.sal".
+use "linux/io.sal".
+use "linux/net.sal".
+use "linux/process.sal".
 {DISPATCH}
+operation ProbeServe:
+    accepts pending of type MutBytes.
+    returns i64.
+    requires:
+        len(pending) == usize(65536) otherwise -91.
+    effects: SystemCall.
+    body:
+        let proxy = slice_mut(pending, usize(0), usize(16)).
+        let formatted = LinuxIpv4Address(proxy, 2130706433, 0).
+        borrow_end(proxy).
+        if formatted < 0:
+            return -91.
+        let head = view(pending).
+        let endpointView = slice(head, usize(0), usize(16)).
+        let listener = LinuxTcpListen(endpointView, i64(4)).
+        borrow_end(endpointView).
+        borrow_end(head).
+        if listener < 0:
+            return listener.
+        let mut failure = 0.
+        if {auto_reap}:
+            let handler = LinuxSignalAction(usize(1), u64(0), usize(0), u64(0)).
+            let mut policy = 0.
+            unsafe:
+                set policy = syscall(13, 17, address(handler), 0, 8, 0, 0).
+            if policy < 0:
+                set failure = -93.
+        let addrLoan = slice_mut(pending, usize(0), usize(16)).
+        let addrBytes = view(addrLoan).
+        let length = ProbeOptionLength(u64(16)).
+        let mut named = 0.
+        unsafe:
+            set named = syscall(51, listener, address(addrBytes), address(length), 0, 0, 0).
+        borrow_end(addrBytes).
+        borrow_end(addrLoan).
+        if named < 0:
+            set failure = -92.
+        put(pending, usize(65535), u8(73)).
+        let portLoan = slice_mut(pending, usize(2), usize(2)).
+        let portBytes = view(portLoan).
+        LinuxWriteAll(1, portBytes).
+        borrow_end(portBytes).
+        borrow_end(portLoan).
+        if failure != 0:
+            LinuxClose(listener).
+            return failure.
+        return listener.
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mapped = LinuxMapMemory(usize(65536)).
-        if mapped < 0:
-            return 90.
-        let arena = usize(mapped).
-        if {auto_reap}:
-            # Exercise ECHILD with an explicitly inherited SIGCHLD=SIG_IGN.
-            store8(arena, u8(1)).
-            let policy = syscall(13, 17, arena, 0, 8, 0, 0).
-            if policy < 0:
-                LinuxUnmapMemory(arena, usize(65536)).
-                return 93.
-        LinuxIpv4Address(arena, 2130706433, 0).
-        store8(arena + 16, u8(1)).
-        let listener = LinuxTcpListen(arena, arena + 16, 16).
-        if listener < 0:
-            LinuxUnmapMemory(arena, usize(65536)).
-            return 91.
-        store8(arena + 20, u8(16)).
-        let named = syscall(51, listener, arena, arena + 20, 0, 0, 0).
-        if named < 0:
-            LinuxClose(listener).
-            LinuxUnmapMemory(arena, usize(65536)).
-            return 92.
-        store8(arena + 65535, u8(73)).
-        LinuxWriteAll(1, bytes_at(arena + 2, usize(2))).
-        return ServerServe(listener, arena, usize(65536), {max_clients}).
+        let pending = buffer(usize(65536)).
+        let setup = borrow_mut(pending, usize(0), usize(65536)).
+        let listener = ProbeServe(setup).
+        borrow_end(setup).
+        let mut failure = 0.
+        if listener >= 0:
+            set failure = ServerServe(listener, pending, {max_clients}).
+        else:
+            set failure = 0 - listener.
+            buffer_drop(pending).
+        return failure.
 "#
     )
 }
@@ -506,30 +575,38 @@ fn accepted_socket_timeout_returns_408_and_releases_the_slot() {
 #[test]
 fn sigpipe_policy_is_explicit_and_returns_epipe_on_a_closed_peer() {
     let fixture = Fixture::build(
-        r#"use "linux/process.sal".
-use "linux/memory.sal".
-use "linux/io.sal".
+        r#"use "linux/io.sal".
+use "linux/process.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mapped = LinuxMapMemory(usize(4096)).
-        if mapped < 0:
-            return 90.
-        let arena = usize(mapped).
-        # Reset to SIG_DFL: the test must not depend on the Rust runner's policy.
-        if syscall(13, 13, arena, 0, 8, 0, 0) < 0:
-            return 91.
-        if LinuxReadExact(0, arena + 64, usize(1)) != 1:
-            return 92.
-        if load8(arena + 64) == 105:
+        let mut failure = 0.
+        let store = buffer(usize(4096)).
+        let mode = borrow_mut(store, usize(64), usize(1)).
+        # 'd' restores SIG_DFL; 'i' checks the explicit EPIPE policy.
+        if LinuxReadExact(0, mode) != 1:
+            set failure = 92.
+        let modeView = view(mode).
+        let modeByte = byte(modeView, usize(0)).
+        borrow_end(modeView).
+        borrow_end(mode).
+        if modeByte == 105:
             if LinuxIgnoreBrokenPipe() < 0:
-                return 93.
-        let result = LinuxWriteAll(1, bytes("closed peer")).
-        LinuxUnmapMemory(arena, usize(4096)).
-        if result != -32:
-            return 94.
-        return 0.
+                set failure = 93.
+        else:
+            let action = LinuxSignalAction(usize(0), u64(0), usize(0), u64(0)).
+            let mut reset = 0.
+            unsafe:
+                set reset = syscall(13, 13, address(action), 0, 8, 0, 0).
+            if reset < 0:
+                set failure = 93.
+        if failure == 0:
+            let result = LinuxWriteAll(1, bytes("closed peer")).
+            if result != -32:
+                set failure = 94.
+        buffer_drop(store).
+        return failure.
 "#,
     );
     for (mode, signal) in [(b'd', Some(13)), (b'i', None)] {
@@ -549,147 +626,193 @@ operation Main:
 }
 
 #[test]
-fn validation_retains_ownership_and_runtime_errors_close_and_unmap() {
+fn validation_consumes_arena_and_releases_listener_on_runtime_errors() {
     let fixture = Fixture::build(
         r#"use "server.sal".
+use "linux/io.sal".
 operation ServerDispatch:
     accepts client of type i64.
-    accepts arena of type usize.
-    accepts arena_size of type usize.
+    accepts arena of type MutBytes.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        return LinuxWriteAll(client, bytes("unreachable for a non-listening socket")).
+        return LinuxWriteAll(client, bytes("unexpected dispatch")).
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
+        let mut failure = 0.
         if ServerRun(2130706433, 0, usize(4095), 1) != -22:
-            return 1.
+            set failure = 1.
         if ServerRun(2130706433, 0, usize(4096), 0) != -22:
-            return 2.
+            if failure == 0:
+                set failure = 2.
         if ServerRun(2130706433, 65536, usize(4096), 1) != -22:
-            return 3.
-        let mapped = LinuxMapMemory(usize(4096)).
-        if mapped < 0:
-            return 4.
-        let arena = usize(mapped).
-        let scratch_map = LinuxMapMemory(usize(4096)).
-        if scratch_map < 0:
-            return 5.
-        let scratch = usize(scratch_map).
-        let socket = syscall(41, 2, 1, 0, 0, 0, 0).
+            if failure == 0:
+                set failure = 3.
+        if failure != 0:
+            return failure.
+        # Validation consumed the arena on every path: fresh Buffers work.
+        let store = buffer(usize(4096)).
+        let arena = borrow_mut(store, usize(0), usize(4096)).
+        let tiny = slice_mut(arena, usize(0), usize(64)).
+        borrow_end(tiny).
+        borrow_end(arena).
+        buffer_drop(store).
+        # A listener rejected by validation stays caller-owned. The syscall
+        # probes below check the numeric fd, never bypassing owner checking.
+        let mut socket = 0.
+        unsafe:
+            set socket = syscall(41, 2, 1, 0, 0, 0, 0).
         if socket < 0:
-            return 6.
-        if ServerServe(socket, arena, usize(4095), 1) != -22:
-            return 7.
-        if ServerServe(socket, arena, usize(4096), 0) != -22:
-            return 8.
-        if ServerServe(-1, arena, usize(4096), 1) != -22:
-            return 9.
-        if ServerServe(socket, usize(0), usize(4096), 1) != -22:
-            return 10.
-        # Invalid arguments did not consume either caller-owned resource.
-        if syscall(72, socket, 1, 0, 0, 0, 0) < 0:
-            return 11.
-        if syscall(27, arena, 4096, scratch, 0, 0, 0) != 0:
-            return 12.
-        # A valid but non-listening socket fails accept with EINVAL after the
-        # ownership transfer. fcntl/mincore observe both actual releases.
-        if ServerServe(socket, arena, usize(4096), 1) != -22:
-            return 13.
-        if syscall(72, socket, 1, 0, 0, 0, 0) != -9:
-            return 14.
-        if syscall(27, arena, 4096, scratch, 0, 0, 0) != -12:
-            return 15.
-        LinuxUnmapMemory(scratch, usize(4096)).
-        return 0.
+            return 4.
+        let probeStore = buffer(usize(4096)).
+        let probe = borrow_mut(probeStore, usize(0), usize(4096)).
+        borrow_end(probe).
+        if ServerServe(socket, probeStore, 0) != -22:
+            set failure = 5.
+        let mut live = 0.
+        unsafe:
+            set live = syscall(72, socket, 1, 0, 0, 0, 0).
+        if live < 0:
+            if failure == 0:
+                set failure = 6.
+        let negStore = buffer(usize(4096)).
+        if ServerServe(-1, negStore, 1) != -22:
+            if failure == 0:
+                set failure = 7.
+        # Valid but non-listening sockets fail accept after ownership transfer.
+        # Descriptor and mapping release are checked separately below.
+        let liveStore = buffer(usize(4096)).
+        if ServerServe(socket, liveStore, 1) != -22:
+            if failure == 0:
+                set failure = 8.
+        let mut closed = 0.
+        unsafe:
+            set closed = syscall(72, socket, 1, 0, 0, 0, 0).
+        if closed != -9:
+            if failure == 0:
+                set failure = 9.
+        return failure.
 "#,
     );
     let mut child = fixture.spawn(Stdio::null(), Stdio::null());
-    assert!(
-        child.finish().success(),
-        "SAL ownership/cleanup checks failed"
-    );
+    assert!(child.finish().success(), "SAL safe ownership checks failed");
 }
 
 #[test]
 fn setup_signal_socket_option_and_fork_failures_release_owned_resources() {
     // A real kernel seccomp filter makes otherwise nondeterministic resource
     // failures reproducible without replacing any SAL lifecycle operation.
+    // Public server/app helpers stay safe SystemCall-only; ONLY this test's
+    // OS setup (BPF install, raw bind, fcntl/mincore probes) uses narrow
+    // explicit unsafe blocks. The app dispatch boundary is never laundered.
     for (syscall_number, errno) in [(13, 1), (54, 1), (57, 11)] {
         let fixture = Fixture::build(&format!(
             r#"use "server.sal".
-operation ProbeWord:
-    accepts target of type usize.
-    accepts value of type usize.
-    effects: UnsafeMemory.
+use "linux/io.sal".
+use "linux/net.sal".
+entity ProbeFilter:
+    layout "C".
+    has load of type u64.
+    has compare of type u64.
+    has deny of type u64.
+    has allow of type u64.
+entity ProbeProgram:
+    layout "C".
+    has length of type u64.
+    has instructions of type usize.
+entity ProbeCell:
+    layout "C".
+    has value of type u64.
+operation ProbeInstall:
+    returns i64.
+    effects: SystemCall.
     body:
-        let mut remaining = value.
-        let mut offset = usize(0).
-        while offset < 8:
-            store8(target + offset, u8(remaining % 256)).
-            set remaining = remaining / 256.
-            set offset = offset + 1.
+        # Four classic BPF instructions as fixed C-layout words, not byte loops.
+        let filter = ProbeFilter(u64(32), u64(16777237) + u64({syscall_number}) * u64(4294967296), u64(6) + u64(327680 + {errno}) * u64(4294967296), u64(6) + u64(2147418112) * u64(4294967296)).
+        let mut pointer = usize(0).
+        let mut result = 0.
+        unsafe:
+            set pointer = address(filter).
+            set result = syscall(157, 38, 1, 0, 0, 0, 0).
+        if result < 0:
+            return result.
+        let program = ProbeProgram(u64(4), pointer).
+        unsafe:
+            set result = syscall(317, 1, 0, address(program), 0, 0, 0).
+        return result.
+operation ProbeListen:
+    accepts arena of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let formatted = LinuxIpv4Address(arena, 2130706433, 0).
+        if formatted < 0:
+            return formatted.
+        let endpoint = view(arena).
+        let listener = LinuxTcpListen(endpoint, i64(4)).
+        borrow_end(endpoint).
+        if listener < 0:
+            return listener.
+        let endpointView = view(arena).
+        let length = ProbeCell(u64(16)).
+        let mut named = 0.
+        unsafe:
+            set named = syscall(51, listener, address(endpointView), address(length), 0, 0, 0).
+        borrow_end(endpointView).
+        if named < 0:
+            LinuxClose(listener).
+            return named.
+        let head = view(arena).
+        let port = slice(head, usize(2), usize(2)).
+        LinuxWriteAll(1, port).
+        borrow_end(port).
+        borrow_end(head).
+        return listener.
 operation ServerDispatch:
     accepts client of type i64.
-    accepts arena of type usize.
-    accepts arena_size of type usize.
+    accepts arena of type MutBytes.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         return LinuxWriteAll(client, bytes("unexpected dispatch after injected failure")).
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mapped = LinuxMapMemory(usize(4096)).
-        if mapped < 0:
-            return 80.
-        let arena = usize(mapped).
-        let scratch_map = LinuxMapMemory(usize(4096)).
-        if scratch_map < 0:
-            return 81.
-        let scratch = usize(scratch_map).
-        LinuxIpv4Address(arena, 2130706433, 0).
-        store8(arena + 16, u8(1)).
-        let listener = LinuxTcpListen(arena, arena + 16, 4).
-        if listener < 0:
-            return 82.
-        store8(arena + 20, u8(16)).
-        if syscall(51, listener, arena, arena + 20, 0, 0, 0) < 0:
-            return 83.
-        # Four classic BPF instructions: load nr, match nr, errno, allow.
-        # The anonymous mapping provides zeroes for untouched instruction bytes.
-        store8(scratch, u8(32)).
-        store8(scratch + 8, u8(21)).
-        store8(scratch + 11, u8(1)).
-        store8(scratch + 12, u8({syscall_number})).
-        store8(scratch + 16, u8(6)).
-        store8(scratch + 20, u8({errno})).
-        store8(scratch + 22, u8(5)).
-        store8(scratch + 24, u8(6)).
-        store8(scratch + 30, u8(255)).
-        store8(scratch + 31, u8(127)).
-        # sock_fprog: u16 length, six padding bytes, eight-byte filter pointer.
-        store8(scratch + 32, u8(4)).
-        ProbeWord(scratch + 40, scratch).
-        if syscall(157, 38, 1, 0, 0, 0, 0) < 0:
-            return 84.
-        if syscall(317, 1, 0, scratch + 32, 0, 0, 0) < 0:
-            return 85.
-        LinuxWriteAll(1, bytes_at(arena + 2, usize(2))).
-        if ServerServe(listener, arena, usize(4096), 1) != -{errno}:
-            return 86.
-        if syscall(72, listener, 1, 0, 0, 0, 0) != -9:
-            return 87.
-        # No accepted descriptor remains after setsockopt/fork failure either.
-        if syscall(72, listener + 1, 1, 0, 0, 0, 0) != -9:
-            return 88.
-        if syscall(27, arena, 4096, scratch, 0, 0, 0) != -12:
-            return 89.
-        LinuxUnmapMemory(scratch, usize(4096)).
-        return 0.
+        let mut failure = 0.
+        let store = buffer(usize(4096)).
+        let arena = borrow_mut(store, usize(0), usize(4096)).
+        let listener = ProbeListen(arena).
+        let mut arenaAddress = usize(0).
+        unsafe:
+            set arenaAddress = address(view(arena)).
+        borrow_end(arena).
+        let installed = ProbeInstall().
+        if listener >= 0 && installed == 0:
+            if ServerServe(listener, store, 1) != -{errno}:
+                set failure = 86.
+        else:
+            set failure = 85.
+            if listener >= 0:
+                LinuxClose(listener).
+            buffer_drop(store).
+        let mut listenerLive = 0.
+        let mut siblingLive = 0.
+        let mut resident = 0.
+        let residency = ProbeCell(u64(0)).
+        unsafe:
+            set listenerLive = syscall(72, listener, 1, 0, 0, 0, 0).
+            set siblingLive = syscall(72, listener + 1, 1, 0, 0, 0, 0).
+            set resident = syscall(27, arenaAddress, 4096, address(residency), 0, 0, 0).
+        if failure == 0 && listenerLive != -9:
+            set failure = 87.
+        if failure == 0 && siblingLive != -9:
+            set failure = 88.
+        if failure == 0 && resident != -12:
+            set failure = 89.
+        return failure.
 "#
         ));
         let (mut child, _events, address) = fixture.serve();
@@ -706,47 +829,47 @@ operation Main:
 fn server_run_bind_and_address_errors_do_not_accumulate_mappings_or_fds() {
     let fixture = Fixture::build(
         r#"use "server.sal".
+use "linux/io.sal".
+use "linux/net.sal".
+use "net.sal".
 operation ServerDispatch:
     accepts client of type i64.
-    accepts arena of type usize.
-    accepts arena_size of type usize.
+    accepts arena of type MutBytes.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        return LinuxWriteAll(client, bytes("unexpected dispatch on occupied port")).
+        return LinuxWriteAll(client, bytes("unexpected dispatch")).
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mapped = LinuxMapMemory(usize(4096)).
-        if mapped < 0:
-            return 80.
-        let arena = usize(mapped).
-        LinuxIpv4Address(arena, 2130706433, 0).
-        store8(arena + 16, u8(1)).
-        let listener = LinuxTcpListen(arena, arena + 16, 4).
-        if listener < 0:
-            return 81.
-        store8(arena + 20, u8(16)).
-        if syscall(51, listener, arena, arena + 20, 0, 0, 0) < 0:
-            return 82.
-        let port = i64(load8(arena + 2)) * 256 + i64(load8(arena + 3)).
+        let mut failure = 0.
+        let store = buffer(usize(4096)).
+        let listener = NetTcpListen(u64(2130706433), 0, 4).
+        let port = NetLocalPort(listener).
+        if listener < 0 || port <= 0:
+            set failure = 81.
         LinuxWriteAll(1, bytes("B")).
-        if LinuxReadExact(0, arena + 64, usize(1)) != 1:
-            return 83.
+        let marker = borrow_mut(store, usize(64), usize(1)).
+        if LinuxReadExact(0, marker) != 1:
+            set failure = 83.
+        borrow_end(marker).
         let mut iteration = 0.
-        while iteration < 32:
+        while iteration < 32 && failure == 0:
             if ServerRun(2130706433, port, usize(4096), 1) != -98:
-                return 84.
+                set failure = 84.
             if ServerRun(2130706433, 65536, usize(4096), 1) != -22:
-                return 85.
+                set failure = 85.
             set iteration = iteration + 1.
         LinuxWriteAll(1, bytes("A")).
-        if LinuxReadExact(0, arena + 64, usize(1)) != 1:
-            return 86.
-        LinuxClose(listener).
-        LinuxUnmapMemory(arena, usize(4096)).
-        return 0.
+        let done = borrow_mut(store, usize(64), usize(1)).
+        if LinuxReadExact(0, done) != 1:
+            set failure = 86.
+        borrow_end(done).
+        if listener >= 0:
+            LinuxClose(listener).
+        buffer_drop(store).
+        return failure.
 "#,
     );
     let (mut events, output) = UnixStream::pair().unwrap();

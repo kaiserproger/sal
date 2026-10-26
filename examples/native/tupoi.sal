@@ -1,0 +1,9 @@
+application TupoiServer.
+
+server Main:
+    listens on port 8081.
+    speaks HTTP/1.
+
+route Route1:
+    handles GET /say/:what.
+    responds with param what.

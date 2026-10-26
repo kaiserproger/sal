@@ -3,90 +3,118 @@ use "linux/memory.sal".
 use "linux/process.sal".
 
 # Static dependency inversion: applications MUST define the real SAL operation
-# ServerDispatch(client:i64, arena:usize, arena_size:usize)->i64 with effects
-# SystemCall, UnsafeMemory. There is deliberately no default dispatcher.
-# It borrows the socket and private COW arena, handles one request, and returns
-# the child's exit status. It must not close/unmap these borrowed resources.
+# ServerDispatch(client:i64, arena:MutBytes)->i64 with effect SystemCall.
+# There is deliberately no default dispatcher. It borrows the socket and a
+# bounded exclusive loan of the private COW arena, handles one request, and
+# returns the child's exit status. The callback must not close/unmap the
+# server-owned listener/mapping; the server frame below owns that cleanup on
+# every path, across forks, max-children waits, timeouts, and SIGPIPE.
 # Call ServerRun/ServerServe as Main's return value, including in fork children.
 # This dedicated server process owns its children (wait4 uses pid=-1).
+#
+# Ownership: ServerRun allocates exactly one arena mapping and consumes it by
+# moving ownership into ServerServe after setup (setup failures drop it in
+# ServerRun; validation failures drop it in ServerServe).
+# ServerServe consumes the arena on entry and releases it exactly once on
+# every return and once in each fork child. Dispatch receives only a MutBytes
+# loan, never the owned mapping, so children cannot leak or double-unmap.
 
 # Retry only interrupted waits. Unexpected wait errors are never spun on.
 operation ServerWait:
     accepts options of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mut result = syscall(61, -1, 0, options, 0, 0, 0).
-        while result == -4:
+        let mut result = 0.
+        unsafe:
             set result = syscall(61, -1, 0, options, 0, 0, 0).
+        while result == -4:
+            unsafe:
+                set result = syscall(61, -1, 0, options, 0, 0, 0).
         return result.
+
+# Wait outcomes are a table; only a positive pid consumes one live child.
+operation ServerReapCount:
+    accepts child of type i64.
+    accepts live of type i64.
+    returns i64.
+    requires:
+        child != -10 otherwise 0.
+        child >= 0 otherwise child.
+        child != 0 otherwise live.
+    body:
+        return live - 1.
 
 # Drain already exited children without blocking. ECHILD resets the count,
 # including when the caller inherited an auto-reaping SIGCHLD disposition.
 operation ServerReap:
     accepts live of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut remaining = live.
         while remaining > 0:
             let child = ServerWait(1).
-            if child == -10:
-                return 0.
-            if child < 0:
-                return child.
-            if child == 0:
-                return remaining.
-            set remaining = remaining - 1.
+            let next = ServerReapCount(child, remaining).
+            if child <= 0:
+                return next.
+            set remaining = next.
         return 0.
 
 # Fatal parent path: stop accepting, drain owned children, release the mapping.
-# Socket timeouts bound blocked I/O, not arbitrary application computation.
-# Cleanup errors never replace the original failure; close is not retried
-# because Linux has already released the descriptor, even on EINTR.
+# Consumes the owned arena on every path. Socket timeouts bound blocked I/O,
+# not arbitrary application computation. Cleanup errors never replace the
+# original failure; close is not retried because Linux has already released
+# the descriptor, even on EINTR.
 operation ServerFinish:
     accepts listener of type i64.
-    accepts arena of type usize.
-    accepts arena_size of type usize.
+    accepts arena of type Buffer.
     accepts live of type i64.
     accepts failure of type i64.
+    consumes arena.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         LinuxClose(listener).
         let mut remaining = live.
         while remaining > 0:
             let child = ServerWait(0).
             if child < 0:
-                LinuxUnmapMemory(arena, arena_size).
-                return failure.
+                break.
             set remaining = remaining - 1.
-        LinuxUnmapMemory(arena, arena_size).
+        buffer_drop(arena).
         return failure.
 
-# Validation failures (-22) leave ownership with the caller. After validation,
-# consumes a valid listening fd and private writable mapping of arena_size bytes.
-# Every return closes/unmaps them. Dispatch may overwrite its whole private arena.
-# Accepted sockets use fixed-frame timevals; there are no per-connection mappings.
-# No logs, scheduler, hidden HTTP policy, or hidden compiler signal setup.
+# Consumes the owned arena on every return; validation failures drop it too.
+# The owned Buffer is always consumed; listener ownership transfers only after
+# validation passes. A validation failure leaves a non-negative listener owned
+# by the caller (matching the old numeric-fd validation-retains rule) and only
+# drops the arena. After validation, every return closes the owned listener.
+# Dispatch may overwrite its whole private arena loan. Accepted sockets use
+# fixed-frame timevals; there are no per-connection mappings. No logs,
+# scheduler, hidden HTTP policy, or hidden compiler signal setup.
 operation ServerServe:
     accepts listener of type i64.
-    accepts arena of type usize.
-    accepts arena_size of type usize.
+    accepts arena of type Buffer.
     accepts max_clients of type i64.
+    consumes arena.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
+    # This guard must retain its body: invalid input consumes/drops the arena,
+    # while requires/otherwise expressions cannot perform ownership cleanup.
     body:
-        if listener < 0 || arena == 0 || arena_size < 4096 || max_clients < 1:
+        let arena_size = len(arena).
+        if listener < 0 || arena_size < 4096 || max_clients < 1:
+            buffer_drop(arena).
             return -22.
         let policy = LinuxIgnoreBrokenPipe().
         if policy < 0:
-            return ServerFinish(listener, arena, arena_size, 0, policy).
+            return ServerFinish(listener, arena, 0, policy).
         let mut live = 0.
         while true:
             let reaped = ServerReap(live).
             if reaped < 0:
-                return ServerFinish(listener, arena, arena_size, live, reaped).
+                return ServerFinish(listener, arena, live, reaped).
             set live = reaped.
             if live == max_clients:
                 let child = ServerWait(0).
@@ -94,56 +122,59 @@ operation ServerServe:
                     set live = 0.
                     continue.
                 if child < 0:
-                    return ServerFinish(listener, arena, arena_size, live, child).
+                    return ServerFinish(listener, arena, live, child).
                 set live = live - 1.
                 continue.
             let client = LinuxTcpAccept(listener).
             if client < 0:
-                return ServerFinish(listener, arena, arena_size, live, client).
+                return ServerFinish(listener, arena, live, client).
             let timeout = LinuxSocketTimeouts(client, i64(5)).
             if timeout < 0:
                 LinuxClose(client).
-                return ServerFinish(listener, arena, arena_size, live, timeout).
-            let child = syscall(57, 0, 0, 0, 0, 0, 0).
+                return ServerFinish(listener, arena, live, timeout).
+            let mut child = 0.
+            unsafe:
+                set child = syscall(57, 0, 0, 0, 0, 0, 0).
             if child < 0:
                 LinuxClose(client).
-                return ServerFinish(listener, arena, arena_size, live, child).
+                return ServerFinish(listener, arena, live, child).
             if child == 0:
                 LinuxClose(listener).
-                let status = ServerDispatch(client, arena, arena_size).
+                let loan = borrow_mut(arena, usize(0), arena_size).
+                let status = ServerDispatch(client, loan).
+                borrow_end(loan).
                 LinuxClose(client).
-                LinuxUnmapMemory(arena, arena_size).
+                buffer_drop(arena).
                 return status.
             LinuxClose(client).
             set live = live + 1.
-        return 0.
 
-# Map once, then transfer both resources to ServerServe exactly once. Port zero
-# is allowed; callers needing the assigned port can bind and call ServerServe.
+# Map exactly one arena, then move ownership into ServerServe exactly once.
+# Port zero is allowed; callers needing the assigned port can bind and call
+# ServerServe. Validation failures never leak the mapping.
 operation ServerRun:
     accepts ipv4 of type u64.
     accepts port of type i64.
     accepts arena_size of type usize.
     accepts max_clients of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    requires:
+        arena_size >= 4096 && max_clients >= 1 otherwise -22.
+    effects: SystemCall.
     body:
-        if arena_size < 4096 || max_clients < 1:
-            return -22.
-        let mapped = LinuxMapMemory(arena_size).
-        if mapped < 0:
-            return mapped.
-        let arena = usize(mapped).
-        let endpoint = LinuxIpv4Address(arena, ipv4, port).
-        if endpoint < 0:
-            LinuxUnmapMemory(arena, arena_size).
-            return endpoint.
-        store8(arena + 16, u8(1)).
-        store8(arena + 17, u8(0)).
-        store8(arena + 18, u8(0)).
-        store8(arena + 19, u8(0)).
-        let listener = LinuxTcpListen(arena, arena + 16, max_clients).
+        let arena = buffer(arena_size).
+        let endpointLoan = borrow_mut(arena, usize(0), usize(16)).
+        let formatted = LinuxIpv4Address(endpointLoan, ipv4, port).
+        borrow_end(endpointLoan).
+        if formatted < 0:
+            buffer_drop(arena).
+            return formatted.
+        let head = view(arena).
+        let endpointView = slice(head, usize(0), usize(16)).
+        let listener = LinuxTcpListen(endpointView, max_clients).
+        borrow_end(head).
+        borrow_end(endpointView).
         if listener < 0:
-            LinuxUnmapMemory(arena, arena_size).
+            buffer_drop(arena).
             return listener.
-        return ServerServe(listener, arena, arena_size, max_clients).
+        return ServerServe(listener, arena, max_clients).

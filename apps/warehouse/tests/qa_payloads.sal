@@ -1,0 +1,211 @@
+use "std/bytes.sal".
+use "std/json.sal".
+use "std/postgres.sal".
+
+# Runtime-built payloads of the all-SAL warehouse QA: the only bodies and
+# expectations that cannot be literals (std/json-escaped fixture strings,
+# numbered code lists, fills, raw non-UTF-8 bytes, Bind parameters). Every
+# builder threads one cursor (`requires: at >= 0 otherwise at.`) and returns
+# the written prefix of its loan. The suite's own payloads always fit their
+# fixed loans, so a failed builder is a suite bug and traps in QaFront.
+
+operation QaFront:
+    accepts out of type MutBytes.
+    accepts at of type i64.
+    returns Bytes from out.
+    requires:
+        at >= 0.
+    body:
+        let written = view(out).
+        return slice(written, usize(0), usize(at)).
+
+# JSON string (std/json escaping, the writer the application uses).
+operation QaJsonAt:
+    accepts out of type MutBytes.
+    accepts at of type i64.
+    accepts value of type Bytes.
+    returns i64.
+    requires:
+        at >= 0 otherwise at.
+        usize(at) <= len(out) otherwise -28.
+    body:
+        let window = slice_mut(out, usize(at), len(out) - usize(at)).
+        let wrote = JsonWriteString(value, window).
+        borrow_end(window).
+        return PgAdvance(at, wrote).
+
+operation QaFillAt:
+    accepts out of type MutBytes.
+    accepts at of type i64.
+    accepts octet of type u8.
+    accepts count of type i64.
+    returns i64.
+    requires:
+        at >= 0 otherwise at.
+        count >= 0 otherwise -22.
+        usize(at) + usize(count) <= len(out) otherwise -28.
+    body:
+        let window = slice_mut(out, usize(at), usize(count)).
+        let wrote = BytesFill(window, octet).
+        borrow_end(window).
+        return PgAdvance(at, wrote).
+
+# One PostgreSQL text Bind parameter: BE32 length, then the bytes.
+operation QaParamAt:
+    accepts out of type MutBytes.
+    accepts at of type i64.
+    accepts value of type Bytes.
+    returns i64.
+    requires:
+        at >= 0 otherwise at.
+    body:
+        return BytesAppend(out, PgAppend32(out, at, i64(len(value))), value).
+
+operation QaBind:
+    accepts out of type MutBytes.
+    accepts value of type Bytes.
+    returns Bytes from out.
+    body:
+        return QaFront(out, QaParamAt(out, 0, value)).
+
+operation QaBindThree:
+    accepts out of type MutBytes.
+    accepts first of type Bytes.
+    accepts second of type Bytes.
+    accepts third of type Bytes.
+    returns Bytes from out.
+    body:
+        let mut at = QaParamAt(out, 0, first).
+        set at = QaParamAt(out, at, second).
+        set at = QaParamAt(out, at, third).
+        return QaFront(out, at).
+
+# `<prefix><number>`, e.g. BATCH-17.
+operation QaNumbered:
+    accepts out of type MutBytes.
+    accepts prefix of type Bytes.
+    accepts number of type i64.
+    returns Bytes from out.
+    body:
+        return QaFront(out, BytesDecimalAt(out, BytesAppend(out, 0, prefix), number)).
+
+operation QaItemOpen:
+    accepts index of type i64.
+    returns Bytes.
+    requires:
+        index > 0 otherwise bytes("\"").
+    body:
+        return bytes(",\"").
+
+operation QaOrdinal:
+    accepts index of type i64.
+    accepts count of type i64.
+    accepts reversed of type bool.
+    returns i64.
+    requires:
+        reversed otherwise index.
+    body:
+        return count - 1 - index.
+
+# {"codes":["<prefix>0",...,"<prefix><count-1>"]}, optionally reversed.
+operation QaCodesBody:
+    accepts out of type MutBytes.
+    accepts prefix of type Bytes.
+    accepts count of type i64.
+    accepts reversed of type bool.
+    returns Bytes from out.
+    body:
+        let mut at = BytesAppend(out, 0, bytes("{\"codes\":[")).
+        let mut index = 0.
+        while index < count:
+            set at = BytesAppend(out, at, QaItemOpen(index)).
+            set at = BytesAppend(out, at, prefix).
+            set at = BytesDecimalAt(out, at, QaOrdinal(index, count, reversed)).
+            set at = BytesAppend(out, at, bytes("\"")).
+            set index = index + 1.
+        return QaFront(out, BytesAppend(out, at, bytes("]}"))).
+
+# {"codes":[<code as JSON>]}.
+operation QaCodeBody:
+    accepts out of type MutBytes.
+    accepts code of type Bytes.
+    returns Bytes from out.
+    body:
+        let mut at = BytesAppend(out, 0, bytes("{\"codes\":[")).
+        set at = QaJsonAt(out, at, code).
+        return QaFront(out, BytesAppend(out, at, bytes("]}"))).
+
+# {"codes":["xxx..."]} with one code of `length` bytes.
+operation QaLongCodeBody:
+    accepts out of type MutBytes.
+    accepts length of type i64.
+    returns Bytes from out.
+    body:
+        let mut at = BytesAppend(out, 0, bytes("{\"codes\":[\"")).
+        set at = QaFillAt(out, at, u8(120), length).
+        return QaFront(out, BytesAppend(out, at, bytes("\"]}"))).
+
+operation QaSpaces:
+    accepts out of type MutBytes.
+    accepts count of type i64.
+    returns Bytes from out.
+    body:
+        return QaFront(out, QaFillAt(out, 0, u8(32), count)).
+
+# Arbitrary bytes, including non-UTF-8, from hex digits.
+operation QaHexBody:
+    accepts out of type MutBytes.
+    accepts hex of type Bytes.
+    returns Bytes from out.
+    body:
+        return QaFront(out, BytesDecodeHex(hex, out)).
+
+# {"warehouse_id":<warehouse>}.
+operation QaStockBody:
+    accepts out of type MutBytes.
+    accepts warehouse of type i64.
+    returns Bytes from out.
+    body:
+        let at = BytesDecimalAt(out, BytesAppend(out, 0, bytes("{\"warehouse_id\":")), warehouse).
+        return QaFront(out, BytesAppend(out, at, bytes("}"))).
+
+# The tail of one stock row: "code":<code>,"quantity":Q,"reserved":R,
+# "available_quantity":Q-R}.
+operation QaCountMarker:
+    accepts out of type MutBytes.
+    accepts code of type Bytes.
+    accepts quantity of type i64.
+    accepts reserved of type i64.
+    returns Bytes from out.
+    body:
+        let mut at = BytesAppend(out, 0, bytes("\"code\":")).
+        set at = QaJsonAt(out, at, code).
+        set at = BytesDecimalAt(out, BytesAppend(out, at, bytes(",\"quantity\":")), quantity).
+        set at = BytesDecimalAt(out, BytesAppend(out, at, bytes(",\"reserved\":")), reserved).
+        set at = BytesDecimalAt(out, BytesAppend(out, at, bytes(",\"available_quantity\":")), quantity - reserved).
+        return QaFront(out, BytesAppend(out, at, bytes("}"))).
+
+# Listing head after renaming warehouse 1:
+# {"warehouse":{"id":1,"name":<name>,"available":true},"items":[
+operation QaRenamedHead:
+    accepts out of type MutBytes.
+    accepts name of type Bytes.
+    returns Bytes from out.
+    body:
+        let mut at = BytesAppend(out, 0, bytes("{\"warehouse\":{\"id\":1,\"name\":")).
+        set at = QaJsonAt(out, at, name).
+        return QaFront(out, BytesAppend(out, at, bytes(",\"available\":true},\"items\":["))).
+
+# Whole stock row of the quoted fixture item (2 in stock, none reserved).
+operation QaQuotedRow:
+    accepts out of type MutBytes.
+    accepts name of type Bytes.
+    accepts size of type Bytes.
+    accepts code of type Bytes.
+    returns Bytes from out.
+    body:
+        let mut at = BytesAppend(out, 0, bytes("{\"name\":")).
+        set at = QaJsonAt(out, at, name).
+        set at = QaJsonAt(out, BytesAppend(out, at, bytes(",\"size\":")), size).
+        set at = QaJsonAt(out, BytesAppend(out, at, bytes(",\"code\":")), code).
+        return QaFront(out, BytesAppend(out, at, bytes(",\"quantity\":2,\"reserved\":0,\"available_quantity\":2}"))).

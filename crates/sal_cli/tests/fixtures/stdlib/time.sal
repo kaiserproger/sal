@@ -1,0 +1,86 @@
+use "std/time.sal".
+
+# Keeps the first failing check number: a check that already failed stays
+# recorded, otherwise the new code is recorded exactly when `failed` holds.
+operation FirstFailure:
+    accepts current of type i64.
+    accepts failed of type bool.
+    accepts code of type i64.
+    returns i64.
+    requires:
+        current == 0 otherwise current.
+        failed == false otherwise code.
+    body:
+        return 0.
+
+operation Main:
+  returns i64.
+  effects: SystemCall.
+  body:
+    let mut failure = 0.
+    let neg = 0 - 1.
+    let made_bad_seconds = TimeSpanMake(neg, 0).
+    set failure = FirstFailure(failure, made_bad_seconds.status != -22, 1).
+    let made_bad_nanoseconds = TimeSpanMake(0, 1000000000).
+    set failure = FirstFailure(failure, made_bad_nanoseconds.status != -22, 2).
+    let made = TimeSpanMake(2, 500000000).
+    set failure = FirstFailure(failure, made.status != 0, 3).
+    set failure = FirstFailure(failure, made.span.seconds != 2, 4).
+    set failure = FirstFailure(failure, made.span.nanoseconds != 500000000, 5).
+    let added = TimeSpanAdd(TimeSpan(0, 600000000), TimeSpan(0, 600000000)).
+    set failure = FirstFailure(failure, added.status != 0, 6).
+    set failure = FirstFailure(failure, added.span.seconds != 1, 7).
+    set failure = FirstFailure(failure, added.span.nanoseconds != 200000000, 8).
+    let added_bad = TimeSpanAdd(TimeSpan(neg, 0), TimeSpan(0, 0)).
+    set failure = FirstFailure(failure, added_bad.status != -22, 9).
+    let added_overflow = TimeSpanAdd(TimeSpan(9223372036854775807, 0), TimeSpan(1, 0)).
+    set failure = FirstFailure(failure, added_overflow.status != -75, 10).
+    let added_carry = TimeSpanAdd(TimeSpan(9223372036854775807, 500000000), TimeSpan(0, 600000000)).
+    set failure = FirstFailure(failure, added_carry.status != -75, 11).
+    let deadline_bad = TimeDeadlineAfter(TimeMono(neg, 0), TimeSpan(0, 0)).
+    set failure = FirstFailure(failure, deadline_bad.status != -22, 12).
+    let deadline_bad_nanoseconds = TimeDeadlineAfter(TimeMono(0, 0), TimeSpan(0, 1000000000)).
+    set failure = FirstFailure(failure, deadline_bad_nanoseconds.status != -22, 13).
+    let deadline_overflow = TimeDeadlineAfter(TimeMono(9223372036854775807, 0), TimeSpan(1, 0)).
+    set failure = FirstFailure(failure, deadline_overflow.status != -75, 14).
+    let monotonic = TimeMonotonic().
+    set failure = FirstFailure(failure, monotonic.status != 0, 15).
+    set failure = FirstFailure(failure, monotonic.stamp.seconds < 0, 16).
+    set failure = FirstFailure(failure, monotonic.stamp.nanoseconds < 0, 17).
+    set failure = FirstFailure(failure, monotonic.stamp.nanoseconds >= 1000000000, 18).
+    let wall = TimeRealtime().
+    set failure = FirstFailure(failure, wall.status != 0, 19).
+    set failure = FirstFailure(failure, wall.stamp.nanoseconds < 0, 20).
+    set failure = FirstFailure(failure, wall.stamp.nanoseconds >= 1000000000, 21).
+    let future_elapsed = TimeElapsedSince(TimeMono(9223372036854775807, 0)).
+    set failure = FirstFailure(failure, future_elapsed.status != -22, 22).
+    set failure = FirstFailure(failure, TimeSleep(TimeSpan(0, 0)) != 0, 23).
+    set failure = FirstFailure(failure, TimeSleep(TimeSpan(neg, 0)) != -22, 24).
+    set failure = FirstFailure(failure, TimeSleep(TimeSpan(0, 1000000000)) != -22, 25).
+    let before = TimeMonotonic().
+    set failure = FirstFailure(failure, TimeSleep(TimeSpan(0, 50000000)) != 0, 26).
+    let done = TimeElapsedSince(before.stamp).
+    set failure = FirstFailure(failure, done.status != 0, 27).
+    set failure = FirstFailure(failure, done.elapsed.seconds == 0 && done.elapsed.nanoseconds < 10000000, 28).
+    set failure = FirstFailure(failure, done.elapsed.seconds > 10, 29).
+    let tick_start = TimeMonotonic().
+    let tick_deadline = TimeDeadlineAfter(tick_start.stamp, TimeSpan(0, 30000000)).
+    set failure = FirstFailure(failure, tick_deadline.status != 0, 30).
+    set failure = FirstFailure(failure, TimeSleepUntil(tick_deadline.point) != 0, 31).
+    let tick_done = TimeElapsedSince(tick_start.stamp).
+    set failure = FirstFailure(failure, tick_done.status != 0, 32).
+    set failure = FirstFailure(failure, tick_done.elapsed.seconds == 0 && tick_done.elapsed.nanoseconds < 5000000, 33).
+    set failure = FirstFailure(failure, tick_done.elapsed.seconds > 10, 34).
+    let past_point = TimeMonotonic().
+    let past_left = TimeRemaining(past_point.stamp).
+    set failure = FirstFailure(failure, past_left.status != 0, 35).
+    set failure = FirstFailure(failure, past_left.expired == false, 36).
+    set failure = FirstFailure(failure, TimeSleepUntil(past_point.stamp) != 0, 37).
+    let later_start = TimeMonotonic().
+    let later_deadline = TimeDeadlineAfter(later_start.stamp, TimeSpan(2, 0)).
+    set failure = FirstFailure(failure, later_deadline.status != 0, 38).
+    let later_left = TimeRemaining(later_deadline.point).
+    set failure = FirstFailure(failure, later_left.status != 0, 39).
+    set failure = FirstFailure(failure, later_left.expired == true, 40).
+    set failure = FirstFailure(failure, later_left.remaining.seconds > 2, 41).
+    return failure.

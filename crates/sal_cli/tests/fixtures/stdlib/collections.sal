@@ -1,0 +1,170 @@
+use "std/collections.sal".
+
+# Executable fixture for typed POD Vector/Map: growth, collision chains,
+# delete/reinsert, missing-vs-zero, zero capacity, and recursive POD key
+# padding. Returns 0 when every check holds, otherwise the first failing
+# check number. Asserts only observable results and statuses, never source
+# text or wiring.
+#
+# Layout facts (keep in sync with stdlib/collections.sal and the lowering):
+# the generated vector metadata is a C record {data, len, cap} and the map
+# metadata is {data, len, cap, used}. The ONLY narrow unsafe block below
+# rewrites one known C padding byte of a stack-boxed key copy through a raw
+# byte store before a map lookup; the actual runtime hashing/equality only
+# ever sees canonical field-wise packed bytes. Main signatures stay
+# SystemCall; every other Main check is ordinary safe surface.
+# Keeps the first failing check number: a check that already failed stays
+# recorded, otherwise the new code is recorded exactly when `failed` holds.
+operation FirstFailure:
+    accepts current of type i64.
+    accepts failed of type bool.
+    accepts code of type i64.
+    returns i64.
+    requires:
+        current == 0 otherwise current.
+        failed == false otherwise code.
+    body:
+        return 0.
+
+entity Pair:
+    layout "C".
+    has first of type i64.
+    has second of type u8.
+
+entity PadKey:
+    layout "C".
+    has tag of type u8.
+    has value of type u64.
+
+operation BoxPadKey:
+    accepts inner of type PadKey.
+    returns PadKey.
+    body:
+        return inner.
+
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        let vec = vector(i64, usize(0)).
+        set failure = FirstFailure(failure, vector_len(vec) != usize(0), 1).
+        set failure = FirstFailure(failure, vector_capacity(vec) != usize(0), 2).
+        let emptyGet = vector_get(vec, usize(0)).
+        set failure = FirstFailure(failure, emptyGet.found == true, 3).
+        set failure = FirstFailure(failure, emptyGet.value != 0, 4).
+        let emptyPop = vector_pop(vec).
+        set failure = FirstFailure(failure, emptyPop.found == true, 5).
+        set failure = FirstFailure(failure, emptyPop.value != 0, 6).
+        set failure = FirstFailure(failure, vector_set(vec, usize(0), 7) != -22, 7).
+        set failure = FirstFailure(failure, vector_reserve(vec, usize(4)) != 0, 8).
+        set failure = FirstFailure(failure, vector_capacity(vec) != usize(4), 9).
+        set failure = FirstFailure(failure, vector_push(vec, 11) != 0, 10).
+        set failure = FirstFailure(failure, vector_push(vec, 0) != 0, 11).
+        set failure = FirstFailure(failure, vector_push(vec, 0 - 5) != 0, 12).
+        set failure = FirstFailure(failure, vector_len(vec) != usize(3), 13).
+        let storedZero = vector_get(vec, usize(1)).
+        set failure = FirstFailure(failure, storedZero.found == false, 14).
+        set failure = FirstFailure(failure, storedZero.value != 0, 15).
+        let missing = vector_get(vec, usize(9)).
+        set failure = FirstFailure(failure, missing.found == true, 16).
+        set failure = FirstFailure(failure, missing.value != 0, 17).
+        set failure = FirstFailure(failure, vector_set(vec, usize(1), 22) != 0, 18).
+        set failure = FirstFailure(failure, vector_get(vec, usize(1)).value != 22, 19).
+        set failure = FirstFailure(failure, vector_set(vec, usize(9), 1) != -22, 20).
+        let grown = vector(i64, usize(2)).
+        set failure = FirstFailure(failure, vector_push(grown, 1) != 0, 21).
+        set failure = FirstFailure(failure, vector_push(grown, 2) != 0, 22).
+        set failure = FirstFailure(failure, vector_push(grown, 3) != 0, 23).
+        set failure = FirstFailure(failure, vector_push(grown, 4) != 0, 24).
+        set failure = FirstFailure(failure, vector_push(grown, 5) != 0, 25).
+        set failure = FirstFailure(failure, vector_len(grown) != usize(5), 26).
+        let mut scan = usize(0).
+        while scan < usize(5):
+            set failure = FirstFailure(failure, vector_get(grown, scan).value != i64(scan) + 1, 27).
+            set failure = FirstFailure(failure, vector_get(grown, scan).found == false, 28).
+            set scan = scan + usize(1).
+        set failure = FirstFailure(failure, vector_capacity(grown) < usize(5), 29).
+        let tail = vector_pop(grown).
+        set failure = FirstFailure(failure, tail.found == false, 30).
+        set failure = FirstFailure(failure, tail.value != 5, 31).
+        set failure = FirstFailure(failure, vector_len(grown) != usize(4), 32).
+        set failure = FirstFailure(failure, vector_get(grown, usize(4)).found == true, 33).
+        set failure = FirstFailure(failure, vector_get(grown, usize(3)).value != 4, 34).
+        let pairs = vector(Pair, usize(2)).
+        set failure = FirstFailure(failure, vector_push(pairs, Pair(1, u8(2))) != 0, 35).
+        set failure = FirstFailure(failure, vector_push(pairs, Pair(0 - 3, u8(4))) != 0, 36).
+        let firstPair = vector_get(pairs, usize(0)).
+        set failure = FirstFailure(failure, firstPair.found == false, 37).
+        set failure = FirstFailure(failure, firstPair.value.first != 1, 38).
+        set failure = FirstFailure(failure, firstPair.value.second != u8(2), 39).
+        let secondPair = vector_pop(pairs).
+        set failure = FirstFailure(failure, secondPair.found == false, 40).
+        set failure = FirstFailure(failure, secondPair.value.first != 0 - 3, 41).
+        set failure = FirstFailure(failure, secondPair.value.second != u8(4), 42).
+        vector_drop(pairs).
+        let table = map(i64, i64, usize(0)).
+        set failure = FirstFailure(failure, map_len(table) != usize(0), 43).
+        set failure = FirstFailure(failure, map_capacity(table) != usize(0), 44).
+        let absent = map_get(table, 7).
+        set failure = FirstFailure(failure, absent.found == true, 45).
+        set failure = FirstFailure(failure, absent.value != 0, 46).
+        set failure = FirstFailure(failure, map_contains(table, 7) == true, 47).
+        set failure = FirstFailure(failure, map_insert(table, 1, 100) != 0, 48).
+        set failure = FirstFailure(failure, map_insert(table, 2, 0) != 0, 49).
+        set failure = FirstFailure(failure, map_len(table) != usize(2), 50).
+        let zeroValue = map_get(table, 2).
+        set failure = FirstFailure(failure, zeroValue.found == false, 51).
+        set failure = FirstFailure(failure, zeroValue.value != 0, 52).
+        set failure = FirstFailure(failure, map_insert(table, 1, 101) != 1, 53).
+        set failure = FirstFailure(failure, map_len(table) != usize(2), 54).
+        set failure = FirstFailure(failure, map_get(table, 1).value != 101, 55).
+        set failure = FirstFailure(failure, map_insert(table, 9, 900) != 0, 56).
+        set failure = FirstFailure(failure, map_insert(table, 17, 1700) != 0, 57).
+        set failure = FirstFailure(failure, map_len(table) != usize(4), 58).
+        set failure = FirstFailure(failure, map_get(table, 9).value != 900, 59).
+        set failure = FirstFailure(failure, map_get(table, 17).value != 1700, 60).
+        set failure = FirstFailure(failure, map_contains(table, 9) == false, 61).
+        let removed = map_remove(table, 9).
+        set failure = FirstFailure(failure, removed.found == false, 62).
+        set failure = FirstFailure(failure, removed.value != 900, 63).
+        set failure = FirstFailure(failure, map_len(table) != usize(3), 64).
+        set failure = FirstFailure(failure, map_contains(table, 9) == true, 65).
+        let gone = map_get(table, 9).
+        set failure = FirstFailure(failure, gone.found == true, 66).
+        set failure = FirstFailure(failure, gone.value != 0, 67).
+        set failure = FirstFailure(failure, map_get(table, 17).value != 1700, 68).
+        set failure = FirstFailure(failure, map_get(table, 1).value != 101, 69).
+        set failure = FirstFailure(failure, map_insert(table, 9, 901) != 0, 70).
+        set failure = FirstFailure(failure, map_get(table, 9).value != 901, 71).
+        set failure = FirstFailure(failure, map_len(table) != usize(4), 72).
+        let missingRemove = map_remove(table, 12345).
+        set failure = FirstFailure(failure, missingRemove.found == true, 73).
+        set failure = FirstFailure(failure, missingRemove.value != 0, 74).
+        set failure = FirstFailure(failure, map_len(table) != usize(4), 75).
+        let keyed = map(Pair, i64, usize(8)).
+        set failure = FirstFailure(failure, map_insert(keyed, Pair(3, u8(5)), 300) != 0, 76).
+        set failure = FirstFailure(failure, map_get(keyed, Pair(3, u8(5))).value != 300, 77).
+        set failure = FirstFailure(failure, map_get(keyed, Pair(3, u8(6))).found == true, 78).
+        set failure = FirstFailure(failure, map_insert(keyed, Pair(3, u8(5)), 301) != 1, 79).
+        set failure = FirstFailure(failure, map_get(keyed, Pair(3, u8(5))).value != 301, 80).
+        let padTable = map(PadKey, i64, usize(8)).
+        set failure = FirstFailure(failure, map_insert(padTable, PadKey(u8(7), u64(12345)), 700) != 0, 81).
+        let boxed = BoxPadKey(PadKey(u8(7), u64(12345))).
+        unsafe:
+            store8(address(boxed) + 1, u8(255)).
+        set failure = FirstFailure(failure, map_get(padTable, boxed).found == false, 82).
+        set failure = FirstFailure(failure, map_get(padTable, boxed).value != 700, 83).
+        set failure = FirstFailure(failure, map_contains(padTable, boxed) == false, 84).
+        set failure = FirstFailure(failure, map_contains(padTable, PadKey(u8(8), u64(12345))) == true, 85).
+        let padZero = map(PadKey, i64, usize(0)).
+        set failure = FirstFailure(failure, map_insert(padZero, PadKey(u8(1), u64(2)), 12) != 0, 86).
+        set failure = FirstFailure(failure, map_len(padZero) != usize(1), 87).
+        set failure = FirstFailure(failure, map_get(padZero, PadKey(u8(1), u64(2))).value != 12, 88).
+        map_drop(padZero).
+        map_drop(padTable).
+        map_drop(keyed).
+        map_drop(table).
+        vector_drop(grown).
+        vector_drop(vec).
+        return failure.

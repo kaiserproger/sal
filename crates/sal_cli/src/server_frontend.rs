@@ -65,33 +65,34 @@ pub(crate) fn lower(file: &SalFile) -> Result<Option<String>, Vec<Diagnostic>> {
     );
     writeln!(
         source,
-        "operation Main:\n    returns i64.\n    effects: SystemCall, UnsafeMemory.\n    body:\n        return ServerRun(u64(0), i64({port}), usize(262144), i64(32)).\n"
+        "operation Main:\n    returns i64.\n    effects: SystemCall.\n    body:\n        return ServerRun(u64(0), i64({port}), usize(262144), i64(32)).\n"
     )
     .expect("write generated SAL");
     source.push_str(
         r#"operation ServerDispatch:
     accepts client of type i64.
-    accepts arena of type usize.
-    accepts capacity of type usize.
+    accepts arena of type MutBytes.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
+        let capacity = len(arena).
         if capacity < 4096:
             return -28.
         let requestCapacity = (capacity - 512) / 2.
-        let decode = arena + requestCapacity.
         let decodeCapacity = capacity - 512 - requestCapacity.
-        let header = arena + capacity - 512.
-        let received = HttpReadRequest(client, arena, requestCapacity).
+        let requestBuffer = slice_mut(arena, usize(0), requestCapacity).
+        let decode = slice_mut(arena, requestCapacity, decodeCapacity).
+        let header = slice_mut(arena, capacity - 512, usize(512)).
+        let received = HttpReadRequest(client, requestBuffer).
         if received < 0:
             if received == -400 || received == -413 || received == -431:
-                return HttpWriteTextResponse(client, 0 - received, bytes(""), header, usize(512)).
+                return HttpWriteTextResponse(client, 0 - received, bytes(""), header).
             if received == -11 || received == -110:
-                return HttpWriteTextResponse(client, i64(408), bytes(""), header, usize(512)).
+                return HttpWriteTextResponse(client, i64(408), bytes(""), header).
             return received.
-        let request = bytes_at(arena, usize(received)).
+        let request = slice(view(requestBuffer), usize(0), usize(received)).
         if HttpMethod(request) != bytes("GET"):
-            return HttpWriteTextResponse(client, i64(404), bytes(""), header, usize(512)).
+            return HttpWriteTextResponse(client, i64(404), bytes(""), header).
         let path = HttpPath(request).
 "#,
     );
@@ -109,7 +110,7 @@ pub(crate) fn lower(file: &SalFile) -> Result<Option<String>, Vec<Diagnostic>> {
                 let name = literal(name);
                 writeln!(
                     source,
-                    "        let capture{index} = RouteCapture(bytes({pattern}), path, bytes({name})).\n        if len(capture{index}) != 0:\n            let decoded{index} = RouteDecode(capture{index}, decode, decodeCapacity).\n            if decoded{index} == -22:\n                return HttpWriteTextResponse(client, i64(400), bytes(\"\"), header, usize(512)).\n            if decoded{index} < 0:\n                return decoded{index}.\n            return HttpWriteTextResponse(client, i64(200), bytes_at(decode, usize(decoded{index})), header, usize(512))."
+                    "        let capture{index} = RouteCapture(bytes({pattern}), path, bytes({name})).\n        if len(capture{index}) != 0:\n            let decoded{index} = RouteDecode(capture{index}, decode).\n            if decoded{index} == -22:\n                return HttpWriteTextResponse(client, i64(400), bytes(\"\"), header).\n            if decoded{index} < 0:\n                return decoded{index}.\n            return HttpWriteTextResponse(client, i64(200), slice(view(decode), usize(0), usize(decoded{index})), header)."
                 )
                 .expect("write generated route");
             }
@@ -122,13 +123,14 @@ pub(crate) fn lower(file: &SalFile) -> Result<Option<String>, Vec<Diagnostic>> {
                 let body = literal(body);
                 writeln!(
                     source,
-                    "        if RouteMatch(bytes({pattern}), path):\n            return HttpWriteTextResponse(client, i64(200), bytes({body}), header, usize(512))."
+                    "        if RouteMatch(bytes({pattern}), path):\n            return HttpWriteTextResponse(client, i64(200), bytes({body}), header)."
                 )
                 .expect("write generated route");
             }
         }
     }
-    source.push_str("        return HttpWriteTextResponse(client, i64(404), bytes(\"\"), header, usize(512)).\n");
+    source
+        .push_str("        return HttpWriteTextResponse(client, i64(404), bytes(\"\"), header).\n");
     Ok(Some(source))
 }
 

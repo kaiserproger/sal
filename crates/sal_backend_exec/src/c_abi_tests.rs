@@ -49,3 +49,26 @@ fn legacy_console_rejects_new_casts_and_reflection() {
         );
     }
 }
+
+#[test]
+fn legacy_console_rejects_new_text_and_contract_assert_intrinsics() {
+    for expression in ["text(bytes(\"hi\"))", "SalContractAssert(true)"] {
+        let ir = source_ir(&format!(
+            "operation Main:\n  returns Text.\n  body:\n    {expression}.\n    return \"hello\".\n"
+        ));
+        let errors = emit_exec(&ir).unwrap_err();
+        assert!(
+            errors.iter().any(|d| d.code == "B201"),
+            "{expression}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn legacy_unsafe_traverses_and_reports_nested_intrinsics() {
+    let ir = source_ir(
+        "operation Main:\n  returns Text.\n  body:\n    unsafe:\n      usize(1).\n      return \"hello\".\n",
+    );
+    let errors = emit_exec(&ir).unwrap_err();
+    assert!(errors.iter().any(|d| d.code == "B201"), "{errors:?}");
+}

@@ -1,0 +1,473 @@
+use "std/bytes.sal".
+use "std/http_client.sal".
+use "std/postgres.sal".
+use "std/time.sal".
+use "std/linux/io.sal".
+use "std/linux/net.sal".
+use "qa_payloads.sal".
+
+# The one scenario runner of the all-SAL warehouse QA, plus its fixture SQL
+# and reporting steps. A scenario is a QaCall record; every step threads the
+# group cursor `at`: the number of checks passed so far, or -(failing check)
+# once one failed. `requires: at >= 0 otherwise at.` skips every later step,
+# so the first failure wins and is the one reported.
+#
+# Loans (owned by Main, never Buffers): `wire` is [response 2 MiB | header
+# 64 KiB | tail 64 KiB]. QaRun uses the exchange prefix (response+header);
+# QaCount builds its request and marker in the tail; fixture SQL uses the
+# whole wire as PostgreSQL scratch. SystemCall only, no UnsafeMemory.
+
+# One HTTP exchange and its exact expectation: the status, an
+# application/json reply with Content-Length, and
+# the body, compared whole (`exact`) or as a contained fragment.
+entity QaCall:
+    has method of type Bytes.
+    has path of type Bytes.
+    has body of type Bytes.
+    has status of type i64.
+    has reply of type Bytes.
+    has exact of type bool.
+
+operation QaVia:
+    accepts method of type Bytes.
+    accepts path of type Bytes.
+    accepts body of type Bytes.
+    accepts status of type i64.
+    accepts reply of type Bytes.
+    returns QaCall.
+    body:
+        return QaCall(method, path, body, status, reply, true).
+
+operation QaPost:
+    accepts path of type Bytes.
+    accepts body of type Bytes.
+    accepts status of type i64.
+    accepts reply of type Bytes.
+    returns QaCall.
+    body:
+        return QaCall(bytes("POST"), path, body, status, reply, true).
+
+# /stock answers 200 and its listing contains `fragment`.
+operation QaShows:
+    accepts body of type Bytes.
+    accepts fragment of type Bytes.
+    returns QaCall.
+    body:
+        return QaCall(bytes("POST"), bytes("/stock"), body, 200, fragment, false).
+
+# Exact error replies of the application.
+operation QaInvalid:
+    returns Bytes.
+    body:
+        return bytes("{\"error\":{\"code\":\"invalid_request\"}}").
+
+operation QaTooLarge:
+    returns Bytes.
+    body:
+        return bytes("{\"error\":{\"code\":\"request_too_large\"}}").
+
+operation QaNoStock:
+    returns Bytes.
+    body:
+        return bytes("{\"error\":{\"code\":\"insufficient_stock\"}}").
+
+operation QaNoReservation:
+    returns Bytes.
+    body:
+        return bytes("{\"error\":{\"code\":\"insufficient_reservation\"}}").
+
+operation QaNoItem:
+    returns Bytes.
+    body:
+        return bytes("{\"error\":{\"code\":\"item_not_found\"}}").
+
+operation QaNoWarehouse:
+    returns Bytes.
+    body:
+        return bytes("{\"error\":{\"code\":\"warehouse_not_found\"}}").
+
+# ---------------------------------------------------------------------------
+# Cursor rules.
+# ---------------------------------------------------------------------------
+
+operation QaNext:
+    accepts at of type i64.
+    accepts holds of type bool.
+    returns i64.
+    requires:
+        holds otherwise 0 - at - 1.
+    body:
+        return at + 1.
+
+operation QaExchangeBytes:
+    returns usize.
+    body:
+        return usize(2162688).
+
+operation QaWireBytes:
+    returns usize.
+    body:
+        return usize(2228224).
+
+# Reply framing: the header section
+# (up to the first blank line) names application/json and a Content-Length.
+operation QaFramedJson:
+    accepts head of type Bytes.
+    returns bool.
+    requires:
+        BytesFind(head, bytes("\r\n\r\n")) > 0 otherwise false.
+    body:
+        let fields = slice(head, usize(0), usize(BytesFind(head, bytes("\r\n\r\n")) + 2)).
+        let typed = BytesFind(fields, bytes("\r\nContent-Type: application/json\r\n")) >= 0.
+        let sized = BytesFind(fields, bytes("\r\nContent-Length: ")) >= 0.
+        borrow_end(fields).
+        return typed && sized.
+
+operation QaHolds:
+    accepts call of type QaCall.
+    accepts status of type i64.
+    accepts framed of type bool.
+    accepts body of type Bytes.
+    returns bool.
+    requires:
+        status == call.status otherwise false.
+        framed otherwise false.
+        !call.exact otherwise body == call.reply.
+    body:
+        return BytesFind(body, call.reply) >= 0.
+
+# ---------------------------------------------------------------------------
+# Reporting. Failures go to stderr, verdicts to stdout.
+# ---------------------------------------------------------------------------
+
+operation QaClip:
+    accepts value of type Bytes.
+    returns Bytes from value.
+    requires:
+        len(value) > usize(240) otherwise value.
+    body:
+        return slice(value, usize(0), usize(240)).
+
+operation QaWrite:
+    accepts fd of type i64.
+    accepts note of type MutBytes.
+    accepts length of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        length >= 0 otherwise length.
+    body:
+        let written = view(note).
+        let line = slice(written, usize(0), usize(length)).
+        let sent = LinuxWriteAll(fd, line).
+        borrow_end(line).
+        borrow_end(written).
+        return sent.
+
+# `  check <n>: <what> <detail> -> <got> want <want> <evidence>` on stderr
+# when a check does not hold.
+operation QaExplain:
+    accepts holds of type bool.
+    accepts check of type i64.
+    accepts what of type Bytes.
+    accepts detail of type Bytes.
+    accepts got of type i64.
+    accepts want of type i64.
+    accepts evidence of type Bytes.
+    accepts note of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        !holds otherwise 0.
+    body:
+        let mut at = BytesAppend(note, 0, bytes("  check ")).
+        set at = BytesDecimalAt(note, at, check).
+        set at = BytesAppend(note, at, bytes(": ")).
+        set at = BytesAppend(note, at, what).
+        set at = BytesAppend(note, at, bytes(" ")).
+        set at = BytesAppend(note, at, QaClip(detail)).
+        set at = BytesAppend(note, at, bytes(" -> ")).
+        set at = BytesDecimalAt(note, at, got).
+        set at = BytesAppend(note, at, bytes(" want ")).
+        set at = BytesDecimalAt(note, at, want).
+        set at = BytesAppend(note, at, bytes(" ")).
+        set at = BytesAppend(note, at, QaClip(evidence)).
+        set at = BytesAppend(note, at, bytes("\n")).
+        return QaWrite(2, note, at).
+
+operation QaVerdictWord:
+    accepts at of type i64.
+    returns Bytes.
+    requires:
+        at >= 0 otherwise bytes("FAIL ").
+    body:
+        return bytes("PASS ").
+
+operation QaVerdictUnit:
+    accepts at of type i64.
+    returns Bytes.
+    requires:
+        at >= 0 otherwise bytes(" failed check ").
+    body:
+        return bytes(" checks ").
+
+operation QaVerdictCount:
+    accepts at of type i64.
+    returns i64.
+    requires:
+        at >= 0 otherwise 0 - at.
+    body:
+        return at.
+
+operation QaVerdictStream:
+    accepts at of type i64.
+    returns i64.
+    requires:
+        at >= 0 otherwise 2.
+    body:
+        return 1.
+
+operation QaVerdictFailures:
+    accepts at of type i64.
+    accepts printed of type i64.
+    returns i64.
+    requires:
+        at >= 0 otherwise 1.
+        printed >= 0 otherwise 1.
+    body:
+        return 0.
+
+# `PASS <group> checks <n>` or `FAIL <group> failed check <n>`; 0 or 1.
+operation QaReport:
+    accepts group of type Bytes.
+    accepts at of type i64.
+    accepts note of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut line = BytesAppend(note, 0, QaVerdictWord(at)).
+        set line = BytesAppend(note, line, group).
+        set line = BytesAppend(note, line, QaVerdictUnit(at)).
+        set line = BytesDecimalAt(note, line, QaVerdictCount(at)).
+        set line = BytesAppend(note, line, bytes("\n")).
+        return QaVerdictFailures(at, QaWrite(QaVerdictStream(at), note, line)).
+
+# ---------------------------------------------------------------------------
+# The runner.
+# ---------------------------------------------------------------------------
+
+operation QaRun:
+    accepts at of type i64.
+    accepts wire of type MutBytes.
+    accepts call of type QaCall.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        at >= 0 otherwise at.
+        len(wire) >= QaExchangeBytes().
+    body:
+        let response = slice_mut(wire, usize(0), usize(2097152)).
+        let header = slice_mut(wire, usize(2097152), usize(65536)).
+        let reply = HttpClientRequest(u64(2130706433), i64(8080), call.method, call.path, call.body, response, header).
+        let head = view(header).
+        let framed = QaFramedJson(head).
+        borrow_end(head).
+        let received = view(response).
+        let body = slice(received, reply.body_offset, reply.body_length).
+        let holds = QaHolds(call, reply.status, framed, body).
+        QaExplain(holds, at + 1, call.method, call.path, reply.status, call.status, body, header).
+        borrow_end(body).
+        borrow_end(received).
+        borrow_end(response).
+        borrow_end(header).
+        return QaNext(at, holds).
+
+# Exact counts: the /stock row of `code` in `warehouse` reads
+# exactly quantity, reserved and available_quantity = quantity - reserved.
+operation QaCount:
+    accepts at of type i64.
+    accepts wire of type MutBytes.
+    accepts warehouse of type i64.
+    accepts code of type Bytes.
+    accepts quantity of type i64.
+    accepts reserved of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        at >= 0 otherwise at.
+        len(wire) >= QaWireBytes().
+    body:
+        let exchange = slice_mut(wire, usize(0), QaExchangeBytes()).
+        let asked = QaStockBody(slice_mut(wire, QaExchangeBytes(), usize(64)), warehouse).
+        let marker = QaCountMarker(slice_mut(wire, QaExchangeBytes() + usize(64), usize(4096)), code, quantity, reserved).
+        let checked = QaRun(at, exchange, QaShows(asked, marker)).
+        borrow_end(marker).
+        borrow_end(asked).
+        borrow_end(exchange).
+        return checked.
+
+# ---------------------------------------------------------------------------
+# Fixture SQL on the suite's own connection to the unique QA database.
+# Runtime values travel as Bind parameters, never interpolated, and every
+# message is one statement (the extended protocol rejects multi-statement
+# strings).
+# ---------------------------------------------------------------------------
+
+operation QaPgLogin:
+    accepts fd of type i64.
+    accepts timed of type i64.
+    accepts scratch of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        timed >= 0 otherwise timed.
+    body:
+        return PgStartup(fd, bytes("warehouse"), bytes("warehouse"), scratch).
+
+operation QaPgSession:
+    accepts fd of type i64.
+    accepts scratch of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        fd >= 0 otherwise fd.
+    body:
+        return QaPgLogin(fd, LinuxSocketTimeouts(fd, i64(10)), scratch).
+
+# Connected session fd (the shared /run/postgresql volume), or a negative
+# error with the socket already closed.
+operation QaPgConnect:
+    accepts scratch of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let fd = LinuxUnixConnect(bytes("/run/postgresql/.s.PGSQL.5432"), scratch).
+        return LinuxCloseOnFailure(fd, QaPgSession(fd, scratch)).
+
+operation QaPgSettle:
+    accepts fd of type i64.
+    accepts sent of type i64.
+    accepts scratch of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        sent >= 0 otherwise sent.
+    body:
+        return PgDrain(fd, scratch).
+
+operation QaSqlBound:
+    accepts at of type i64.
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    accepts sql of type Bytes.
+    accepts count of type i64.
+    accepts parameters of type Bytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        at >= 0 otherwise at.
+    body:
+        let status = QaPgSettle(fd, PgSendQuery(fd, sql, count, parameters, wire), wire).
+        QaExplain(status == 0, at + 1, bytes("SQL"), sql, status, 0, bytes(""), wire).
+        return QaNext(at, status == 0).
+
+operation QaSql:
+    accepts at of type i64.
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    accepts sql of type Bytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        return QaSqlBound(at, fd, wire, sql, 0, bytes("")).
+
+# Per-group fixture reset, plus removal of warehouses >= 100 so the empty-warehouse
+# probe never leaks between groups.
+operation QaReset:
+    accepts at of type i64.
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut step = QaSql(at, fd, wire, bytes("UPDATE warehouses SET name=CASE id WHEN 1 THEN 'Central warehouse' WHEN 2 THEN 'Outlet warehouse' ELSE 'Closed warehouse' END, available=(id<>3)")).
+        set step = QaSql(step, fd, wire, bytes("DELETE FROM inventory WHERE item_id>=100")).
+        set step = QaSql(step, fd, wire, bytes("DELETE FROM items WHERE id>=100")).
+        set step = QaSql(step, fd, wire, bytes("DELETE FROM warehouses WHERE id>=100")).
+        return QaSql(step, fd, wire, bytes("UPDATE inventory SET reserved=0, quantity=CASE WHEN warehouse_id=1 AND item_id=1 THEN 10 WHEN warehouse_id=1 AND item_id=2 THEN 5 WHEN warehouse_id=1 AND item_id=3 THEN 0 WHEN warehouse_id=1 AND item_id=4 THEN 7 WHEN warehouse_id=2 AND item_id=1 THEN 3 WHEN warehouse_id=2 AND item_id=2 THEN 2 ELSE 4 END")).
+
+# ---------------------------------------------------------------------------
+# Readiness: a real /stock query, never a mutation
+# replay, until 200; at most 150 attempts 50 ms apart. Refused/in-progress
+# connects and non-200 replies mean "still starting"; any other transport
+# failure is final.
+# ---------------------------------------------------------------------------
+
+operation QaStarting:
+    accepts status of type i64.
+    accepts attempt of type i64.
+    returns bool.
+    requires:
+        status != 200 otherwise false.
+        attempt < 150 otherwise false.
+    body:
+        return status >= 0 || status == -111 || status == -115.
+
+operation QaPause:
+    accepts attempt of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        attempt > 0 otherwise 0.
+    body:
+        return TimeSleep(TimeSpan(i64(0), i64(50000000))).
+
+operation QaStockStatus:
+    accepts paused of type i64.
+    accepts wire of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        paused >= 0 otherwise paused.
+    body:
+        let response = slice_mut(wire, usize(0), usize(2097152)).
+        let header = slice_mut(wire, usize(2097152), usize(65536)).
+        let reply = HttpClientRequest(u64(2130706433), i64(8080), bytes("POST"), bytes("/stock"), bytes("{\"warehouse_id\":1}"), response, header).
+        borrow_end(response).
+        borrow_end(header).
+        return reply.status.
+
+operation QaAwaitApp:
+    accepts at of type i64.
+    accepts wire of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        at >= 0 otherwise at.
+    body:
+        let mut status = 0.
+        let mut attempt = 0.
+        while QaStarting(status, attempt):
+            set status = QaStockStatus(QaPause(attempt), wire).
+            set attempt = attempt + 1.
+        QaExplain(status == 200, at + 1, bytes("readiness"), bytes("POST /stock"), status, 200, bytes(""), wire).
+        return QaNext(at, status == 200).
+
+operation QaConnected:
+    accepts at of type i64.
+    accepts fd of type i64.
+    accepts note of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        QaExplain(fd >= 0, at + 1, bytes("readiness"), bytes("PostgreSQL session"), fd, 0, bytes(""), note).
+        return QaNext(at, fd >= 0).
+
+operation QaClose:
+    accepts fd of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        fd >= 0 otherwise fd.
+    body:
+        return LinuxClose(fd).

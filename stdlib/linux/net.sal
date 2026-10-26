@@ -1,3 +1,10 @@
+# Linux x86-64: syscall results preserve negative errno values.
+# Safe checked surface: endpoints are Bytes views, scratch is a MutBytes loan.
+# Raw addresses exist only inside audited narrow unsafe blocks at the OS
+# boundary; public effects are SystemCall, except LinuxIpv4Address which is
+# pure address formatting into a caller loan. The caller owns fd lifetime and
+# closes established fds itself; connect helpers close only a socket they just
+# created when connect fails.
 use "io.sal".
 
 entity LinuxTimeval:
@@ -5,126 +12,211 @@ entity LinuxTimeval:
     has seconds of type i64.
     has microseconds of type i64.
 
-# Zero disables timeouts. The kernel borrows a fixed local C-layout timeval.
+# setsockopt(SOL_SOCKET, option) with a timeval of `seconds`; a negative
+# cursor propagates. The kernel borrows a fixed local C-layout timeval.
+operation LinuxSocketTimeout:
+    accepts fd of type i64.
+    accepts option of type i64.
+    accepts seconds of type i64.
+    accepts status of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        status >= 0 otherwise status.
+    body:
+        let value = LinuxTimeval(seconds, i64(0)).
+        let mut received = 0.
+        unsafe:
+            set received = syscall(54, fd, 1, option, address(value), size_of(LinuxTimeval), 0).
+        return received.
+
+# Zero disables timeouts: SO_RCVTIMEO (20) then SO_SNDTIMEO (21).
 operation LinuxSocketTimeouts:
     accepts fd of type i64.
     accepts seconds of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    requires:
+        seconds >= 0 otherwise -22.
+    effects: SystemCall.
     body:
-        if seconds < 0:
-            return -22.
-        let value = LinuxTimeval(seconds, i64(0)).
-        let received = syscall(54, fd, 1, 20, address(value), size_of(LinuxTimeval), 0).
-        if received < 0:
-            return received.
-        return syscall(54, fd, 1, 21, address(value), size_of(LinuxTimeval), 0).
+        return LinuxSocketTimeout(fd, 21, seconds, LinuxSocketTimeout(fd, 20, seconds, 0)).
 
-# Linux x86-64 sockaddr_in: caller supplies 16 writable bytes.
+# Big-endian write of the low `width` bytes of `value` at offset; the
+# caller has checked the span is long enough.
+operation LinuxPutBigEndian:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type u64.
+    accepts width of type usize.
+    returns usize.
+    body:
+        let mut rest = value.
+        let mut index = width.
+        while index > 0:
+            set index = index - 1.
+            put(span, offset + index, u8(rest % u64(256))).
+            set rest = rest / u64(256).
+        return width.
+
+# Linux x86-64 sockaddr_in into a caller MutBytes loan (needs 16 bytes).
 # IPv4 is the network-order numeric address (127.0.0.1 = 2130706433).
+# Layout: family AF_INET as little-endian u16 (02 00), port and address
+# big-endian, then 8 zero bytes.
 operation LinuxIpv4Address:
-    accepts buffer of type usize.
+    accepts endpoint of type MutBytes.
     accepts ipv4 of type u64.
     accepts port of type i64.
     returns i64.
-    effects: UnsafeMemory.
+    requires:
+        ipv4 <= 4294967295 otherwise -22.
+        port >= 0 && port <= 65535 otherwise -22.
+        len(endpoint) >= usize(16) otherwise -28.
     body:
-        if ipv4 > 4294967295:
-            return -22.
-        if port < 0:
-            return -22.
-        if port > 65535:
-            return -22.
-        let mut index = usize(0).
-        while index < 16:
-            store8(buffer + index, u8(0)).
-            set index = index + 1.
-        store8(buffer, u8(2)).
-        store8(buffer + 2, u8(port / 256)).
-        store8(buffer + 3, u8(port % 256)).
-        store8(buffer + 4, u8(ipv4 / 16777216)).
-        store8(buffer + 5, u8(ipv4 / 65536 % 256)).
-        store8(buffer + 6, u8(ipv4 / 256 % 256)).
-        store8(buffer + 7, u8(ipv4 % 256)).
+        LinuxPutBigEndian(endpoint, usize(0), u64(512), usize(2)).
+        LinuxPutBigEndian(endpoint, usize(2), u64(port), usize(2)).
+        LinuxPutBigEndian(endpoint, usize(4), ipv4, usize(4)).
+        LinuxPutBigEndian(endpoint, usize(8), u64(0), usize(8)).
         return 0.
 
-# endpoint points to sockaddr_in; reuse_value points to a native int of value 1.
-# The caller retains both buffers; no per-listener heap allocation is required.
+# setsockopt(SO_REUSEADDR, 1) on a new listener; a negative cursor propagates.
+# The flag cell is internal and lends only its first four bytes.
+operation LinuxReuseAddress:
+    accepts fd of type i64.
+    accepts status of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        status >= 0 otherwise status.
+    body:
+        let cell = LinuxReuseValue(1).
+        let mut option = 0.
+        unsafe:
+            set option = syscall(54, fd, 1, 2, address(cell), 4, 0).
+        return option.
+
+# bind(2) of a validated 16-byte sockaddr view; a negative cursor propagates.
+operation LinuxBind:
+    accepts fd of type i64.
+    accepts endpoint of type Bytes.
+    accepts status of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        status >= 0 otherwise status.
+    body:
+        let mut bound = 0.
+        unsafe:
+            set bound = syscall(49, fd, address(endpoint), 16, 0, 0, 0).
+        return bound.
+
+# listen(2); a negative cursor propagates.
+operation LinuxListen:
+    accepts fd of type i64.
+    accepts backlog of type i64.
+    accepts status of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        status >= 0 otherwise status.
+    body:
+        let mut listening = 0.
+        unsafe:
+            set listening = syscall(50, fd, backlog, 0, 0, 0, 0).
+        return listening.
+
+# endpoint is a validated sockaddr_in view; reuse flag is internal, no caller
+# buffer retained. No per-listener heap allocation is required. Any failed
+# setup step closes the socket it just created.
 operation LinuxTcpListen:
-    accepts endpoint of type usize.
-    accepts reuse_value of type usize.
+    accepts endpoint of type Bytes.
     accepts backlog of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    requires:
+        len(endpoint) >= usize(16) otherwise -22.
+    effects: SystemCall.
     body:
-        let listener = syscall(41, 2, 1, 0, 0, 0, 0).
-        if listener < 0:
-            return listener.
-        let option = syscall(54, listener, 1, 2, reuse_value, 4, 0).
-        if option < 0:
-            LinuxClose(listener).
-            return option.
-        let bound = syscall(49, listener, endpoint, 16, 0, 0, 0).
-        if bound < 0:
-            LinuxClose(listener).
-            return bound.
-        let listening = syscall(50, listener, backlog, 0, 0, 0, 0).
-        if listening < 0:
-            LinuxClose(listener).
-            return listening.
-        return listener.
+        let listener = LinuxSocketCreate(0, 2, 1).
+        let mut code = LinuxReuseAddress(listener, listener).
+        set code = LinuxBind(listener, endpoint, code).
+        set code = LinuxListen(listener, backlog, code).
+        return LinuxCloseOnFailure(listener, code).
+
+# Internal SO_REUSEADDR flag cell. Little-endian i64 value 1 presents 01 00
+# 00 00 in its first four bytes, exactly the kernel int 1; only four bytes
+# are lent to the kernel and no caller buffer is retained.
+entity LinuxReuseValue:
+    layout "C".
+    has flag of type i64.
 
 operation LinuxTcpAccept:
     accepts listener of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mut client = syscall(43, listener, 0, 0, 0, 0, 0).
+        let mut client = -4.
         while client == -4:
-            set client = syscall(43, listener, 0, 0, 0, 0, 0).
+            unsafe:
+                set client = syscall(43, listener, 0, 0, 0, 0, 0).
         return client.
 
-operation LinuxTcpConnect:
-    accepts endpoint of type usize.
+# connect(2) with an explicit sockaddr length; a negative cursor propagates.
+operation LinuxConnect:
+    accepts fd of type i64.
+    accepts endpoint of type Bytes.
+    accepts length of type usize.
+    accepts status of type i64.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
+    requires:
+        status >= 0 otherwise status.
     body:
-        let connection = syscall(41, 2, 1, 0, 0, 0, 0).
-        if connection < 0:
-            return connection.
-        let connected = syscall(42, connection, endpoint, 16, 0, 0, 0).
-        if connected < 0:
-            LinuxClose(connection).
-            return connected.
-        return connection.
+        let mut connected = 0.
+        unsafe:
+            set connected = syscall(42, fd, address(endpoint), length, 0, 0, 0).
+        return connected.
 
-# Filesystem Unix socket; caller supplies 110 writable sockaddr_un bytes.
-# Empty, embedded-NUL and overlong paths fail before socket creation.
+operation LinuxTcpConnect:
+    accepts endpoint of type Bytes.
+    returns i64.
+    requires:
+        len(endpoint) >= usize(16) otherwise -22.
+    effects: SystemCall.
+    body:
+        let connection = LinuxSocketCreate(0, 2, 1).
+        return LinuxCloseOnFailure(connection, LinuxConnect(connection, endpoint, usize(16), connection)).
+
+# True when no byte of path is NUL.
+operation LinuxPathNulFree:
+    accepts path of type Bytes.
+    returns bool.
+    body:
+        let mut index = usize(0).
+        while index < len(path) && byte(path, index) != 0:
+            set index = index + 1.
+        return index == len(path).
+
+# Filesystem Unix socket; path is validated data, scratch is a MutBytes loan
+# holding the 110-byte sockaddr_un. Empty, embedded-NUL and overlong paths
+# fail before socket creation (and before scratch is written).
 operation LinuxUnixConnect:
     accepts path of type Bytes.
-    accepts scratch of type usize.
+    accepts scratch of type MutBytes.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    requires:
+        len(path) > 0 otherwise -22.
+        len(path) <= 107 otherwise -36.
+        len(scratch) >= len(path) + 3 otherwise -28.
+        LinuxPathNulFree(path) otherwise -22.
+    effects: SystemCall.
     body:
-        if len(path) == 0:
-            return -22.
-        if len(path) > 107:
-            return -36.
-        store8(scratch, u8(1)).
-        store8(scratch + 1, u8(0)).
+        put(scratch, usize(0), u8(1)).
+        put(scratch, usize(1), u8(0)).
         let mut index = usize(0).
         while index < len(path):
-            let value = byte(path, index).
-            if value == 0:
-                return -22.
-            store8(scratch + 2 + index, value).
+            put(scratch, usize(2) + index, byte(path, index)).
             set index = index + 1.
-        store8(scratch + 2 + index, u8(0)).
-        let connection = syscall(41, 1, 1, 0, 0, 0, 0).
-        if connection < 0:
-            return connection.
-        let connected = syscall(42, connection, scratch, len(path) + 3, 0, 0, 0).
-        if connected < 0:
-            LinuxClose(connection).
-            return connected.
-        return connection.
+        put(scratch, usize(2) + index, u8(0)).
+        let view = view(scratch).
+        let frame = slice(view, usize(0), len(path) + 3).
+        let connection = LinuxSocketCreate(0, 1, 1).
+        return LinuxCloseOnFailure(connection, LinuxConnect(connection, frame, len(path) + 3, connection)).

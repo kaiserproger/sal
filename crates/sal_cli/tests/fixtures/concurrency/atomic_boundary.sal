@@ -1,4 +1,18 @@
 use "std/linux/memory.sal".
+
+# First failure wins: keeps an earlier failure, else reports `code` when the
+# check does not hold.
+operation Expect:
+    accepts failure of type i64.
+    accepts code of type i64.
+    accepts holds of type bool.
+    returns i64.
+    requires:
+        failure == 0 otherwise failure.
+        holds otherwise code.
+    body:
+        return 0.
+
 operation Main:
     returns i64.
     effects: SystemCall, UnsafeMemory.
@@ -9,27 +23,12 @@ operation Main:
         let buf = usize(mapping).
         let mut failure = 0.
         store64(buf, usize(123456789)).
-        if load64(buf) != usize(123456789):
-            if failure == 0:
-                set failure = 2.
+        set failure = Expect(failure, 2, load64(buf) == usize(123456789)).
         atomic_store(buf, u32(7)).
-        if atomic_load(buf) != u32(7):
-            if failure == 0:
-                set failure = 3.
-        if atomic_cas(buf, u32(7), u32(8)) != u32(7):
-            if failure == 0:
-                set failure = 4.
-        if atomic_load(buf) != u32(8):
-            if failure == 0:
-                set failure = 5.
-        if atomic_cas(buf, u32(7), u32(9)) != u32(8):
-            if failure == 0:
-                set failure = 6.
-        if atomic_load(buf) != u32(8):
-            if failure == 0:
-                set failure = 7.
-        let unmapped = LinuxUnmapMemory(buf, usize(4096)).
-        if unmapped != 0:
-            if failure == 0:
-                set failure = 8.
+        set failure = Expect(failure, 3, atomic_load(buf) == u32(7)).
+        set failure = Expect(failure, 4, atomic_cas(buf, u32(7), u32(8)) == u32(7)).
+        set failure = Expect(failure, 5, atomic_load(buf) == u32(8)).
+        set failure = Expect(failure, 6, atomic_cas(buf, u32(7), u32(9)) == u32(8)).
+        set failure = Expect(failure, 7, atomic_load(buf) == u32(8)).
+        set failure = Expect(failure, 8, LinuxUnmapMemory(buf, usize(4096)) == 0).
         return failure.

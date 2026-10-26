@@ -1,0 +1,257 @@
+use "std/binary.sal".
+use "std/bytes.sal".
+
+# Executable SAL fixture for stdlib/binary.sal: fixed big/little-endian
+# roundtrips, Minecraft signed VarInt/VarLong boundaries (0, 127, 128,
+# signed MIN/MAX, -1), bad fifth/tenth continuation and payload forms,
+# accepted bounded non-minimal encodings with exact consumed and a
+# following sentinel byte, every truncation length, write capacity edges
+# with unchanged-on-failure, ZigZag helpers, and externally supplied byte
+# vectors staged from hex text into a second safe Buffer. Returns 0 when
+# every check holds, otherwise the first failing check number. Asserts only
+# observable results, byte counts and span contents, never source text or
+# wiring. No raw addresses: only Buffer/MutBytes/Bytes and std/binary.
+
+# Keeps the first failing check number: a check that already failed stays
+# recorded, otherwise the new code is recorded exactly when `failed` holds.
+operation FirstFailure:
+    accepts current of type i64.
+    accepts failed of type bool.
+    accepts code of type i64.
+    returns i64.
+    requires:
+        current == 0 otherwise current.
+        failed == false otherwise code.
+    body:
+        return 0.
+
+# Decode hex text ("ffffffff0f") into the front of `stage`; returns the byte
+# count (0 on odd length or overflow of the stage).
+operation StageHex:
+    accepts stage of type MutBytes.
+    accepts hex of type Bytes.
+    returns usize.
+    requires:
+        len(hex) % usize(2) == usize(0) otherwise usize(0).
+        len(hex) / usize(2) <= len(stage) otherwise usize(0).
+    body:
+        let count = len(hex) / usize(2).
+        let mut index = usize(0).
+        while index < count:
+            let high = BytesHexDigit(byte(hex, index * usize(2))).
+            let low = BytesHexDigit(byte(hex, index * usize(2) + usize(1))).
+            put(stage, index, u8(high * 16 + low)).
+            set index = index + usize(1).
+        return count.
+
+# The first `count` staged bytes as a read-only span rooted in `stage`.
+operation Staged:
+    accepts stage of type MutBytes.
+    accepts count of type usize.
+    returns Bytes from stage.
+    requires:
+        count <= len(stage) otherwise bytes("").
+    body:
+        return slice(view(stage), usize(0), count).
+
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        let negOneBits = -1.
+        let buf = buffer(usize(32)).
+        let span = borrow_mut(buf, usize(0), usize(32)).
+        set failure = FirstFailure(failure, BinaryWriteU16Be(span, usize(0), 4660) != 2, 1).
+        let readU16Be = BinaryReadU16Be(view(span), usize(0)).
+        set failure = FirstFailure(failure, readU16Be.status != 0 || readU16Be.value != 4660 || readU16Be.consumed != usize(2), 2).
+        set failure = FirstFailure(failure, byte(view(span), usize(0)) != 18 || byte(view(span), usize(1)) != 52, 3).
+        set failure = FirstFailure(failure, BinaryWriteU16Le(span, usize(0), 4660) != 2, 4).
+        let readU16Le = BinaryReadU16Le(view(span), usize(0)).
+        set failure = FirstFailure(failure, readU16Le.status != 0 || readU16Le.value != 4660 || readU16Le.consumed != usize(2), 5).
+        set failure = FirstFailure(failure, byte(view(span), usize(0)) != 52 || byte(view(span), usize(1)) != 18, 6).
+        set failure = FirstFailure(failure, BinaryWriteI16Be(span, usize(0), -1) != 2, 7).
+        let readI16Be = BinaryReadI16Be(view(span), usize(0)).
+        set failure = FirstFailure(failure, readI16Be.status != 0 || readI16Be.value != -1, 8).
+        set failure = FirstFailure(failure, byte(view(span), usize(0)) != 255 || byte(view(span), usize(1)) != 255, 9).
+        set failure = FirstFailure(failure, BinaryWriteI16Le(span, usize(0), 0 - 32767 - 1) != 2, 10).
+        let readI16Le = BinaryReadI16Le(view(span), usize(0)).
+        set failure = FirstFailure(failure, readI16Le.status != 0 || readI16Le.value != 0 - 32767 - 1, 11).
+        set failure = FirstFailure(failure, BinaryWriteI16Be(span, usize(0), 32767) != 2, 12).
+        set failure = FirstFailure(failure, BinaryReadI16Be(view(span), usize(0)).value != 32767, 13).
+        set failure = FirstFailure(failure, BinaryWriteU16Be(span, usize(0), 65536) != -22, 14).
+        set failure = FirstFailure(failure, BinaryWriteU16Be(span, usize(0), -1) != -22, 15).
+        set failure = FirstFailure(failure, BinaryWriteI16Be(span, usize(0), 32768) != -22, 16).
+        set failure = FirstFailure(failure, BinaryReadU16Be(slice(view(span), usize(0), usize(1)), usize(0)).status != -22, 17).
+        set failure = FirstFailure(failure, BinaryReadU16Be(view(span), usize(33)).status != -22, 18).
+        set failure = FirstFailure(failure, BinaryReadI16Le(view(span), usize(31)).status != -22, 19).
+        set failure = FirstFailure(failure, BinaryWriteU32Be(span, usize(0), 4294967295) != 4, 20).
+        let readU32Be = BinaryReadU32Be(view(span), usize(0)).
+        set failure = FirstFailure(failure, readU32Be.status != 0 || readU32Be.value != 4294967295 || readU32Be.consumed != usize(4), 21).
+        set failure = FirstFailure(failure, byte(view(span), usize(0)) != 255 || byte(view(span), usize(1)) != 255 || byte(view(span), usize(2)) != 255 || byte(view(span), usize(3)) != 255, 22).
+        set failure = FirstFailure(failure, BinaryWriteU32Le(span, usize(0), 4294967295) != 4, 23).
+        set failure = FirstFailure(failure, BinaryReadU32Le(view(span), usize(0)).value != 4294967295, 24).
+        set failure = FirstFailure(failure, BinaryWriteI32Be(span, usize(0), 0 - 2147483647 - 1) != 4, 25).
+        let readI32Min = BinaryReadI32Be(view(span), usize(0)).
+        set failure = FirstFailure(failure, readI32Min.status != 0 || readI32Min.value != 0 - 2147483647 - 1, 26).
+        set failure = FirstFailure(failure, byte(view(span), usize(0)) != 128 || byte(view(span), usize(1)) != 0 || byte(view(span), usize(2)) != 0 || byte(view(span), usize(3)) != 0, 27).
+        set failure = FirstFailure(failure, BinaryWriteI32Le(span, usize(0), 2147483647) != 4, 28).
+        set failure = FirstFailure(failure, BinaryReadI32Le(view(span), usize(0)).value != 2147483647, 29).
+        set failure = FirstFailure(failure, BinaryWriteI32Be(span, usize(0), 2147483648) != -22, 30).
+        set failure = FirstFailure(failure, BinaryWriteU32Be(span, usize(0), 4294967296) != -22, 31).
+        set failure = FirstFailure(failure, BinaryReadU32Be(slice(view(span), usize(0), usize(3)), usize(0)).status != -22, 32).
+        set failure = FirstFailure(failure, BinaryReadI32Le(view(span), usize(29)).status != -22, 33).
+        let i64min = 0 - 9223372036854775807 - 1.
+        set failure = FirstFailure(failure, BinaryWriteI64Be(span, usize(0), i64min) != 8, 34).
+        let readI64Min = BinaryReadI64Be(view(span), usize(0)).
+        set failure = FirstFailure(failure, readI64Min.status != 0 || readI64Min.value != i64min || readI64Min.consumed != usize(8), 35).
+        set failure = FirstFailure(failure, byte(view(span), usize(0)) != 128, 36).
+        set failure = FirstFailure(failure, BinaryWriteI64Le(span, usize(0), 9223372036854775807) != 8, 37).
+        set failure = FirstFailure(failure, BinaryReadI64Le(view(span), usize(0)).value != 9223372036854775807, 38).
+        set failure = FirstFailure(failure, BinaryWriteI64Le(span, usize(0), -1) != 8, 39).
+        let readNegOne = BinaryReadI64Be(view(span), usize(0)).
+        set failure = FirstFailure(failure, readNegOne.status != 0 || readNegOne.value != -1, 40).
+        set failure = FirstFailure(failure, byte(view(span), usize(0)) != 255 || byte(view(span), usize(7)) != 255, 41).
+        let maxU64 = bits_as(u64, negOneBits).
+        set failure = FirstFailure(failure, BinaryWriteU64Be(span, usize(0), maxU64) != 8, 42).
+        let readU64Max = BinaryReadU64Be(view(span), usize(0)).
+        set failure = FirstFailure(failure, readU64Max.status != 0 || readU64Max.value != maxU64 || readU64Max.consumed != usize(8), 43).
+        set failure = FirstFailure(failure, BinaryWriteU64Le(span, usize(0), maxU64) != 8, 44).
+        set failure = FirstFailure(failure, BinaryReadU64Le(view(span), usize(0)).value != maxU64, 45).
+        set failure = FirstFailure(failure, BinaryWriteU64Be(span, usize(0), u64(123456789)) != 8, 46).
+        set failure = FirstFailure(failure, BinaryReadU64Be(view(span), usize(0)).value != u64(123456789), 47).
+        set failure = FirstFailure(failure, BinaryReadI64Be(slice(view(span), usize(0), usize(7)), usize(0)).status != -22, 48).
+        set failure = FirstFailure(failure, BinaryReadU64Le(view(span), usize(25)).status != -22, 49).
+        set failure = FirstFailure(failure, BinaryWriteI64Be(span, usize(25), 0) != -28, 50).
+        set failure = FirstFailure(failure, BinaryWriteU64Be(span, usize(33), maxU64) != -22, 51).
+        set failure = FirstFailure(failure, BinaryVarIntLength(0) != 1, 52).
+        set failure = FirstFailure(failure, BinaryVarIntLength(127) != 1, 53).
+        set failure = FirstFailure(failure, BinaryVarIntLength(128) != 2, 54).
+        set failure = FirstFailure(failure, BinaryVarIntLength(2147483647) != 5, 55).
+        set failure = FirstFailure(failure, BinaryVarIntLength(0 - 2147483647 - 1) != 5, 56).
+        set failure = FirstFailure(failure, BinaryVarIntLength(-1) != 5, 57).
+        set failure = FirstFailure(failure, BinaryVarIntLength(2147483648) != -22, 58).
+        set failure = FirstFailure(failure, BinaryVarLongLength(0) != 1, 59).
+        set failure = FirstFailure(failure, BinaryVarLongLength(127) != 1, 60).
+        set failure = FirstFailure(failure, BinaryVarLongLength(128) != 2, 61).
+        set failure = FirstFailure(failure, BinaryVarLongLength(9223372036854775807) != 9, 62).
+        set failure = FirstFailure(failure, BinaryVarLongLength(i64min) != 10, 63).
+        set failure = FirstFailure(failure, BinaryVarLongLength(-1) != 10, 64).
+        set failure = FirstFailure(failure, BinaryVarIntWrite(span, usize(0), 0) != 1, 65).
+        let varZero = BinaryVarIntRead(view(span), usize(0)).
+        set failure = FirstFailure(failure, varZero.status != 0 || varZero.value != 0 || varZero.consumed != usize(1), 66).
+        set failure = FirstFailure(failure, BinaryVarIntWrite(span, usize(0), 127) != 1, 67).
+        set failure = FirstFailure(failure, byte(view(span), usize(0)) != 127, 68).
+        set failure = FirstFailure(failure, BinaryVarIntRead(view(span), usize(0)).value != 127, 69).
+        set failure = FirstFailure(failure, BinaryVarIntWrite(span, usize(0), 128) != 2, 70).
+        set failure = FirstFailure(failure, byte(view(span), usize(0)) != 128 || byte(view(span), usize(1)) != 1, 71).
+        let var128 = BinaryVarIntRead(view(span), usize(0)).
+        set failure = FirstFailure(failure, var128.status != 0 || var128.value != 128 || var128.consumed != usize(2), 72).
+        set failure = FirstFailure(failure, BinaryVarIntWrite(span, usize(0), -1) != 5, 73).
+        set failure = FirstFailure(failure, byte(view(span), usize(0)) != 255 || byte(view(span), usize(1)) != 255 || byte(view(span), usize(2)) != 255 || byte(view(span), usize(3)) != 255 || byte(view(span), usize(4)) != 15, 74).
+        set failure = FirstFailure(failure, BinaryVarIntRead(view(span), usize(0)).value != -1, 75).
+        set failure = FirstFailure(failure, BinaryVarIntWrite(span, usize(0), 2147483647) != 5, 76).
+        set failure = FirstFailure(failure, byte(view(span), usize(4)) != 7, 77).
+        set failure = FirstFailure(failure, BinaryVarIntRead(view(span), usize(0)).value != 2147483647, 78).
+        set failure = FirstFailure(failure, BinaryVarIntWrite(span, usize(0), 0 - 2147483647 - 1) != 5, 79).
+        set failure = FirstFailure(failure, byte(view(span), usize(4)) != 8, 80).
+        set failure = FirstFailure(failure, BinaryVarIntRead(view(span), usize(0)).value != 0 - 2147483647 - 1, 81).
+        set failure = FirstFailure(failure, BinaryVarIntWrite(span, usize(0), 2147483648) != -22, 82).
+        set failure = FirstFailure(failure, BinaryVarLongWrite(span, usize(0), 0) != 1, 83).
+        set failure = FirstFailure(failure, BinaryVarLongRead(view(span), usize(0)).value != 0, 84).
+        set failure = FirstFailure(failure, BinaryVarLongWrite(span, usize(0), 128) != 2, 85).
+        set failure = FirstFailure(failure, BinaryVarLongRead(view(span), usize(0)).value != 128, 86).
+        set failure = FirstFailure(failure, BinaryVarLongWrite(span, usize(0), -1) != 10, 87).
+        set failure = FirstFailure(failure, byte(view(span), usize(8)) != 255 || byte(view(span), usize(9)) != 1, 88).
+        set failure = FirstFailure(failure, BinaryVarLongRead(view(span), usize(0)).value != -1, 89).
+        set failure = FirstFailure(failure, BinaryVarLongWrite(span, usize(0), 9223372036854775807) != 9, 90).
+        set failure = FirstFailure(failure, byte(view(span), usize(8)) != 127, 91).
+        set failure = FirstFailure(failure, BinaryVarLongRead(view(span), usize(0)).value != 9223372036854775807, 92).
+        set failure = FirstFailure(failure, BinaryVarLongWrite(span, usize(0), i64min) != 10, 93).
+        set failure = FirstFailure(failure, BinaryVarLongRead(view(span), usize(0)).value != i64min, 94).
+        set failure = FirstFailure(failure, BinaryZigZagEncode32(0) != u32(0), 95).
+        set failure = FirstFailure(failure, BinaryZigZagEncode32(-1) != u32(1), 96).
+        set failure = FirstFailure(failure, BinaryZigZagEncode32(1) != u32(2), 97).
+        set failure = FirstFailure(failure, BinaryZigZagEncode32(-2) != u32(3), 98).
+        set failure = FirstFailure(failure, BinaryZigZagEncode32(2147483647) != u32(4294967294), 99).
+        set failure = FirstFailure(failure, BinaryZigZagDecode32(u32(4294967294)) != 2147483647, 100).
+        set failure = FirstFailure(failure, BinaryZigZagDecode32(u32(4294967295)) != 0 - 2147483647 - 1, 101).
+        set failure = FirstFailure(failure, BinaryZigZagEncode64(0) != u64(0), 102).
+        set failure = FirstFailure(failure, BinaryZigZagEncode64(-1) != u64(1), 103).
+        set failure = FirstFailure(failure, BinaryZigZagEncode64(1) != u64(2), 104).
+        set failure = FirstFailure(failure, BinaryZigZagEncode64(9223372036854775807) != maxU64 - u64(1), 105).
+        set failure = FirstFailure(failure, BinaryZigZagEncode64(i64min) != maxU64, 106).
+        set failure = FirstFailure(failure, BinaryZigZagDecode64(u64(1)) != -1, 107).
+        set failure = FirstFailure(failure, BinaryZigZagDecode64(maxU64) != i64min, 108).
+        let scratch = buffer(usize(16)).
+        let stage = borrow_mut(scratch, usize(0), usize(16)).
+        let mut staged = StageHex(stage, bytes("ffffffff0f")).
+        let extRead = BinaryVarIntRead(Staged(stage, staged), usize(0)).
+        set failure = FirstFailure(failure, extRead.status != 0 || extRead.value != -1 || extRead.consumed != usize(5), 109).
+        set staged = StageHex(stage, bytes("8080808008")).
+        set failure = FirstFailure(failure, BinaryVarIntRead(Staged(stage, staged), usize(0)).value != 0 - 2147483647 - 1, 110).
+        set staged = StageHex(stage, bytes("ffffffff1f")).
+        set failure = FirstFailure(failure, BinaryVarIntRead(Staged(stage, staged), usize(0)).status != -22, 111).
+        set staged = StageHex(stage, bytes("ffffffff8f")).
+        set failure = FirstFailure(failure, BinaryVarIntRead(Staged(stage, staged), usize(0)).status != -22, 112).
+        set staged = StageHex(stage, bytes("8080808080")).
+        set failure = FirstFailure(failure, BinaryVarIntRead(Staged(stage, staged), usize(0)).status != -22, 113).
+        set staged = StageHex(stage, bytes("80004d")).
+        let overlongRead = BinaryVarIntRead(Staged(stage, staged), usize(0)).
+        set failure = FirstFailure(failure, overlongRead.status != 0 || overlongRead.value != 0 || overlongRead.consumed != usize(2), 114).
+        set failure = FirstFailure(failure, byte(Staged(stage, staged), usize(2)) != 77, 115).
+        let overlongOne = BinaryVarIntRead(Staged(stage, staged), usize(1)).
+        set failure = FirstFailure(failure, overlongOne.status != 0 || overlongOne.value != 0 || overlongOne.consumed != usize(1), 116).
+        set staged = StageHex(stage, bytes("80")).
+        set failure = FirstFailure(failure, BinaryVarIntRead(Staged(stage, staged), usize(0)).status != -22, 117).
+        set staged = StageHex(stage, bytes("8080")).
+        set failure = FirstFailure(failure, BinaryVarIntRead(Staged(stage, staged), usize(0)).status != -22, 118).
+        set staged = StageHex(stage, bytes("80808080")).
+        set failure = FirstFailure(failure, BinaryVarIntRead(Staged(stage, staged), usize(0)).status != -22, 119).
+        set failure = FirstFailure(failure, BinaryVarIntRead(Staged(stage, usize(0)), usize(0)).status != -22, 120).
+        set staged = StageHex(stage, bytes("ffffffff0f")).
+        set failure = FirstFailure(failure, BinaryVarIntRead(Staged(stage, staged), usize(5)).status != -22, 121).
+        set failure = FirstFailure(failure, BinaryVarIntRead(Staged(stage, staged), usize(6)).status != -22, 122).
+        set staged = StageHex(stage, bytes("80808080808080808001")).
+        set failure = FirstFailure(failure, BinaryVarLongRead(Staged(stage, staged), usize(0)).value != i64min, 123).
+        set staged = StageHex(stage, bytes("ffffffffffffffffff01")).
+        set failure = FirstFailure(failure, BinaryVarLongRead(Staged(stage, staged), usize(0)).value != -1, 124).
+        set staged = StageHex(stage, bytes("ffffffffffffffffff02")).
+        set failure = FirstFailure(failure, BinaryVarLongRead(Staged(stage, staged), usize(0)).status != -22, 125).
+        set staged = StageHex(stage, bytes("ffffffffffffffffff81")).
+        set failure = FirstFailure(failure, BinaryVarLongRead(Staged(stage, staged), usize(0)).status != -22, 126).
+        set staged = StageHex(stage, bytes("800063")).
+        let overlongLongRead = BinaryVarLongRead(Staged(stage, staged), usize(0)).
+        set failure = FirstFailure(failure, overlongLongRead.status != 0 || overlongLongRead.value != 0 || overlongLongRead.consumed != usize(2), 127).
+        let overlongLongOne = BinaryVarLongRead(Staged(stage, staged), usize(1)).
+        set failure = FirstFailure(failure, overlongLongOne.status != 0 || overlongLongOne.value != 0 || overlongLongOne.consumed != usize(1), 128).
+        set staged = StageHex(stage, bytes("80")).
+        set failure = FirstFailure(failure, BinaryVarLongRead(Staged(stage, staged), usize(0)).status != -22, 129).
+        set staged = StageHex(stage, bytes("ffffffffff")).
+        set failure = FirstFailure(failure, BinaryVarLongRead(Staged(stage, staged), usize(0)).status != -22, 130).
+        set staged = StageHex(stage, bytes("ffffffffffffffffff")).
+        set failure = FirstFailure(failure, BinaryVarLongRead(Staged(stage, staged), usize(0)).status != -22, 131).
+        set staged = StageHex(stage, bytes("1234")).
+        set failure = FirstFailure(failure, BinaryReadU16Be(Staged(stage, staged), usize(0)).value != 4660, 132).
+        set failure = FirstFailure(failure, BinaryReadU16Le(Staged(stage, staged), usize(0)).value != 13330, 133).
+        set staged = StageHex(stage, bytes("ffffffffffffffff")).
+        set failure = FirstFailure(failure, BinaryReadU64Be(Staged(stage, staged), usize(0)).value != maxU64, 134).
+        set failure = FirstFailure(failure, BinaryReadI64Be(Staged(stage, staged), usize(0)).value != -1, 135).
+        borrow_end(stage).
+        buffer_drop(scratch).
+        set failure = FirstFailure(failure, BinaryWriteU32Be(span, usize(28), 0) != 4, 136).
+        set failure = FirstFailure(failure, BinaryWriteU16Be(span, usize(22), 0) != 2, 137).
+        set failure = FirstFailure(failure, BinaryWriteU16Be(span, usize(31), 1) != -28, 138).
+        set failure = FirstFailure(failure, byte(view(span), usize(31)) != 0, 139).
+        set failure = FirstFailure(failure, BinaryVarIntWrite(span, usize(28), -1) != -28, 140).
+        set failure = FirstFailure(failure, byte(view(span), usize(28)) != 0 || byte(view(span), usize(31)) != 0, 141).
+        set failure = FirstFailure(failure, BinaryVarLongWrite(span, usize(23), -1) != -28, 142).
+        set failure = FirstFailure(failure, byte(view(span), usize(23)) != 0, 143).
+        set failure = FirstFailure(failure, BinaryWriteI64Be(span, usize(24), 1) != 8, 144).
+        set failure = FirstFailure(failure, BinaryWriteI64Be(span, usize(25), 1) != -28, 145).
+        set failure = FirstFailure(failure, BinaryReadI64Be(view(span), usize(24)).value != 1, 146).
+        set failure = FirstFailure(failure, BinaryVarIntWrite(span, usize(27), 0) != 1, 147).
+        set failure = FirstFailure(failure, BinaryVarLongWrite(span, usize(22), 0) != 1, 148).
+        borrow_end(span).
+        buffer_drop(buf).
+        return failure.

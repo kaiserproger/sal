@@ -18,7 +18,7 @@
 //!   resource; ARCH107 module both may-modify/owns and cannot-modify a resource.
 //!   `owns`/`implements` targets that are plain resources/interfaces are NOT
 //!   validated except for ARCH106/ARCH107.
-//! - `check_effects`: EFF201 service allowed∩forbidden overlap (error); EFF202
+//! - `check_effects`: EFF202
 //!   operation effects contain `Pure` plus others (error); EFF203 missing a
 //!   direct intrinsic or declared callee effect, including all nested calls.
 //! - `check_bodies` (B1xx errors): lexical names (B100), call/arity (B101),
@@ -54,7 +54,10 @@ pub use sal_syntax::{
 };
 
 mod c_layout;
+pub mod collections;
 mod concurrency;
+pub mod declarations;
+pub mod memory;
 pub use c_layout::{c_record_layouts, CAbiTarget, CFieldLayout, CRecordLayout};
 
 #[derive(Debug, Clone, Default)]
@@ -77,10 +80,7 @@ pub struct RustFile {
 }
 
 pub fn build(file: &SalFile) -> (Ir, Vec<Diagnostic>) {
-    let (file, mut diagnostics) = match concurrency::lower(file) {
-        Ok(file) => (file, Vec::new()),
-        Err(diagnostics) => (file.clone(), diagnostics),
-    };
+    let (file, mut diagnostics) = lower_pipeline(file);
     let mut ir = Ir::default();
     for item in registered_items(&file, &mut diagnostics) {
         let (name, _) = item_identity(item);
@@ -116,6 +116,37 @@ pub fn build(file: &SalFile) -> (Ir, Vec<Diagnostic>) {
     (ir, diagnostics)
 }
 
+/// Shared lowering pipeline `declarations -> concurrency -> memory ->
+/// collections`. A failing stage stops the pipeline but the file lowered by
+/// the previous stages is kept, so later checkers see the derived
+/// declarations (e.g. generated JSON codecs) and report the stage's real
+/// diagnostics instead of cascading `unknown operation` noise.
+///
+/// Re-building an already collections-lowered file (backends re-run `build`
+/// on `Ir::file`) skips the memory pass: memory validated the pre-lowering
+/// source, and collections output is identified by the parser-false
+/// `generated` flag, which source code cannot forge.
+fn lower_pipeline(file: &SalFile) -> (SalFile, Vec<Diagnostic>) {
+    let mut current = match declarations::lower(file) {
+        Ok(next) => next,
+        Err(diagnostics) => return (file.clone(), diagnostics),
+    };
+    current = match concurrency::lower(&current) {
+        Ok(next) => next,
+        Err(diagnostics) => return (current, diagnostics),
+    };
+    if !collections::is_lowered(&current) {
+        current = match memory::lower(&current) {
+            Ok(next) => next,
+            Err(diagnostics) => return (current, diagnostics),
+        };
+    }
+    match collections::lower(&current) {
+        Ok(next) => (next, Vec::new()),
+        Err(diagnostics) => (current, diagnostics),
+    }
+}
+
 /// Validate the original namespace before a frontend consumes declarations.
 pub fn check_declarations(file: &SalFile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -138,33 +169,26 @@ fn registered_items<'a>(
             return false;
         }
         let (name, span) = item_identity(item);
+        let generated = match item {
+            Item::Operation(operation) => operation.generated,
+            Item::Entity(entity) => entity.generated,
+            _ => false,
+        };
+        let reserved_generation = name.starts_with("SalDecl")
+            || name.starts_with("SalColl")
+            || name.starts_with("SalConc");
         if builtin_signature(name).is_some()
+            || is_numeric_intrinsic(name)
             || reflection_arity(name).is_some()
             || matches!(
                 name,
-                "push"
-                    | "channel"
-                    | "channel_clone"
-                    | "channel_drop"
-                    | "send"
-                    | "receive"
-                    | "close"
-                    | "spawn"
-                    | "join"
-                    | "wait_for"
-                    | "timeout"
-                    | "otherwise"
-                    | "Channel"
-                    | "Thread"
-                    | "SendResult"
-                    | "ReceiveResult"
-                    | "WaitResult"
-                    | "WaitArm"
+                "Buffer" | "MutBytes" | "Borrow" | "Vector" | "Map" | "ValueResult"
             )
+            || (reserved_generation && !generated)
         {
             diagnostics.push(error(
                 "E1003",
-                format!("top-level name `{name}` is reserved for an intrinsic"),
+                format!("top-level name `{name}` is reserved for the compiler"),
                 span,
             ));
             return false;
@@ -248,8 +272,10 @@ pub fn check_bodies(ir: &Ir) -> Vec<Diagnostic> {
 }
 
 /// Borrow declaration types and literal names instead of cloning type trees.
+/// `pub(crate)`: shared with the compiler owner's memory/ownership passes
+/// (concurrency checks, native lowering); this file owns the definitions.
 #[derive(Clone, Copy, PartialEq)]
-enum BodyType<'a> {
+pub(crate) enum BodyType<'a> {
     Named(&'a str),
     Generic(&'a TypeRef),
     Void,
@@ -307,30 +333,64 @@ impl<'a> BodyType<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct Binding<'a> {
+pub(crate) struct Binding<'a> {
     ty: BodyType<'a>,
     mutable: bool,
 }
 
 #[derive(Clone, Copy)]
-enum BuiltinArg {
+pub(crate) enum BuiltinArg {
     Exact(&'static str),
     Span,
     Length,
     Integer,
     MachineWord,
 }
-
-fn builtin_signature(name: &str) -> Option<(&'static [BuiltinArg], BodyType<'static>)> {
+pub(crate) fn builtin_signature(name: &str) -> Option<(&'static [BuiltinArg], BodyType<'static>)> {
     use BuiltinArg::{Exact, Integer, Length, MachineWord, Span};
     let (args, result): (&[BuiltinArg], BodyType<'_>) = match name {
         "len" => (&[Length], BodyType::Named("usize")),
         "bytes" => (&[Exact("Text")], BodyType::Named("Bytes")),
+        "text" => (&[Exact("Bytes")], BodyType::Named("Text")),
+        "SalContractAssert" => (&[Exact("bool")], BodyType::Void),
+        "SalMemoryAssertDisjoint" => (&[Exact("Bytes"), Exact("Bytes")], BodyType::Void),
         "byte" => (&[Exact("Bytes"), Exact("usize")], BodyType::Named("u8")),
         "slice" => (
             &[Exact("Bytes"), Exact("usize"), Exact("usize")],
             BodyType::Named("Bytes"),
         ),
+        // Owner-dependent types are refined by the memory/collection passes;
+        // concrete spans stay typed here. Allocation remains SystemCall.
+        "buffer" => (&[Exact("usize")], BodyType::Named("Buffer")),
+        "buffer_drop" | "borrow_end" => (&[Integer], BodyType::Void),
+        "borrow_mut" | "slice_mut" => (
+            &[Integer, Exact("usize"), Exact("usize")],
+            BodyType::Named("MutBytes"),
+        ),
+        "view" => (&[Integer], BodyType::Named("Bytes")),
+        "borrow" => (&[Integer], BodyType::Unknown),
+        "put" => (&[Integer, Integer, Integer], BodyType::Void),
+        "vector" => (&[Integer, Integer], BodyType::Unknown),
+        "vector_len" | "vector_capacity" | "map_len" | "map_capacity" => {
+            (&[Integer], BodyType::Named("usize"))
+        }
+        "vector_reserve" | "vector_push" | "map_reserve" => {
+            (&[Integer, Integer], BodyType::Named("i64"))
+        }
+        "vector_get" | "map_get" | "map_remove" => (&[Integer, Integer], BodyType::Unknown),
+        "vector_pop" => (&[Integer], BodyType::Unknown),
+        "map_contains" => (&[Integer, Integer], BodyType::Named("bool")),
+        "vector_set" | "map_insert" => (&[Integer, Integer, Integer], BodyType::Named("i64")),
+        "vector_drop" | "map_drop" => (&[Integer], BodyType::Void),
+        "map" => (&[Integer, Integer, Integer], BodyType::Unknown),
+        // Pure machine-integer boundaries: arity here, same-width typing in
+        // `BodyChecker::call` before the generic argument loop.
+        "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "bit_and" | "bit_or" | "bit_xor" => {
+            (&[Integer, Integer], BodyType::Unknown)
+        }
+        "bit_not" => (&[Integer], BodyType::Unknown),
+        "shift_left" | "shift_right" => (&[Integer, Integer], BodyType::Unknown),
+        "bits_as" => (&[Integer, Integer], BodyType::Unknown),
         "usize" => (&[Integer], BodyType::Named("usize")),
         "i64" => (&[Integer], BodyType::Named("i64")),
         "u8" => (&[Integer], BodyType::Named("u8")),
@@ -363,8 +423,10 @@ fn builtin_signature(name: &str) -> Option<(&'static [BuiltinArg], BodyType<'sta
     Some((args, result))
 }
 
-fn intrinsic_effects(name: &str) -> &'static [&'static str] {
+pub(crate) fn intrinsic_effects(name: &str) -> &'static [&'static str] {
     match name {
+        "buffer" | "buffer_drop" | "vector" | "vector_drop" | "vector_reserve" | "vector_push"
+        | "map" | "map_drop" | "map_reserve" | "map_insert" => &["SystemCall"],
         "syscall" | "thread_launch" => &["SystemCall", "UnsafeMemory"],
         "address" | "bytes_at" | "load8" | "store8" | "atomic_load" | "atomic_store"
         | "atomic_cas" | "load64" | "store64" | "concurrency_state" | "operation_address" => {
@@ -374,7 +436,7 @@ fn intrinsic_effects(name: &str) -> &'static [&'static str] {
     }
 }
 
-fn reflection_arity(name: &str) -> Option<usize> {
+pub(crate) fn reflection_arity(name: &str) -> Option<usize> {
     match name {
         "size_of" | "align_of" => Some(1),
         "offset_of" => Some(2),
@@ -505,6 +567,7 @@ impl<'a> BodyChecker<'a, '_> {
                     self.loop_depth += 1;
                     self.nested_block(body, None);
                     self.loop_depth -= 1;
+                    returns |= *cond == Expr::Bool(true) && !breaks_out(body);
                 }
                 Stmt::For { var, iter, body } => {
                     let ty = self.expr(iter, None);
@@ -523,6 +586,12 @@ impl<'a> BodyChecker<'a, '_> {
                         self.report("B111", "loop control requires an enclosing loop".into());
                     }
                 }
+                // Explicit `unsafe:` scope: type/borrow checks still apply to
+                // every nested statement; only UnsafeMemory is discharged,
+                // and that happens in `check_operation_effects`, not here.
+                Stmt::Unsafe { body } => {
+                    returns |= self.nested_block(body, None);
+                }
                 Stmt::ExprStmt(expr) => {
                     self.expr(expr, None);
                 }
@@ -538,9 +607,53 @@ impl<'a> BodyChecker<'a, '_> {
 
     /// Only nonliteral evidence supplies a peer's context. This does not
     /// diagnose or execute expressions, and never guesses a variable's type.
+    /// Numeric intrinsics recurse into their value operands (never the
+    /// `bits_as` target name) so nested calls preserve width:
+    /// `wrapping_add(1, wrapping_mul(u8(10), u8(2)))` infers `u8`.
     fn hint(&self, expr: &'a Expr) -> Option<BodyType<'a>> {
         match expr {
             Expr::Var(name) => self.lookup(name).map(|binding| binding.ty),
+            Expr::Call { name, args } if name == "bits_as" => match args.first() {
+                Some(Expr::Var(target)) if int_bit_width(target).is_some() => {
+                    Some(BodyType::Named(match target.as_str() {
+                        "i8" => "i8",
+                        "i16" => "i16",
+                        "i32" => "i32",
+                        "i64" => "i64",
+                        "isize" => "isize",
+                        "u8" => "u8",
+                        "u16" => "u16",
+                        "u32" => "u32",
+                        "u64" => "u64",
+                        _ => "usize",
+                    }))
+                }
+                _ => None,
+            },
+            Expr::Call { name, args }
+                if name == "bit_not" || name == "shift_left" || name == "shift_right" =>
+            {
+                args.first().and_then(|operand| self.hint(operand))
+            }
+            Expr::Call { name, args }
+                if matches!(
+                    name.as_str(),
+                    "wrapping_add"
+                        | "wrapping_sub"
+                        | "wrapping_mul"
+                        | "bit_and"
+                        | "bit_or"
+                        | "bit_xor"
+                ) =>
+            {
+                match args.as_slice() {
+                    [first, second] => self
+                        .hint(first)
+                        .filter(|ty| ty.integer())
+                        .or_else(|| self.hint(second).filter(|ty| ty.integer())),
+                    _ => None,
+                }
+            }
             Expr::Call { name, .. } => builtin_signature(name)
                 .map(|(_, result)| result)
                 .or_else(|| reflection_arity(name).map(|_| BodyType::Named("usize")))
@@ -548,7 +661,6 @@ impl<'a> BodyChecker<'a, '_> {
                     self.ir
                         .entities
                         .get(name)
-                        .filter(|entity| entity.c_layout)
                         .map(|entity| BodyType::Named(&entity.name))
                 })
                 .or_else(|| {
@@ -578,6 +690,18 @@ impl<'a> BodyChecker<'a, '_> {
     }
 
     fn field(&self, base: BodyType<'a>, name: &str) -> Option<BodyType<'a>> {
+        // `ValueResult<T>` is a plain value record shared by collection
+        // accessors: `found: bool` distinguishes missing/out-of-range, and
+        // `value: T` carries the payload. It never nests owners.
+        if let BodyType::Generic(TypeRef::Generic { name: owner, args }) = base {
+            if owner == "ValueResult" && args.len() == 1 {
+                return match name {
+                    "found" => Some(BodyType::Named("bool")),
+                    "value" => Some(BodyType::declared(&args[0])),
+                    _ => None,
+                };
+            }
+        }
         let BodyType::Named(entity) = base else {
             return None;
         };
@@ -620,7 +744,7 @@ impl<'a> BodyChecker<'a, '_> {
                     self.report("B100", format!("undefined variable `{name}`"));
                     BodyType::Unknown
                 }),
-            Expr::Call { name, args } => self.call(name, args),
+            Expr::Call { name, args } => self.call(name, args, expected),
             Expr::Field { base, field } => {
                 let base = self.expr(base, None);
                 self.field(base, field).unwrap_or_else(|| {
@@ -702,7 +826,12 @@ impl<'a> BodyChecker<'a, '_> {
         }
     }
 
-    fn call(&mut self, name: &str, args: &'a [Expr]) -> BodyType<'a> {
+    fn call(
+        &mut self,
+        name: &str,
+        args: &'a [Expr],
+        expected: Option<BodyType<'a>>,
+    ) -> BodyType<'a> {
         if name == "operation_address" {
             let [Expr::Var(name)] = args else {
                 self.report(
@@ -728,7 +857,109 @@ impl<'a> BodyChecker<'a, '_> {
         if let Some(arity) = reflection_arity(name) {
             return self.reflection(name, args, arity);
         }
-        let record = self.ir.entities.get(name).filter(|entity| entity.c_layout);
+        if is_numeric_intrinsic(name) {
+            return self.numeric_intrinsic(name, args, expected);
+        }
+        // Opaque owners are never forged by calls: `Buffer(...)`,
+        // `MutBytes(...)`, `Vector(...)`, `Map(...)`, `Borrow(...)`, and
+        // `ValueResult(...)` have dedicated constructors/accessors only.
+        // Fail closed with B108 (not the generic B101 unknown-call path).
+        if matches!(
+            name,
+            "Buffer" | "MutBytes" | "Vector" | "Map" | "Borrow" | "ValueResult"
+        ) {
+            for arg in args {
+                self.expr(arg, None);
+            }
+            self.report(
+                "B108",
+                format!("call `{name}` cannot forge an opaque owner or result record"),
+            );
+            return BodyType::Unknown;
+        }
+        // Opaque owners/spans never convert: `usize(owner)`, `u8(span)`,
+        // and the other checked casts reject owned handles (B108).
+        if matches!(
+            name,
+            "usize" | "i64" | "u8" | "i8" | "i16" | "i32" | "isize" | "u16" | "u32" | "u64"
+        ) && args.len() == 1
+        {
+            let actual = self.expr(args.first().expect("checked arity"), None);
+            if !actual.integer()
+                && actual != BodyType::Unknown
+                && !matches!(actual, BodyType::Named("f32" | "f64"))
+                && matches!(
+                    actual,
+                    BodyType::Named("Buffer" | "MutBytes" | "Bytes" | "Text")
+                        | BodyType::Generic(_)
+                )
+            {
+                self.report(
+                    "B108",
+                    format!(
+                        "call `{name}` requires an integer source, got {}",
+                        actual.description()
+                    ),
+                );
+                return BodyType::Named(match name {
+                    "usize" => "usize",
+                    "i64" => "i64",
+                    "u8" => "u8",
+                    "i8" => "i8",
+                    "i16" => "i16",
+                    "i32" => "i32",
+                    "isize" => "isize",
+                    "u16" => "u16",
+                    "u32" => "u32",
+                    _ => "u64",
+                });
+            }
+            // Fall through to the generic checked-cast path below, which
+            // types integer/float sources and reports B108 otherwise.
+        }
+        // `byte` reads both immutable views and exclusive writable spans.
+        if name == "byte" && args.len() == 2 {
+            let base = self.expr(&args[0], None);
+            if !matches!(
+                base,
+                BodyType::Named("Bytes" | "MutBytes") | BodyType::Unknown
+            ) && base != BodyType::Unknown
+            {
+                self.report(
+                    "B107",
+                    format!("expected Bytes, got {}", base.description()),
+                );
+            }
+            let index = self.expr(&args[1], Some(BodyType::Named("usize")));
+            self.require(index, BodyType::Named("usize"), "B107");
+            return BodyType::Named("u8");
+        }
+        // `len` covers caller loans and typed owners as well as the legacy
+        // Text/Word/Bytes/Vec surface.
+        if name == "len" && args.len() == 1 {
+            let actual = self.expr(&args[0], None);
+            let valid = matches!(
+                actual,
+                BodyType::Named("Text" | "Word" | "Bytes" | "Buffer" | "MutBytes")
+            ) || actual.element().is_some()
+                || matches!(
+                    actual,
+                    BodyType::Generic(TypeRef::Generic { name, args })
+                        if (name == "Vector" || name == "Map" || name == "Borrow") && !args.is_empty()
+                )
+                || actual == BodyType::Unknown;
+            if !valid {
+                self.report(
+                    "B108",
+                    format!(
+                        "call `len` argument 1 requires Text, Word, Bytes, Buffer, MutBytes, Vec, or a typed owner, got {}",
+                        actual.description()
+                    ),
+                );
+            }
+            return BodyType::Named("usize");
+        }
+        let record = self.ir.entities.get(name);
         let signature = builtin_signature(name);
         let operation = if signature.is_some() || name == "push" {
             None
@@ -770,10 +1001,10 @@ impl<'a> BodyChecker<'a, '_> {
             } else if let Some(rule) = rule {
                 let (valid, description) = match rule {
                     BuiltinArg::Span => (
-                        matches!(actual, BodyType::Named("Text" | "Bytes"))
+                        matches!(actual, BodyType::Named("Text" | "Bytes" | "MutBytes"))
                             || matches!(actual, BodyType::Named(ty)
                                 if self.ir.entities.get(ty).is_some_and(|entity| entity.c_layout)),
-                        "Text, Bytes, or a C record",
+                        "Text, Bytes, MutBytes, or a C record",
                     ),
                     BuiltinArg::Length => (
                         matches!(actual, BodyType::Named("Text" | "Word" | "Bytes"))
@@ -790,7 +1021,23 @@ impl<'a> BodyChecker<'a, '_> {
                     ),
                     BuiltinArg::Exact(_) => unreachable!("exact arguments have an expected type"),
                 };
-                if !valid && actual != BodyType::Unknown {
+                // Checked owner/span loans (Buffer/MutBytes/typed owners) flow
+                // to the compiler owner's memory pass for precise B107/CON203
+                // + provenance; this file only enforces arity here, never a
+                // blanket B108 on owner-typed arguments. Internal records that
+                // hold views are loan holders there too, so `borrow_end` of
+                // such a record is the memory pass's to validate.
+                let deferred = is_memory_builtin(name)
+                    && (matches!(
+                        actual,
+                        BodyType::Named("Buffer" | "MutBytes" | "Bytes" | "Text")
+                            | BodyType::Generic(_)
+                    ) || (name == "borrow"
+                        && matches!(actual, BodyType::Named(record) if self.ir.entities.contains_key(record)))
+                        || (name == "borrow_end"
+                            && matches!(actual, BodyType::Named(record)
+                                if memory::record_carries_views(&self.ir.entities, record))));
+                if !valid && actual != BodyType::Unknown && !deferred {
                     self.report(
                         "B108",
                         format!(
@@ -859,9 +1106,195 @@ impl<'a> BodyChecker<'a, '_> {
         }
         BodyType::Named("usize")
     }
-}
 
-fn integer_literal_fits(value: i64, ty: BodyType<'_>) -> bool {
+    /// Integer type context for one value operand: the operand's own hint
+    /// first, then the peer's hint, then the call-site expectation. Mirrors
+    /// the checked `+`/`-` propagation without ever silently converting a
+    /// variable's type: `expected` only types otherwise-untyped literals.
+    fn integer_context(
+        &self,
+        operand: &'a Expr,
+        peer: Option<&'a Expr>,
+        expected: Option<BodyType<'a>>,
+    ) -> Option<BodyType<'a>> {
+        self.hint(operand)
+            .filter(|ty| ty.integer())
+            .or_else(|| {
+                peer.and_then(|peer| self.hint(peer))
+                    .filter(|ty| ty.integer())
+            })
+            .or_else(|| expected.filter(|ty| ty.integer()))
+    }
+
+    fn integer_operand(
+        &mut self,
+        name: &str,
+        operand: &'a Expr,
+        context: Option<BodyType<'a>>,
+    ) -> BodyType<'a> {
+        let actual = self.expr(operand, context);
+        if actual != BodyType::Unknown && !actual.integer() {
+            self.report(
+                "B107",
+                format!(
+                    "call `{name}` requires integer types, got {}",
+                    actual.description()
+                ),
+            );
+            return BodyType::Unknown;
+        }
+        actual
+    }
+
+    /// Pure machine-integer boundaries: exact-typed operands, no implicit
+    /// conversion, unsuffixed-literal contextual inference (operand hint,
+    /// then peer hint, then the call-site expectation). Nested intrinsic
+    /// result hints preserve width, so `returns u8` on
+    /// `wrapping_add(250, 10)` yields 4 and
+    /// `wrapping_add(1, wrapping_mul(u8(10), u8(2)))` yields 21 at runtime.
+    /// Shifts take a `usize` count; the width guard stays a native runtime
+    /// trap owned by the numeric lowerer. Pure: no effect entries.
+    fn numeric_intrinsic(
+        &mut self,
+        name: &str,
+        args: &'a [Expr],
+        expected: Option<BodyType<'a>>,
+    ) -> BodyType<'a> {
+        if name == "bits_as" {
+            if args.len() != 2 {
+                self.report(
+                    "B101",
+                    format!("call `{name}` expects 2 argument(s), got {}", args.len()),
+                );
+                return BodyType::Unknown;
+            }
+            let target = match &args[0] {
+                Expr::Var(target) if int_bit_width(target).is_some() => target.as_str(),
+                Expr::Var(target) => {
+                    self.report(
+                        "B108",
+                        format!("`bits_as` target requires an integer type name, got `{target}`"),
+                    );
+                    return BodyType::Unknown;
+                }
+                _ => {
+                    self.report(
+                        "B108",
+                        "`bits_as` target must be a compile-time integer type name".into(),
+                    );
+                    return BodyType::Unknown;
+                }
+            };
+            let width = int_bit_width(target).expect("checked target");
+            let result = BodyType::Named(match target {
+                "i8" => "i8",
+                "i16" => "i16",
+                "i32" => "i32",
+                "i64" => "i64",
+                "isize" => "isize",
+                "u8" => "u8",
+                "u16" => "u16",
+                "u32" => "u32",
+                "u64" => "u64",
+                _ => "usize",
+            });
+            let value = self.expr(&args[1], Some(result));
+            let same = match value {
+                BodyType::Named(found) => int_bit_width(found) == Some(width),
+                BodyType::Unknown => true,
+                _ => false,
+            };
+            if !same {
+                self.report(
+                    "B107",
+                    format!(
+                        "`bits_as` requires the same bit width as `{target}`, got {}",
+                        value.description()
+                    ),
+                );
+                return BodyType::Unknown;
+            }
+            if value == BodyType::Unknown {
+                return BodyType::Unknown;
+            }
+            return result;
+        }
+        if name == "bit_not" {
+            if args.len() != 1 {
+                self.report(
+                    "B101",
+                    format!("call `{name}` expects 1 argument(s), got {}", args.len()),
+                );
+                return BodyType::Unknown;
+            }
+            // Unary result hint: the operand's own type first, then the
+            // call-site expectation (literals only; typed vars never convert).
+            let context = self.integer_context(&args[0], None, expected);
+            return self.integer_operand(name, &args[0], context);
+        }
+        if name == "shift_left" || name == "shift_right" {
+            if args.len() != 2 {
+                self.report(
+                    "B101",
+                    format!("call `{name}` expects 2 argument(s), got {}", args.len()),
+                );
+                return BodyType::Unknown;
+            }
+            let context = self.integer_context(&args[0], None, expected);
+            let value = self.integer_operand(name, &args[0], context);
+            if value == BodyType::Unknown {
+                self.expr(&args[1], Some(BodyType::Named("usize")));
+                return BodyType::Unknown;
+            }
+            let count = self.expr(&args[1], Some(BodyType::Named("usize")));
+            if count != BodyType::Unknown && count != BodyType::Named("usize") {
+                self.report(
+                    "B107",
+                    format!(
+                        "call `{name}` shift count requires usize, got {}",
+                        count.description()
+                    ),
+                );
+                return BodyType::Unknown;
+            }
+            return value;
+        }
+        // Binary wrapping/bitwise: same-width T for both operands. Literals
+        // take the peer's type first; the call-site expectation is only the
+        // last resort for otherwise-untyped literals. Explicitly typed
+        // operands never silently convert.
+        if args.len() != 2 {
+            self.report(
+                "B101",
+                format!("call `{name}` expects 2 argument(s), got {}", args.len()),
+            );
+            return BodyType::Unknown;
+        }
+        let context = self.integer_context(&args[0], Some(&args[1]), expected);
+        let left = self.integer_operand(name, &args[0], context);
+        if left == BodyType::Unknown {
+            self.expr(&args[1], None);
+            return BodyType::Unknown;
+        }
+        let right = self.integer_operand(name, &args[1], Some(left));
+        if right == BodyType::Unknown {
+            return BodyType::Unknown;
+        }
+        if left != right {
+            self.report(
+                "B107",
+                format!(
+                    "call `{name}` requires equal integer types, got {} and {}",
+                    left.description(),
+                    right.description()
+                ),
+            );
+            return BodyType::Unknown;
+        }
+        left
+    }
+}
+pub(crate) fn integer_literal_fits(value: i64, ty: BodyType<'_>) -> bool {
     match ty {
         BodyType::Named("i8") => i8::try_from(value).is_ok(),
         BodyType::Named("i16") => i16::try_from(value).is_ok(),
@@ -873,6 +1306,73 @@ fn integer_literal_fits(value: i64, ty: BodyType<'_>) -> bool {
         BodyType::Named("u64" | "u128" | "usize") => value >= 0,
         _ => false,
     }
+}
+/// Bit width of a machine integer type name, shared with the compiler
+/// owner's same-width checks (`bits_as`, wrapping/bit/shift operands).
+/// Returns `None` for non-integers, floats, owners, spans, and handles.
+pub(crate) fn int_bit_width(name: &str) -> Option<u32> {
+    Some(match name {
+        "i8" | "u8" => 8,
+        "i16" | "u16" => 16,
+        "i32" | "u32" => 32,
+        "i64" | "u64" | "isize" | "usize" => 64,
+        _ => return None,
+    })
+}
+
+/// The ten exact pure machine-integer boundary spellings (nine contract
+/// intrinsics plus `bits_as`), owned by the native numeric module's header
+/// guide; this file only reserves and types them.
+pub(crate) fn is_numeric_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        "wrapping_add"
+            | "wrapping_sub"
+            | "wrapping_mul"
+            | "bit_and"
+            | "bit_or"
+            | "bit_xor"
+            | "bit_not"
+            | "shift_left"
+            | "shift_right"
+            | "bits_as"
+    )
+}
+
+/// Checked safe-memory/collection builtins whose owner/span arguments the
+/// compiler owner's memory pass types precisely (B107/CON203 + provenance).
+/// This file enforces arity (B101) and scalar rules only, and never emits a
+/// blanket B108 for owner-typed arguments to these names.
+pub(crate) fn is_memory_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "buffer"
+            | "buffer_drop"
+            | "borrow_mut"
+            | "slice_mut"
+            | "view"
+            | "put"
+            | "borrow_end"
+            | "borrow"
+            | "vector"
+            | "vector_drop"
+            | "vector_len"
+            | "vector_capacity"
+            | "vector_reserve"
+            | "vector_push"
+            | "vector_get"
+            | "vector_set"
+            | "vector_pop"
+            | "map"
+            | "map_drop"
+            | "map_len"
+            | "map_capacity"
+            | "map_reserve"
+            | "map_insert"
+            | "map_get"
+            | "map_remove"
+            | "map_contains"
+    )
 }
 
 pub fn check_architecture(ir: &Ir) -> Vec<Diagnostic> {
@@ -984,21 +1484,6 @@ pub fn check_architecture(ir: &Ir) -> Vec<Diagnostic> {
 
 pub fn check_effects(ir: &Ir) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    for (_, service) in sorted_entries(&ir.services) {
-        let mut conflicts = HashSet::new();
-        for effect in &service.allowed_effects {
-            if service.forbidden_effects.contains(effect) && conflicts.insert(effect) {
-                diagnostics.push(error(
-                    "EFF201",
-                    format!(
-                        "service `{}` both allows and forbids `{effect}`",
-                        service.name
-                    ),
-                    &service.span,
-                ));
-            }
-        }
-    }
     for (_, operation) in sorted_entries(&ir.operations) {
         if operation.c_import.is_some() {
             for effect in ["SystemCall", "UnsafeMemory"] {
@@ -1034,11 +1519,24 @@ pub fn check_effects(ir: &Ir) -> Vec<Diagnostic> {
 fn check_operation_effects(ir: &Ir, operation: &OperationDecl, diagnostics: &mut Vec<Diagnostic>) {
     enum Node<'a> {
         Statement(&'a Stmt),
+        EnterUnsafe,
+        ExitUnsafe,
         Expression(&'a Expr),
     }
     let mut pending: Vec<_> = operation.body.iter().rev().map(Node::Statement).collect();
+    // Lexical `unsafe:` scope: discharges ONLY `UnsafeMemory` for nested
+    // raw operations/calls. `SystemCall` and every other effect still
+    // propagate normally; type/borrow checks are untouched (see
+    // `BodyChecker::block`). No module/name whitelists.
+    let mut unsafe_depth: usize = 0;
     while let Some(node) = pending.pop() {
         match node {
+            Node::EnterUnsafe => {
+                unsafe_depth += 1;
+            }
+            Node::ExitUnsafe => {
+                unsafe_depth = unsafe_depth.saturating_sub(1);
+            }
             Node::Statement(statement) => match statement {
                 Stmt::Let { expr, .. }
                 | Stmt::Assign { expr, .. }
@@ -1057,12 +1555,21 @@ fn check_operation_effects(ir: &Ir, operation: &OperationDecl, diagnostics: &mut
                     pending.extend(body.iter().rev().map(Node::Statement));
                     pending.push(Node::Expression(iter));
                 }
+                Stmt::Unsafe { body } => {
+                    pending.push(Node::ExitUnsafe);
+                    pending.extend(body.iter().rev().map(Node::Statement));
+                    pending.push(Node::EnterUnsafe);
+                }
                 Stmt::Break | Stmt::Continue => {}
             },
             Node::Expression(expr) => match expr {
                 Expr::Call { name, args } => {
+                    let in_unsafe = unsafe_depth > 0;
                     let mut require = |effect: &str| {
-                        if effect != "Pure" && !operation.effects.iter().any(|own| own == effect) {
+                        if effect != "Pure"
+                            && !(in_unsafe && effect == "UnsafeMemory")
+                            && !operation.effects.iter().any(|own| own == effect)
+                        {
                             diagnostics.push(error(
                                 "EFF203",
                                 format!(
@@ -1076,7 +1583,7 @@ fn check_operation_effects(ir: &Ir, operation: &OperationDecl, diagnostics: &mut
                     for effect in intrinsic_effects(name) {
                         require(effect);
                     }
-                    if builtin_signature(name).is_none() {
+                    if builtin_signature(name).is_none() && !is_numeric_intrinsic(name) {
                         if let Some(callee) = ir.operations.get(name) {
                             if callee.c_import.is_some() {
                                 for effect in ["SystemCall", "UnsafeMemory"] {
@@ -1116,11 +1623,9 @@ fn check_operation_effects(ir: &Ir, operation: &OperationDecl, diagnostics: &mut
 /// (X100 missing/duplicate/port/version: port 1..=65535 present,
 /// `speaks HTTP/1` required, other versions X101); one or more `route`s
 /// (X102 non-GET or missing method, X103 bad path, X104 missing/bad responds:
-/// exactly one of Text / "literal" / param NAME); route `:p` params must be
 /// Word-or-Text use (Character rejected here as X105 when the response
-/// parameter matches a Character operation parameter; semfront rejects it
-/// earlier as E9006); unknown `param NAME` with no matching `:p` segment ->
-/// X106. No routes -> X102.
+/// parameter matches a Character operation parameter); unknown `param NAME`
+/// with no matching `:p` segment -> X106. No routes -> X102.
 ///
 /// Console program (no servers AND no routes): exactly one hello-world
 /// `operation` (`returns Text` + `responds with "literal"`). Zero hello
@@ -1343,21 +1848,30 @@ fn check_console(ir: &Ir, fallback: &Span, diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
+/// Whether a `break` in `body` exits the loop that directly owns `body`.
+/// Breaks inside nested loops target those loops instead.
+fn breaks_out(body: &[Stmt]) -> bool {
+    body.iter().any(|statement| match statement {
+        Stmt::Break => true,
+        Stmt::If { then, else_, .. } => breaks_out(then) || breaks_out(else_),
+        Stmt::Unsafe { body } => breaks_out(body),
+        _ => false,
+    })
+}
+
 /// Body-form hello: any `return` of a Text literal or Text-typed value.
 /// Conservative: literal always counts; variable counts (type proven by B-check).
 fn has_text_return(operation: &OperationDecl) -> bool {
-    operation.body.iter().any(|stmt| match stmt {
-        sal_syntax::Stmt::Return(sal_syntax::Expr::Lit(_))
-        | sal_syntax::Stmt::Return(sal_syntax::Expr::Var(_)) => true,
-        sal_syntax::Stmt::If { then, else_, .. } => {
-            then.iter()
-                .any(|s| matches!(s, sal_syntax::Stmt::Return(_)))
-                || else_
-                    .iter()
-                    .any(|s| matches!(s, sal_syntax::Stmt::Return(_)))
-        }
-        _ => false,
-    })
+    fn block_returns(body: &[sal_syntax::Stmt]) -> bool {
+        body.iter().any(|stmt| match stmt {
+            sal_syntax::Stmt::Return(sal_syntax::Expr::Lit(_))
+            | sal_syntax::Stmt::Return(sal_syntax::Expr::Var(_)) => true,
+            sal_syntax::Stmt::If { then, else_, .. } => block_returns(then) || block_returns(else_),
+            sal_syntax::Stmt::Unsafe { body } => block_returns(body),
+            _ => false,
+        })
+    }
+    block_returns(&operation.body)
 }
 
 pub fn verify_rust_imports(ir: &Ir, files: &[RustFile]) -> Vec<Diagnostic> {
@@ -1515,6 +2029,8 @@ fn is_primitive(name: &str) -> bool {
             | "Word"
             | "Text"
             | "Bytes"
+            | "Buffer"
+            | "MutBytes"
             | "u8"
             | "u16"
             | "u32"
@@ -1544,8 +2060,8 @@ fn check_type(ir: &Ir, ty: &TypeRef, span: &Span, diagnostics: &mut Vec<Diagnost
             }
             TypeRef::Generic { name, args } => {
                 let arity = match name.as_str() {
-                    "Option" | "Vec" | "Money" => Some(1),
-                    "Result" => Some(2),
+                    "Option" | "Vec" | "Money" | "Borrow" | "Vector" | "ValueResult" => Some(1),
+                    "Result" | "Map" => Some(2),
                     _ => None,
                 };
                 if let Some(arity) = arity {
@@ -1691,11 +2207,168 @@ mod tests {
         ir
     }
 
+    /// Body checks for sources the ownership pass rejects too; those
+    /// diagnostics are asserted where ownership is the subject.
+    fn unchecked_ir(source: &str) -> Ir {
+        build(&parsed(source)).0
+    }
+
     fn codes(diagnostics: &[Diagnostic]) -> Vec<&'static str> {
         diagnostics
             .iter()
             .map(|diagnostic| diagnostic.code)
             .collect()
+    }
+
+    #[test]
+    fn numeric_intrinsics_type_same_width_integers_with_literal_inference() {
+        // Positive: contextual literal inference, including the nested-call
+        // width preservation (`wrapping_add(1, wrapping_mul(u8(10), u8(2)))`).
+        let ir = checked_ir(
+            "operation Good:\n  returns u8.\n  body:\n    let a = wrapping_add(250, 10).\n    let b = wrapping_add(1, wrapping_mul(u8(10), u8(2))).\n    let c = bit_and(u8(6), u8(3)).\n    let d = bit_not(u8(6)).\n    let e = shift_left(u8(1), usize(2)).\n    let f = shift_right(u8(4), usize(1)).\n    let g = bits_as(u8, wrapping_add(250, 10)).\n    return g.\n",
+        );
+        assert!(check_bodies(&ir).is_empty(), "{:?}", check_bodies(&ir));
+        assert!(check_effects(&ir).is_empty());
+        // Negative: mismatched widths, bad shift count, bad bits_as
+        // target/width, and wrong arities.
+        for (call, code) in [
+            ("wrapping_add(u8(1), usize(2))", "B107"),
+            ("wrapping_add(u8(1), 1.5)", "B107"),
+            ("wrapping_add(1, true)", "B107"),
+            ("bit_not(u8(1), u8(2))", "B101"),
+            ("wrapping_add(u8(1))", "B101"),
+            ("shift_left(u8(1), u8(2))", "B107"),
+            ("shift_left(u8(1))", "B101"),
+            ("bits_as(u8, u16(1))", "B107"),
+            ("bits_as(u16, u8(1))", "B107"),
+            ("bits_as(unknown, u8(1))", "B108"),
+            ("bits_as(1, u8(1))", "B108"),
+            ("bits_as(u8)", "B101"),
+        ] {
+            let ir = checked_ir(&format!("operation Bad:\n  body:\n    {call}.\n"));
+            assert_eq!(codes(&check_bodies(&ir)), [code], "{call}");
+        }
+    }
+
+    #[test]
+    fn numeric_intrinsics_are_pure_and_reserved() {
+        // Pure operations may call numeric intrinsics with no effects.
+        let ir = checked_ir(
+            "operation Pure:\n  effects: Pure.\n  returns u8.\n  body:\n    return wrapping_add(250, 10).\n",
+        );
+        assert!(check_bodies(&ir).is_empty(), "{:?}", check_bodies(&ir));
+        assert!(check_effects(&ir).is_empty());
+        for name in [
+            "wrapping_add",
+            "wrapping_sub",
+            "wrapping_mul",
+            "bit_and",
+            "bit_or",
+            "bit_xor",
+            "bit_not",
+            "shift_left",
+            "shift_right",
+            "bits_as",
+        ] {
+            let (ir, diagnostics) = build(&parsed(&format!("operation {name}:\n  returns i64.\n")));
+            assert_eq!(codes(&diagnostics), ["E1003"], "{name}");
+            assert!(!ir.operations.contains_key(name));
+        }
+        for name in [
+            "buffer",
+            "buffer_drop",
+            "borrow_mut",
+            "slice_mut",
+            "view",
+            "put",
+            "borrow_end",
+            "borrow",
+            "Buffer",
+            "MutBytes",
+            "Borrow",
+            "Vector",
+            "Map",
+            "ValueResult",
+        ] {
+            let (ir, diagnostics) = build(&parsed(&format!("operation {name}:\n  returns i64.\n")));
+            assert_eq!(codes(&diagnostics), ["E1003"], "{name}");
+            assert!(!ir.operations.contains_key(name));
+        }
+    }
+
+    #[test]
+    fn safe_memory_surface_types_loans_and_rejects_owner_casts() {
+        // Positive: the checked safe-memory SDK surface types cleanly.
+        let ir = checked_ir(
+            "operation Good:\n  returns i64.\n  effects: SystemCall.\n  body:\n    let arena = buffer(usize(64)).\n    let span = borrow_mut(arena, usize(0), usize(64)).\n    put(span, usize(0), u8(9)).\n    let probe = view(span).\n    let first = byte(probe, usize(0)).\n    let wide = byte(span, usize(0)).\n    let size = len(arena) + len(span) + len(probe).\n    borrow_end(probe).\n    borrow_end(span).\n    buffer_drop(arena).\n    return i64(first) + i64(wide) + i64(size).\n",
+        );
+        assert!(check_bodies(&ir).is_empty(), "{:?}", check_bodies(&ir));
+        // Negative: opaque owners/spans never forge into integers, and
+        // `byte` still rejects non-span bases.
+        for (call, code) in [
+            ("usize(arena)", "B108"),
+            ("u8(span)", "B108"),
+            ("byte(arena, usize(0))", "B107"),
+            ("byte(\"x\", usize(0))", "B107"),
+            ("len(1)", "B108"),
+        ] {
+            let ir = unchecked_ir(&format!(
+                "operation Bad:\n  accepts arena of type Buffer.\n  accepts span of type MutBytes.\n  body:\n    {call}.\n"
+            ));
+            assert_eq!(codes(&check_bodies(&ir)), [code], "{call}");
+        }
+    }
+
+    #[test]
+    fn owner_collection_types_validate_without_e2002() {
+        let ir = checked_ir(
+            "operation Good:\n  accepts owned of type Buffer.\n  accepts span of type MutBytes.\n  accepts held of type Borrow<Buffer>.\n  accepts items of type Vector<i64>.\n  accepts table of type Map<i64, i64>.\n  accepts found of type ValueResult<i64>.\n  returns i64.\n  effects: SystemCall.\n  body:\n    buffer_drop(owned).\n    vector_drop(items).\n    map_drop(table).\n    return 0.\n",
+        );
+        assert!(check_types(&ir).is_empty(), "{:?}", check_types(&ir));
+        for ty in [
+            "Borrow<Buffer, Buffer>",
+            "Map<i64>",
+            "ValueResult<i64, i64>",
+        ] {
+            let ir = unchecked_ir(&format!(
+                "operation Bad:\n  accepts value of type {ty}.\n  body:\n    return 0.\n"
+            ));
+            assert_eq!(codes(&check_types(&ir)), ["E2004"], "{ty}");
+        }
+    }
+
+    #[test]
+    fn collection_calls_type_expected_shapes_and_reject_forgeries() {
+        // Positive: canonical arities type cleanly; get/pop project
+        // `found`/`value` through the ValueResult helper.
+        let source = format!(
+            "{}\noperation Good:\n  accepts items of type Vector<i64>.\n  accepts table of type Map<i64, i64>.\n  returns i64.\n  effects: SystemCall.\n  body:\n    let slot = vector_get(items, usize(0)).\n    let hit = slot.found.\n    let count = vector_len(items) + map_len(table).\n    let present = map_contains(table, 1).\n    vector_drop(items).\n    map_drop(table).\n    if hit && present:\n      return i64(count) + slot.value.\n    return 0.\n",
+            include_str!("../../../stdlib/collections.sal")
+        );
+        let ir = checked_ir(&source);
+        assert!(check_bodies(&ir).is_empty(), "{:?}", check_bodies(&ir));
+        // Negative: forged owner/result construction and owner->integer
+        // casts fail closed; arities still B101.
+        for (call, code) in [
+            ("Vector(1)", "B108"),
+            ("Map(1, 2, 3)", "B108"),
+            ("Borrow(items)", "B108"),
+            ("ValueResult(true, 1)", "B108"),
+            ("Buffer(1)", "B108"),
+            ("usize(items)", "B108"),
+            ("vector_get(items)", "B101"),
+            ("vector_set(items, usize(0))", "B101"),
+            ("map_insert(table, 1)", "B101"),
+        ] {
+            let ir = unchecked_ir(&format!(
+                "operation Bad:\n  accepts items of type Vector<i64>.\n  accepts table of type Map<i64, i64>.\n  body:\n    {call}.\n"
+            ));
+            assert_eq!(codes(&check_bodies(&ir)), [code], "{call}");
+        }
+        // Generated `SalColl*` names are reserved like intrinsics.
+        let (ir, diagnostics) = build(&parsed("operation SalCollHelper:\n  returns i64.\n"));
+        assert_eq!(codes(&diagnostics), ["E1003"]);
+        assert!(!ir.operations.contains_key("SalCollHelper"));
     }
 
     #[test]
@@ -2171,7 +2844,13 @@ operation Loop:
   returns i64.
   body:
     while true:
-      return 1.
+      if true:
+        break.
+operation Forever:
+  returns i64.
+  body:
+    while true:
+      let value = 1.
 operation Spec:
   accepts value of type Text.
   returns Text.
@@ -2295,7 +2974,12 @@ operation Void:
     len("ok").
 "#,
         );
-        assert_eq!(codes(&check_bodies(&ir)), ["B108", "B102"]);
+        assert_eq!(
+            codes(&check_bodies(&ir)),
+            ["B108", "B102"],
+            "{:?}",
+            check_bodies(&ir)
+        );
     }
 
     #[test]
@@ -2418,6 +3102,8 @@ operation Void:
             effects: Vec::new(),
             requires: Vec::new(),
             ensures: Vec::new(),
+            ownership: Default::default(),
+            generated: false,
             responds_literal: Some("hello".into()),
             c_export: None,
             c_import: None,
@@ -2493,6 +3179,9 @@ operation Void:
                 .collect(),
             invariants: Vec::new(),
             c_layout: false,
+            json: Default::default(),
+            iteration: None,
+            generated: false,
         };
         build(&SalFile {
             items: vec![Item::Entity(entity)],
@@ -2666,15 +3355,17 @@ operation Void:
     }
 
     #[test]
-    fn effects_reject_only_overlap_and_pure_with_other_effects() {
+    fn effects_reject_pure_with_other_effects() {
         let ir = checked_ir(
-            "service Bad:\n  allowed effects:\n    DatabaseAccess.\n  forbidden effects:\n    DatabaseAccess.\n\
-             service Good:\n  allowed effects:\n    DatabaseAccess.\n  forbidden effects:\n    HTTPAccess.\n\
-             operation Impure:\n  effects: Pure, HTTPAccess.\n\
+            "operation Impure:\n  effects: Pure, HTTPAccess.\n\
              operation PureOnly:\n  effects: Pure, Pure.\n\
              operation Unrestricted:\n  effects: HTTPAccess, DatabaseAccess.\n",
         );
-        assert_eq!(codes(&check_effects(&ir)), ["EFF201", "EFF202"]);
+        assert_eq!(codes(&check_effects(&ir)), ["EFF202"]);
+        let (_, diagnostics) = build(&parsed(
+            "service Promise:\n  allowed effects:\n    DatabaseAccess.\n  forbidden effects:\n    HTTPAccess.\n",
+        ));
+        assert_eq!(codes(&diagnostics), ["DEC102"]);
     }
 
     fn imports(module: &str, paths: &[&str]) -> RustFile {

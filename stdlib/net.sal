@@ -1,0 +1,432 @@
+# Reusable safe IP networking over the Linux x86-64 socket interface.
+#
+# All algorithms are SAL in this file. The only kernel crossings are the
+# socket syscalls (poll 7, socket 41, connect 42, accept 43, sendto 44,
+# recvfrom 45, shutdown 48, bind 49, listen 50, getsockname 51, setsockopt 54),
+# each confined to a narrow audited `unsafe:` block that grants
+# UnsafeMemory to those nested statements only. Public operations declare
+# `SystemCall` where they (transitively) trap into the kernel and never
+# declare UnsafeMemory; type checks stay on everywhere. No libc, no DNS
+# (numeric IPv4 only), no scheduler, no sleep/polling loops: every wait
+# blocks in the kernel.
+#
+# Addresses are host-order numeric u64 values holding a 32-bit dotted quad
+# (127.0.0.1 = 2130706433). Wire order is big-endian and byte-identical to
+# the existing LinuxIpv4Address helper: family 2, port high byte first,
+# address most-significant byte first. Values above 4294967295 are -22
+# before any trap. Ports are host order: connect/send destinations must be
+# 1..65535 (port 0 fails fast with -22, it has no route); listen/bind
+# accept 0..65535 with 0 meaning an ephemeral kernel-assigned port.
+#
+# Descriptors are explicit caller-owned i64 values, not owned handles: the
+# caller owns the lifetime and closes exactly once with LinuxClose from
+# linux/io.sal. A creator return >= 0 (including 0, when stdin was closed
+# first) transfers exactly one open descriptor to the caller; consumers
+# reject only fd < 0, since Unix fd 0 is a valid socket. Helpers that
+# create a socket close it themselves when a later step fails, so a
+# negative return never leaks. Close is never retried. Shutdown
+# (NetShutdown) disables reads/writes without releasing the descriptor;
+# only LinuxClose releases it.
+#
+# Buffers are caller loans. Stream writers take immutable Bytes views;
+# datagram/byte readers take exclusive MutBytes loans whose length bounds
+# the transfer. Lengths come from spans, never from caller-claimed
+# capacities. Zero-length datagrams are valid: send/recv trap with the
+# loan's address and length 0, which the kernel accepts without touching
+# a byte (recvfrom with MSG_TRUNC reports the true length even into a
+# zero loan, so a zero loan receiving a nonzero datagram reports -28).
+# Single-attempt reads/writes report short counts as-is. -4 (EINTR)
+# retries inside the call and never escapes. Every other negative value
+# preserves the kernel -errno unchanged.
+#
+# Status vocabulary: 0 is success. -22 rejects invalid arguments
+# (negative descriptor, out-of-range address/port/backlog/how/timeout,
+# non-IPv4 or short kernel address). Datagram loans may be empty.
+# -28 reports a datagram truncated by a short destination loan (the loan
+# may hold the head bytes; never publish it on a negative status).
+# NetUdpSend returns the bytes sent; NetUdpReceive returns the byte count
+# in BOTH status and length on success (0 with length 0 names an empty
+# datagram, not a header). NetPollOne reports 1 readable-or-closed, 0 on
+# timeout. All other negative values are the kernel errno (-9 bad
+# descriptor, -98 address in use, -99 cannot assign, -111 refused, and
+# so on).
+use "linux/io.sal".
+
+# Kernel sockaddr_in: family (AF_INET = 2), big-endian port, big-endian
+# IPv4 address, then 8 zero padding bytes. Exactly 16 bytes, matching the
+# layout the existing listener helpers put on the wire.
+entity NetSockaddrIn:
+    layout "C".
+    has family of type u16.
+    has port of type u16.
+    has addr of type u32.
+    has zero of type u64.
+
+# Kernel socklen_t value-result word for getsockname/recvfrom.
+entity NetSocklen:
+    layout "C".
+    has value of type u32.
+
+# Kernel int option value for setsockopt (SO_REUSEADDR = 1).
+entity NetReuseFlag:
+    layout "C".
+    has value of type i32.
+
+# Validated kernel-ready endpoint plus its status: 0 with a usable
+# endpoint, or -22 with a zeroed endpoint that must not be trapped on.
+entity NetEndpoint:
+    layout "C".
+    has status of type i64.
+    has endpoint of type NetSockaddrIn.
+
+# Datagram result plus its source: status is the byte count, -28 when a
+# short loan truncated the datagram, or the negative errno. length echoes
+# the byte count on success. address/port name the source in host order
+# on success and are zero on any failure; never use them then.
+entity NetDatagram:
+    layout "C".
+    has status of type i64.
+    has length of type usize.
+    has address of type u64.
+    has port of type i64.
+
+# Kernel pollfd for a single descriptor: watched fd, requested events
+# (POLLIN = 1), and the kernel-written revents mask.
+entity NetPollFd:
+    layout "C".
+    has fd of type i32.
+    has events of type i16.
+    has revents of type i16.
+
+# 16-bit byte swap between host order and big-endian wire order. Partial
+# products fit u16 exactly, so checked arithmetic cannot trap.
+operation NetSwap16:
+    accepts value of type u16.
+    returns u16.
+    body:
+        return value % u16(256) * u16(256) + value / u16(256).
+
+# 32-bit byte swap between host order and big-endian wire order. Partial
+# products fit u32 exactly, so checked arithmetic cannot trap.
+operation NetSwap32:
+    accepts value of type u32.
+    returns u32.
+    body:
+        let zeroth = value % u32(256).
+        let first = value / u32(256) % u32(256).
+        let second = value / u32(65536) % u32(256).
+        let third = value / u32(16777216).
+        return zeroth * u32(16777216) + first * u32(65536) + second * u32(256) + third.
+
+# The zeroed endpoint of a rejected address: never trap on it.
+operation NetNoEndpoint:
+    returns NetEndpoint.
+    body:
+        return NetEndpoint(-22, NetSockaddrIn(u16(0), u16(0), u32(0), u64(0))).
+
+# Build a kernel-ready IPv4 endpoint from a host-order address and a
+# host-order port. Range failures report -22 with a zeroed endpoint;
+# narrowing conversions run only after validation, so they cannot trap.
+operation NetSockaddr:
+    accepts ipv4 of type u64.
+    accepts port of type i64.
+    returns NetEndpoint.
+    requires:
+        ipv4 <= u64(4294967295) otherwise NetNoEndpoint().
+        port >= 0 otherwise NetNoEndpoint().
+        port <= 65535 otherwise NetNoEndpoint().
+    body:
+        return NetEndpoint(0, NetSockaddrIn(u16(2), NetSwap16(u16(port)), NetSwap32(u32(ipv4)), u64(0))).
+
+# connect(2) on `status`'s socket; a negative cursor propagates.
+operation NetConnect:
+    accepts fd of type i64.
+    accepts endpoint of type NetSockaddrIn.
+    accepts status of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        status >= 0 otherwise status.
+    body:
+        let mut connected = 0.
+        unsafe:
+            set connected = syscall(i64(42), fd, address(endpoint), size_of(NetSockaddrIn), i64(0), i64(0), i64(0)).
+        return connected.
+
+# setsockopt(SO_REUSEADDR, 1); a negative cursor propagates.
+operation NetReuseAddress:
+    accepts fd of type i64.
+    accepts status of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        status >= 0 otherwise status.
+    body:
+        let reuse = NetReuseFlag(i32(1)).
+        let mut option = 0.
+        unsafe:
+            set option = syscall(i64(54), fd, i64(1), i64(2), address(reuse), size_of(NetReuseFlag), i64(0)).
+        return option.
+
+# bind(2); a negative cursor propagates.
+operation NetBind:
+    accepts fd of type i64.
+    accepts endpoint of type NetSockaddrIn.
+    accepts status of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        status >= 0 otherwise status.
+    body:
+        let mut bound = 0.
+        unsafe:
+            set bound = syscall(i64(49), fd, address(endpoint), size_of(NetSockaddrIn), i64(0), i64(0), i64(0)).
+        return bound.
+
+# listen(2); a negative cursor propagates.
+operation NetListen:
+    accepts fd of type i64.
+    accepts backlog of type i64.
+    accepts status of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        status >= 0 otherwise status.
+    body:
+        let mut listening = 0.
+        unsafe:
+            set listening = syscall(i64(50), fd, backlog, i64(0), i64(0), i64(0), i64(0)).
+        return listening.
+
+# Connect a new blocking TCP socket to a numeric IPv4 address and port.
+# Returns the caller-owned connected descriptor, or the negative errno.
+# Port 0 fails fast with -22 before any socket is created. A failed
+# connect closes the socket it just created; only success transfers one.
+operation NetTcpConnect:
+    accepts ipv4 of type u64.
+    accepts port of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        port >= 1 otherwise -22.
+        port <= 65535 otherwise -22.
+    body:
+        let built = NetSockaddr(ipv4, port).
+        let connection = LinuxSocketCreate(built.status, i64(2), i64(1)).
+        return LinuxCloseOnFailure(connection, NetConnect(connection, built.endpoint, connection)).
+
+# Bind a new blocking TCP listener with SO_REUSEADDR and the given
+# backlog. Port 0 assigns an ephemeral port; discover it with
+# NetLocalPort. Returns the caller-owned listening descriptor, or the
+# negative errno. Backlog below 1 is -22; larger values are the
+# kernel's to clamp. Any failure closes the socket it just created.
+operation NetTcpListen:
+    accepts ipv4 of type u64.
+    accepts port of type i64.
+    accepts backlog of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        backlog >= 1 otherwise -22.
+    body:
+        let built = NetSockaddr(ipv4, port).
+        let listener = LinuxSocketCreate(built.status, i64(2), i64(1)).
+        let mut code = NetReuseAddress(listener, listener).
+        set code = NetBind(listener, built.endpoint, code).
+        set code = NetListen(listener, backlog, code).
+        return LinuxCloseOnFailure(listener, code).
+
+# Accept the next queued connection on a listening descriptor. Blocks in
+# the kernel until one arrives; EINTR retries inside. Returns the
+# caller-owned connected descriptor, or the negative errno.
+operation NetTcpAccept:
+    accepts listener of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        listener >= 0 otherwise -22.
+    body:
+        let mut client = -4.
+        while client == -4:
+            unsafe:
+                set client = syscall(i64(43), listener, i64(0), i64(0), i64(0), i64(0), i64(0)).
+        return client.
+
+# Bind a new blocking UDP socket. Port 0 assigns an ephemeral port;
+# discover it with NetLocalPort. Returns the caller-owned descriptor, or
+# the negative errno. The wildcard address (ipv4 0) is accepted for
+# binding; NetSockaddr still rejects ports outside 0..65535. Any failure
+# closes the socket it just created.
+operation NetUdpBind:
+    accepts ipv4 of type u64.
+    accepts port of type i64.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let built = NetSockaddr(ipv4, port).
+        let socket = LinuxSocketCreate(built.status, i64(2), i64(2)).
+        return LinuxCloseOnFailure(socket, NetBind(socket, built.endpoint, socket)).
+
+# sendto(2) toward a validated endpoint with EINTR retry; a rejected
+# endpoint's status propagates before any trap.
+operation NetSendTo:
+    accepts socket of type i64.
+    accepts data of type Bytes.
+    accepts built of type NetEndpoint.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        built.status >= 0 otherwise built.status.
+    body:
+        let endpoint = built.endpoint.
+        let mut sent = -4.
+        while sent == -4:
+            unsafe:
+                set sent = syscall(i64(44), socket, address(data), i64(len(data)), i64(0), address(endpoint), size_of(NetSockaddrIn)).
+        return sent.
+
+# Send one datagram to a numeric IPv4 address and port. Returns the bytes
+# sent (0 for an empty datagram, whose address/length trap touches no
+# byte), or the negative errno. Oversized payloads keep the kernel's -90.
+# EINTR retries inside; the socket stays open either way.
+operation NetUdpSend:
+    accepts socket of type i64.
+    accepts ipv4 of type u64.
+    accepts port of type i64.
+    accepts data of type Bytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        socket >= 0 otherwise -22.
+        port >= 1 otherwise -22.
+        port <= 65535 otherwise -22.
+    body:
+        return NetSendTo(socket, data, NetSockaddr(ipv4, port)).
+
+# A received datagram from the kernel's results: the errno propagates, a
+# source that is not a full IPv4 sockaddr is -22, and a datagram longer than
+# the loan (MSG_TRUNC reports the true length) is -28. Failures zero the
+# length, address and port.
+operation NetDatagramFrom:
+    accepts received of type i64.
+    accepts count of type usize.
+    accepts length of type NetSocklen.
+    accepts endpoint of type NetSockaddrIn.
+    returns NetDatagram.
+    requires:
+        received >= 0 otherwise NetDatagram(received, usize(0), u64(0), 0).
+        length.value == u32(16) otherwise NetDatagram(-22, usize(0), u64(0), 0).
+        endpoint.family == u16(2) otherwise NetDatagram(-22, usize(0), u64(0), 0).
+        received <= i64(count) otherwise NetDatagram(-28, usize(0), u64(0), 0).
+    body:
+        return NetDatagram(received, usize(received), u64(NetSwap32(endpoint.addr)), i64(NetSwap16(endpoint.port))).
+
+# Receive one datagram with its source address. MSG_TRUNC exposes the
+# true length, so a short loan reports -28 instead of silently keeping a
+# prefix; length is valid only on success. A zero loan is valid: a zero
+# datagram arrives as status 0 with length 0, while a nonzero datagram
+# into a zero loan reports -28 (nothing is stored). EINTR retries inside
+# and never escapes.
+operation NetUdpReceive:
+    accepts socket of type i64.
+    accepts destination of type MutBytes.
+    returns NetDatagram.
+    effects: SystemCall.
+    requires:
+        socket >= 0 otherwise NetDatagram(-22, usize(0), u64(0), 0).
+    body:
+        let endpoint = NetSockaddrIn(u16(0), u16(0), u32(0), u64(0)).
+        let length = NetSocklen(u32(16)).
+        let count = len(destination).
+        let mut received = -4.
+        while received == -4:
+            unsafe:
+                set received = syscall(i64(45), socket, address(destination), i64(count), i64(32), address(endpoint), address(length)).
+        return NetDatagramFrom(received, count, length, endpoint).
+
+# poll(2) outcome: the errno propagates, 0 is timeout, anything else means
+# attempt the I/O now.
+operation NetPollResult:
+    accepts ready of type i64.
+    returns i64.
+    requires:
+        ready >= 0 otherwise ready.
+        ready != 0 otherwise 0.
+    body:
+        return 1.
+
+# Block in poll(2) until the descriptor signals or the timeout lapses:
+# 1 means attempt the I/O now (readable, hung up, or errored; that
+# result is authoritative), 0 is timeout, negative is the errno.
+# Timeout -1 waits without bound; 0 is a single nonblocking check; above
+# 2147483647 is -22 rather than a wrapped kernel int. EINTR restarts the
+# full wait inside; it never escapes. No sleep loop: each iteration waits
+# in the kernel.
+operation NetPollOne:
+    accepts fd of type i64.
+    accepts timeout_ms of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        fd >= 0 otherwise -22.
+        fd <= 2147483647 otherwise -22.
+        timeout_ms >= -1 otherwise -22.
+        timeout_ms <= 2147483647 otherwise -22.
+    body:
+        let watch = NetPollFd(i32(fd), i16(1), i16(0)).
+        let mut ready = -4.
+        while ready == -4:
+            unsafe:
+                set ready = syscall(i64(7), address(watch), i64(1), timeout_ms, i64(0), i64(0), i64(0)).
+        return NetPollResult(ready).
+
+# The host-order port of a getsockname result: the errno propagates, and a
+# non-IPv4 or short kernel address is -22.
+operation NetPortFrom:
+    accepts code of type i64.
+    accepts length of type NetSocklen.
+    accepts endpoint of type NetSockaddrIn.
+    returns i64.
+    requires:
+        code >= 0 otherwise code.
+        length.value == u32(16) otherwise -22.
+        endpoint.family == u16(2) otherwise -22.
+    body:
+        return i64(NetSwap16(endpoint.port)).
+
+# Report the bound host-order port of a socket via getsockname: 1..65535
+# when bound (ephemeral ports included), 0 when created but not yet
+# bound, or the negative errno. Non-IPv4 or short kernel addresses are
+# -22 rather than decoded guesses.
+operation NetLocalPort:
+    accepts fd of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        fd >= 0 otherwise -22.
+    body:
+        let endpoint = NetSockaddrIn(u16(0), u16(0), u32(0), u64(0)).
+        let length = NetSocklen(u32(16)).
+        let mut code = 0.
+        unsafe:
+            set code = syscall(i64(51), fd, address(endpoint), address(length), i64(0), i64(0), i64(0)).
+        return NetPortFrom(code, length, endpoint).
+
+# Disable receptions (0), transmissions (1), or both (2) on a connected
+# socket without releasing the descriptor: the peer observes EOF or a
+# reset while this side keeps ownership until LinuxClose. Returns 0 or
+# the negative errno; how outside 0..2 is -22 before any trap.
+operation NetShutdown:
+    accepts fd of type i64.
+    accepts how of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        fd >= 0 otherwise -22.
+        how >= 0 otherwise -22.
+        how <= 2 otherwise -22.
+    body:
+        let mut code = 0.
+        unsafe:
+            set code = syscall(i64(48), fd, how, i64(0), i64(0), i64(0), i64(0)).
+        return code.

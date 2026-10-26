@@ -76,6 +76,12 @@ pub(super) fn preflight(file: &sal_syntax::SalFile) -> Option<Diagnostic> {
                             .map(|stmt| (Node::Statement(stmt), depth + 1, span)),
                     );
                 }
+                Stmt::Unsafe { body } => {
+                    pending.extend(
+                        body.iter()
+                            .map(|stmt| (Node::Statement(stmt), depth + 1, span)),
+                    );
+                }
                 Stmt::Break | Stmt::Continue => {}
             },
             Node::Expression(expr) => match expr {
@@ -271,10 +277,11 @@ impl Checker<'_, '_> {
         }
     }
     fn require(&mut self, actual: &Ty, expected: &TypeRef) {
-        if actual
-            .as_ref()
-            .is_some_and(|actual| actual != expected && actual != &named("?"))
-        {
+        if actual.as_ref().is_some_and(|actual| {
+            actual != expected
+                && !matches!(actual, TypeRef::Named(name) if name == "?")
+                && !matches!(expected, TypeRef::Named(name) if name == "?")
+        }) {
             self.report("CON202", format!("expected {expected:?}, found {actual:?}"));
         } else if actual.is_none() {
             self.report("CON202", format!("expected {expected:?}, found Void"));
@@ -442,6 +449,7 @@ impl Checker<'_, '_> {
                 }
                 true
             }
+            Stmt::Unsafe { body } => self.block(body, depth, false, None),
             Stmt::If { cond, then, else_ } => {
                 self.expression(cond, Some(&named("bool")), depth, false);
                 let before = self.state.clone();
@@ -617,7 +625,13 @@ impl Checker<'_, '_> {
                 Some(binding.map(|binding| binding.ty).unwrap_or_else(|| named("?")))
             }
             Expr::Int(value) => {
-                let context = expected.filter(|ty| matches!(ty, TypeRef::Named(name) if super::is_integer_name(name)));
+                let context = expected.filter(|ty| {
+                    let name = match ty {
+                        TypeRef::Named(name) => name.as_str(),
+                        TypeRef::Generic { name, .. } => name.as_str(),
+                    };
+                    super::is_integer_name(name) || crate::int_bit_width(name).is_some()
+                });
                 if let Some(TypeRef::Named(name)) = context {
                     if !crate::integer_literal_fits(*value, crate::BodyType::Named(name)) { self.report("CON202", "integer literal does not fit the expected payload"); }
                 }
@@ -679,6 +693,9 @@ impl Checker<'_, '_> {
                 self.report("CON202", "reflection and operation-address operands must be compile-time names (offset_of also takes a literal field name)");
             }
             return Some(named("usize"));
+        }
+        if crate::is_numeric_intrinsic(name) {
+            return self.numeric_intrinsic(name, args, depth);
         }
         let registry = self.registry;
         if let Some(operation) = registry.operations.get(name) {
@@ -747,17 +764,149 @@ impl Checker<'_, '_> {
             true
         }
     }
-    fn concurrent_call(&mut self, name: &str, args: &[Expr], depth: usize, producer: bool) -> Ty {
-        for effect in ["SystemCall", "UnsafeMemory"] {
-            if !self.operation.effects.iter().any(|own| own == effect) {
-                self.report(
-                    "EFF203",
-                    format!(
-                        "operation `{}` must declare `{effect}` for concurrency",
-                        self.operation.name
-                    ),
-                );
+    fn integer_type(&mut self, expr: &Expr, expected: Option<&TypeRef>, depth: usize) -> Ty {
+        let actual = self.expression(expr, expected, depth + 1, false);
+        if let Some(inner) = actual.as_ref() {
+            if super::is_integer_name(&Self::type_name(inner)) {
+                return Some(inner.clone());
             }
+            if !matches!(inner, TypeRef::Named(name) if name == "?") {
+                self.report("CON202", "numeric intrinsic requires integer types");
+                return None;
+            }
+        }
+        actual
+    }
+    fn type_name(ty: &TypeRef) -> String {
+        match ty {
+            TypeRef::Named(name) => name.clone(),
+            TypeRef::Generic { name, .. } => name.clone(),
+        }
+    }
+    fn numeric_intrinsic(&mut self, name: &str, args: &[Expr], depth: usize) -> Ty {
+        if name == "bits_as" {
+            if !self.arity(name, args, 2) {
+                return None;
+            }
+            let target = match &args[0] {
+                Expr::Var(target) if crate::int_bit_width(target).is_some() => target.clone(),
+                _ => {
+                    self.report(
+                        "CON202",
+                        "`bits_as` target must be a compile-time integer type name",
+                    );
+                    return None;
+                }
+            };
+            let width = crate::int_bit_width(&target).expect("checked target");
+            let expected = self
+                .hint(&args[1])
+                .filter(|ty| super::is_integer_name(&Self::type_name(ty)))
+                .unwrap_or_else(|| named(&target));
+            let value = self.expression(&args[1], Some(&expected), depth + 1, false);
+            if let Some(value) = value.as_ref() {
+                let same = match value {
+                    TypeRef::Named(name) if name == "?" => true,
+                    TypeRef::Named(found) => crate::int_bit_width(found) == Some(width),
+                    _ => false,
+                };
+                if !same {
+                    self.report(
+                        "CON202",
+                        format!("`bits_as` requires the same bit width as `{target}`"),
+                    );
+                    return None;
+                }
+                if super::mentions_memory_owner(value) {
+                    self.report(
+                        "CON203",
+                        format!("`{name}` cannot accept an owned handle or span"),
+                    );
+                    return None;
+                }
+            }
+            return Some(named(&target));
+        }
+        if name == "bit_not" {
+            if !self.arity(name, args, 1) {
+                return None;
+            }
+            let hinted = self
+                .hint(&args[0])
+                .filter(|ty| super::is_integer_name(&Self::type_name(ty)));
+            let value = self.integer_type(&args[0], hinted.as_ref(), depth);
+            if value.as_ref().is_some_and(super::mentions_memory_owner) {
+                self.report(
+                    "CON203",
+                    format!("`{name}` cannot accept an owned handle or span"),
+                );
+                return None;
+            }
+            return value;
+        }
+        if name == "shift_left" || name == "shift_right" {
+            if !self.arity(name, args, 2) {
+                return None;
+            }
+            let hinted = self
+                .hint(&args[0])
+                .filter(|ty| super::is_integer_name(&Self::type_name(ty)));
+            let value = self.integer_type(&args[0], hinted.as_ref(), depth);
+            let count = self.expression(&args[1], Some(&named("usize")), depth + 1, false);
+            if count.as_ref().is_some_and(|ty| ty != &named("usize")) {
+                self.report(
+                    "CON202",
+                    format!("call `{name}` shift count requires usize"),
+                );
+                return None;
+            }
+            if value.as_ref().is_some_and(super::mentions_memory_owner) {
+                self.report(
+                    "CON203",
+                    format!("`{name}` cannot accept an owned handle or span"),
+                );
+                return None;
+            }
+            return value;
+        }
+        if !self.arity(name, args, 2) {
+            return None;
+        }
+        let hinted = self
+            .hint(&args[0])
+            .filter(|ty| super::is_integer_name(&Self::type_name(ty)))
+            .or_else(|| {
+                self.hint(&args[1])
+                    .filter(|ty| super::is_integer_name(&Self::type_name(ty)))
+            });
+        let left = self.integer_type(&args[0], hinted.as_ref(), depth);
+        let Some(left) = left else {
+            self.expression(&args[1], None, depth + 1, false);
+            return None;
+        };
+        let right = self.integer_type(&args[1], Some(&left), depth);
+        if right.as_ref().is_some_and(|ty| ty != &left) {
+            self.report("CON202", format!("`{name}` requires equal integer types"));
+            return None;
+        }
+        if super::mentions_memory_owner(&left) {
+            self.report(
+                "CON203",
+                format!("`{name}` cannot accept an owned handle or span"),
+            );
+            return None;
+        }
+        Some(left)
+    }
+    fn concurrent_call(&mut self, name: &str, args: &[Expr], depth: usize, producer: bool) -> Ty {
+        if !self.operation.effects.iter().any(|own| own == "SystemCall") {
+            self.report(
+                "EFF203",
+                format!(
+                    "operation `{}` must declare `SystemCall` for concurrency",
+                    self.operation.name
+                ),
+            );
         }
         if matches!(name, "channel" | "channel_clone" | "spawn") && !producer {
             self.report(

@@ -7,7 +7,7 @@ use super::{abi, Function, Local, Ty};
 
 impl Function<'_> {
     pub(super) fn resolve(&self, ty: &TypeRef) -> Option<Ty> {
-        Ty::resolve(ty, self.layouts)
+        Ty::resolve(ty, self.layouts, self.internal)
     }
 
     pub(super) fn record_layout(&self, ty: Ty) -> Option<&CRecordLayout> {
@@ -32,7 +32,11 @@ impl Function<'_> {
     /// RAX points to a record; destination is an address expression. Storage
     /// never aliases a different live value, so a forward copy is sufficient.
     pub(super) fn copy_record_to(&mut self, ty: Ty, destination: &str) {
-        let size = self.record_layout(ty).expect("validated record").size;
+        let size = self
+            .record_layout(ty)
+            .map(|layout| layout.size)
+            .or_else(|| self.internal_layout(ty).map(|layout| layout.size))
+            .expect("validated record");
         let _ = writeln!(self.code, "    movq %rax, %rsi\n    leaq {destination}, %rdi\n    movq ${size}, %rcx\n    rep movsb");
         // Never load unrelated frame bytes in the last INTEGER eightbyte.
         for offset in 0..(size.div_ceil(8) * 8 - size) {
@@ -57,19 +61,29 @@ impl Function<'_> {
             ));
         }
         let slot = self.allocate(ty);
-        let size = abi::bytes(self.layouts, ty);
+        let size = abi::bytes(self.layouts, self.internal, ty);
         let _ = writeln!(self.code, "    leaq -{slot}(%rbp), %rdi\n    xorl %eax, %eax\n    movq ${size}, %rcx\n    rep stosb");
         for (field, arg) in layout.fields.iter().zip(args) {
             let expected = self.resolve(&field.ty).expect("validated field");
             let actual = self.expression(arg, Some(expected))?;
             self.require(actual, expected, "record field")?;
             let destination = format!("{}(%rbp)", -(slot as i64) + field.offset as i64);
-            if matches!(expected, Ty::Record(_)) {
-                // A nested field has its actual C size, not rounded slot size.
+            if matches!(expected, Ty::Record(_) | Ty::Internal(_)) {
+                // A nested field has its actual size, not rounded slot size.
                 // copy_record_to also clears its unused last slot bytes, which
                 // could overlap the following field. Copy exactly here.
-                let size = self.record_layout(expected).expect("record").size;
+                let size = self
+                    .record_layout(expected)
+                    .map(|layout| layout.size)
+                    .or_else(|| self.internal_layout(expected).map(|layout| layout.size))
+                    .expect("validated record");
                 let _ = writeln!(self.code, "    movq %rax, %rsi\n    leaq {destination}, %rdi\n    movq ${size}, %rcx\n    rep movsb");
+            } else if expected.pair() {
+                let _ = writeln!(
+                    self.code,
+                    "    movq %rax, {destination}\n    movq %rdx, {}(%rbp)",
+                    -(slot as i64) + field.offset as i64 + 8
+                );
             } else {
                 let (instruction, register) = match expected.bits() {
                     8 => ("movb", "%al"),
@@ -86,13 +100,36 @@ impl Function<'_> {
 
     pub(super) fn field(&mut self, base: &Expr, name: &str) -> Result<Ty, Diagnostic> {
         let base_ty = self.expression(base, None)?;
-        let field = abi::record(self.layouts, base_ty)
-            .and_then(|layout| layout.fields.iter().find(|field| field.name == name))
-            .ok_or_else(|| self.error("N100", format!("unknown C record field `{name}`")))?;
-        let offset = field.offset;
-        let ty = self.resolve(&field.ty).expect("validated field");
-        if matches!(ty, Ty::Record(_)) {
+        let found = abi::record(self.layouts, base_ty)
+            .and_then(|layout| {
+                layout
+                    .fields
+                    .iter()
+                    .find(|field| field.name == name)
+                    .map(|field| (field.offset, field.ty.clone()))
+            })
+            .or_else(|| {
+                self.internal_layout(base_ty).and_then(|layout| {
+                    layout
+                        .fields
+                        .iter()
+                        .find(|field| field.name == *name)
+                        .map(|field| (field.offset, field.ty.clone()))
+                })
+            })
+            .ok_or_else(|| self.error("N100", format!("unknown record field `{name}`")))?;
+        let (offset, field_ty) = found;
+        let ty = self.resolve(&field_ty).expect("validated field");
+        if matches!(ty, Ty::Record(_) | Ty::Internal(_)) {
             let _ = writeln!(self.code, "    addq ${offset}, %rax");
+        } else if ty.pair() {
+            // Pair widths are exact words: move, never narrow-extend, and
+            // load the length before the pointer overwrites the base.
+            let _ = writeln!(
+                self.code,
+                "    movq {}(%rax), %rdx\n    movq {offset}(%rax), %rax",
+                offset + 8
+            );
         } else {
             let instruction = match (ty.bits(), ty.signed()) {
                 (8, true) => "movsbq",
@@ -147,11 +184,14 @@ impl Function<'_> {
     }
 
     pub(super) fn return_record(&mut self, ty: Ty) {
+        let size = self
+            .record_layout(ty)
+            .map(|layout| layout.size)
+            .or_else(|| self.internal_layout(ty).map(|layout| layout.size))
+            .expect("record result");
         if let Some(slot) = self.hidden_result {
-            let size = self.record_layout(ty).expect("record result").size;
             let _ = writeln!(self.code, "    movq %rax, %rsi\n    movq -{slot}(%rbp), %rdi\n    movq ${size}, %rcx\n    rep movsb\n    movq -{slot}(%rbp), %rax");
         } else {
-            let size = self.record_layout(ty).expect("record result").size;
             self.code.push_str("    movq %rax, %r11\n");
             for (word, register) in ["%rax", "%rdx"].iter().enumerate().take(size.div_ceil(8)) {
                 let offset = word * 8;
@@ -175,7 +215,7 @@ impl Function<'_> {
     }
 
     pub(super) fn copy_argument_to_stack(&mut self, local: Local, offset: usize) {
-        if matches!(local.ty, Ty::Record(_)) {
+        if matches!(local.ty, Ty::Record(_) | Ty::Internal(_)) {
             self.load(local);
             self.copy_record_to(local.ty, &format!("{offset}(%rsp)"));
         } else {

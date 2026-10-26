@@ -1,8 +1,6 @@
-# Anglish and SAL
+# SAL
 
-Anglish (`.ang`) is the human/agent-facing input language. SAL (`.sal`) is the deterministic compiler representation. Models may propose Anglish interpretations; they are not part of SAL compilation. A well-typed translation does **not** prove that a model preserved the user's intention: changing a requested port to another valid port must be caught by comparing the proposal with the request, not by a type checker.
-
-One canonical representation per operation; frontend aliases lower to that representation. Current Anglish recognition is a small deterministic sentence classifier, not general natural-language understanding. No cloud access or model is needed for the supported sentences.
+SAL is a deterministic, statically checked language with one canonical source representation. Programs are written directly in `.sal`; there is no natural-language translation layer, model invocation or alias frontend.
 
 ## Build and run locally
 
@@ -10,7 +8,7 @@ Prerequisites: Rust/Cargo for building the bootstrap compiler, GNU `as`, `ld`, a
 
 ```sh
 cargo build --workspace
-./target/debug/sal build-exe --ang examples/ang/hello.ang --out /tmp/sal-hello
+./target/debug/sal build-exe examples/native/hello.sal --out /tmp/sal-hello
 /tmp/sal-hello/hello
 # Hello, world!
 
@@ -21,91 +19,128 @@ cargo build --workspace
 
 `build-exe` defaults to the **native** backend. It emits GNU assembly and uses `as`/`ld` at build time, not generated Rust or `rustc`. The resulting executable has its own entry point, direct Linux write/exit syscalls, no interpreter, no dynamic library imports, no libc, and no Rust runtime. The compiler itself is still implemented in Rust and uses its standard library; self-hosting has not been implemented.
 
-Native execution supports lexical `let`/`let mut`, `set`, branches, fixed-frame `while` loops, nearest-loop `break`/`continue`, calls/recursion, procedures, and returns. Boolean `&&`/`||` short-circuit; `!` negates a bool. Both operands are statically checked even when one will not execute. Precedence, low to high: `||`, `&&`, equality, ordering, `+ -`, `* / %`, `!`, field/index access. Arithmetic and comparisons are typed; overflow, division by zero, signed MIN/−1 and invalid conversions trap instead of wrapping. Scalar types are signed/unsigned 8-, 16-, 32- and 64-bit integers, `usize`, `isize` and `bool`. `Text` is a UTF-8 span; `Bytes` is a distinct arbitrary-byte span. Span equality compares contents. Unsupported constructs fail closed.
+Native execution supports lexical `let`/`let mut`, `set`, branches, fixed-frame `while` loops, nearest-loop `break`/`continue`, calls/recursion, procedures, and returns. Boolean `&&`/`||` short-circuit; `!` negates a bool. Both operands are statically checked even when one will not execute. Precedence, low to high: `||`, `&&`, equality, ordering, `+ -`, `* / %`, `!`, field/index access. Arithmetic and comparisons are typed; overflow, division by zero, signed MIN/−1 and invalid conversions trap instead of wrapping. Scalar types are signed/unsigned 8-, 16-, 32- and 64-bit integers, `usize`, `isize` and `bool`. `Text` is a UTF-8 span; `Bytes` is a distinct arbitrary-byte span. Span equality compares contents. A `while true` loop without a `break` of its own counts as diverging for return coverage. Unsupported constructs fail closed.
 
 `Main() -> i64` supplies the Linux process exit status. `Main() -> Text` prints its result and a newline; a sole zero-parameter Text operation retains the hello-world fallback. Procedures omit `returns`, may fall through, and cannot be used as values.
 
 `Character` means one Unicode scalar; `Word` is nonempty text without Unicode whitespace; `Text` is unrestricted text. The body checker validates constrained literal construction and types of parameters, locals, calls, conditions, returns, field/index access, and return coverage. Native lowering of `Character` and `Word` is not yet available; they are **not** silently erased to unconstrained strings.
 
-## Anglish translation
+## Declarative operation contracts
 
-```sh
-./target/debug/sal run-ang examples/ang/hello.ang > /tmp/hello.sal
-./target/debug/sal check /tmp/hello.sal
-./target/debug/sal build-exe /tmp/hello.sal --out /tmp/from-sal
-/tmp/from-sal/hello
-```
-
-`run-ang` translates; despite the historical command name, it does not execute the program. stdout contains structurally checked SAL; diagnostics go to stderr. The deterministic frontend remains the default.
-
-### Optional model and omp bridge
-
-`--model-command PROGRAM` selects an explicit Anglish proposal generator. Repeat `--model-arg ARG` for its arguments, including arguments beginning with `--`. The command receives the SAL grammar and Anglish input on stdin and must return only UTF-8 SAL on stdout. It is executed directly, not through a shell. Nonzero exit, malformed SAL and semantic errors fail the command; there is no deterministic fallback hiding a model failure.
-
-For example, with an already configured omp provider:
-
-```sh
-printf '%s\n' 'Create Main returning Text with the exact result "Anglish model bridge".' > /tmp/model.ang
-./target/debug/sal run-ang /tmp/model.ang \
-  --model-command omp \
-  --model-arg -p \
-  --model-arg --model --model-arg opencode-go/muse-spark-1.3-contributor \
-  --model-arg --no-tools --model-arg --no-lsp \
-  --model-arg --no-extensions --model-arg --no-skills --model-arg --no-rules \
-  --model-arg --no-session --model-arg --no-title \
-  --model-arg --max-time --model-arg 90 \
-  --model-arg --system-prompt \
-  --model-arg 'Translate Anglish to SAL using the supplied grammar. Output SAL source only, no Markdown or commentary.' \
-  > /tmp/model-proposal.sal
-# Review the proposal against the request before compiling it.
-./target/debug/sal build-exe /tmp/model-proposal.sal --out /tmp/model-program
-/tmp/model-program/model-proposal
-# Anglish model bridge
-```
-
-The same model options work with `build-exe --ang` and `build-lib --ang`, but never with SAL input. No model is invoked by ordinary SAL compilation. A local runner can implement the same stdin/stdout protocol; the selected runner owns provider credentials and whether input leaves the machine. This is an omp CLI bridge, not an omp plugin. Passing structural checks does **not** establish that a model preserved intent.
-
-The supplied model grammar includes checked integer widths, short-circuit boolean operators, nearest-loop `break`/`continue`, C-layout records and explicit C imports/exports. Unsupported constructs must be reported rather than replaced with a different implementation.
-
-## SAL libraries and machine boundary
-
-Top-level `use "relative.sal".` loads a source relative to the containing file. Dependencies are loaded transitively once by canonical path; cycles and missing files are errors. Diagnostics identify the original dependency file. `use "std/http.sal".` selects the compiler's embedded SAL source package, never a local shadow or foreign runtime. Standard module paths cannot escape that namespace.
+Rules belong in the operation header next to `accepts` and `returns`, not in `if` chains inside the body:
 
 ```text
-use "std/bytes.sal".
-operation Count:
-    accepts data of type Bytes.
-    returns usize.
+operation HttpMethod:
+    accepts request of type Bytes.
+    returns Bytes from request.
+    requires:
+        HttpRequestLineEnd(request) >= 0 otherwise bytes("").
     body:
-        let mut count = usize(0).
-        while count < len(data):
-            set count = count + 1.
-        return count.
+        ...
+
+operation Guarded:
+    accepts owner of type i64.
+    returns i64.
+    requires:
+        owner > 0 otherwise -1.
+    ensures:
+        result >= owner.
+    body:
+        return owner + 1.
 ```
 
-Native intrinsics provide computation and the explicit OS boundary, not protocol implementations:
+| Clause | Meaning |
+|---|---|
+| `requires: COND otherwise VALUE.` | Evaluated once, in declaration order, before the body. A false condition returns `VALUE`, which must have the declared return type. |
+| `requires: COND.` | A false condition traps (`ud2`); there is no silent fallthrough. |
+| `ensures: COND.` | Evaluated exactly once after the return expression. `result` names the returned value; a body local called `result` does not shadow it. A false condition traps. |
+| `returns T from a, b.` | Declares which parameters the returned views/records may borrow from. The memory checker verifies this provenance; it is not trusted. |
+| `borrows x.` | `x` is an exclusive borrow of the caller's owner. The call site borrows the original slot, so no alias is created. |
+| `consumes x.` | The owned parameter is transferred to the callee; the caller cannot use it afterwards. |
+
+Contract conditions and `otherwise` values must be pure. The compiler walks the actual callee graph, so a contract that calls a writer, a syscall or an unresolved operation is rejected (`DEC203`), even if the caller has the effect. Record constructors count as pure. The declaration pass lowers contracts to ordinary SAL before effect, type and ownership checks, so lowered contracts get the same checks as hand-written code.
+
+## Typed JSON schemas
+
+An entity with `encoding JSON.` is a typed wire schema. Defaults and validation rules are declared on it:
+
+```text
+entity MutationInput:
+    encoding JSON.
+    has warehouse_id of type i64.
+    has codes of type TextList.
+    defaults warehouse_id to 1.
+    requires:
+        warehouse_id > 0.
+        len(codes) > 0.
+        len(codes) <= 64 otherwise -28.
+        TextListEachNonEmpty(codes).
+        TextListEachAtMost(codes, usize(128)) otherwise -28.
+        TextListNoNul(codes).
+        TextListUnique(codes).
+```
+
+For each schema the compiler generates ordinary SAL operations:
+
+| Operation | Contract |
+|---|---|
+| `TDecodeJson(input: Bytes, storage: MutBytes)` | Returns `{status, value: T, written, read_end}`. Trailing non-whitespace input is `-22`. |
+| `TDecodeJsonAt(input: Bytes, start: usize, storage: MutBytes)` | The same, but following bytes are allowed, for nested values. |
+| `TEncodeJson(value: T, target: MutBytes) -> i64` | Returns the bytes written, or a negative status. A result that does not fit is an error, never truncated output. |
+
+- **Field types:** `i64`, `u64`, `bool`, `Text`, `TextList`, and acyclic nested JSON entities.
+- **Status codes:** a missing required field, a duplicate field (compared after escape decoding) or malformed JSON is `-22`. A failed rule returns its `otherwise` status, or `-22` if it has none.
+- **Unknown fields:** fully validated, then ignored.
+- **Storage:** decoded `Text` and `TextList` values borrow the caller's `storage`; nothing is allocated per field.
+- **Runtime:** parsing and encoding run in `stdlib/json_model.sal` and `stdlib/text_list.sal`. The compiler only derives the typed field dispatch.
+
+## Safe memory and the machine boundary
+
+Application code works with checked owners and loans, not raw addresses:
+
+| Value | Operations |
+|---|---|
+| `Buffer` (affine owner) | `buffer(usize)` allocates, `buffer_drop(owner)` releases exactly once, `len(owner)`. Cannot be copied, cast, addressed or sent. |
+| `MutBytes` (exclusive loan) | `borrow_mut(buffer, offset, length)`, `slice_mut(span, offset, length)`, `put(span, index, u8)`, `byte(span, index)`, `view(span) -> Bytes`, `borrow_end(span)`. |
+| `Bytes` / `Text` (read-only views) | `slice`, `byte`, `len`, `bytes(text)`. `text(bytes)` validates UTF-8 and traps on invalid input. |
+| `Borrow<T>` | `borrow(owner)` gives a scoped exclusive reference to an owner for helper calls. |
+| `Vector<T>`, `Map<K,V>` | POD-only collections with explicit capacity. Lookups return `{found, value}`; a failed allocation leaves existing data intact. |
+
+The memory checker tracks the provenance of every view, including views held in records and views returned through calls. It rejects:
+
+- using a loan after `borrow_end`;
+- dropping or moving an owner while a derived view is live;
+- returning a view of a dead local;
+- overlapping mutable loans;
+- an owner that is not dropped or transferred on every path, including early returns (`MEM208`).
+
+Sibling loans of one arena are allowed. Disjointness is proven at compile time where possible; otherwise a range check runs before the second loan is granted.
+
+Every operation declares its direct and callee effects. `Pure` cannot be combined with other effects. Raw intrinsics (`syscall`, `address`, `bytes_at`, `load8`, `store8`, atomics) need `UnsafeMemory`. An `unsafe:` block grants `UnsafeMemory` to the statements inside it only; `SystemCall` still propagates, and type and ownership checks still apply. The standard library keeps raw code in narrow `unsafe:` blocks at the OS boundary, so its public operations, including channels and threads, need only `effects: SystemCall.` There is no hidden signal policy or managed scheduler.
 
 | Intrinsics | Contract |
 |---|---|
-| `len`, `bytes` | Byte length and zero-copy Text-to-Bytes view. |
-| `byte`, `slice` | Bounds-checked byte access/subspans; empty endpoint slices are valid. |
+| `len`, `bytes`, `byte`, `slice` | Byte length, zero-copy Text-to-Bytes view, bounds-checked access and subspans. |
 | `i8`…`i64`, `u8`…`u64`, `usize`, `isize` | Checked explicit integer conversions. |
-| `syscall(number,a,b,c,d,e,f)` | Exactly seven machineword arguments; Linux x86-64 registers, signed negative errno; requires **both** `SystemCall` and `UnsafeMemory`. |
-| `address`, `bytes_at`, `load8`, `store8` | Explicit raw-memory escape/access; requires `UnsafeMemory`. |
+| `wrapping_*`, `bit_*`, `shift_left`/`shift_right`, `bits_as` | Explicit same-width wrapping and bit operations. Shifts reject counts at or above the bit width. |
+| `syscall(number,a,b,c,d,e,f)` | Seven machine-word arguments in Linux x86-64 registers; returns negative errno. Requires `SystemCall` and `UnsafeMemory`. |
 | `size_of`, `align_of`, `offset_of` | Target-checked C-layout record geometry, evaluated at compile time. |
 
-Every operation must declare its direct and callee effects. `Pure` cannot accompany another effect. Native lowering accepts implemented `SystemCall`/`UnsafeMemory` effects, not abstract promises. Raw memory operations do not provide ownership or mapping validity: the caller owns lifetime, bounds and alias discipline. Kernel signal behavior remains Linux behavior; there is no hidden signal policy or managed scheduler.
+## SAL libraries
 
-The following algorithms are actual `.sal` implementations:
+Top-level `use "relative.sal".` loads a source relative to the containing file. Dependencies are loaded transitively, once per canonical path; cycles and missing files are errors, and diagnostics name the original file. `use "std/http.sal".` selects the compiler's embedded SAL package, never a local shadow. Standard module paths cannot escape that namespace.
 
-- `stdlib/bytes.sal`: prefix/search, decimal parsing/formatting (including signed MIN), and bounded copying.
-- `stdlib/linux/{io,memory,net}.sal`: partial-write/EINTR loops, exact reads, mappings, TCP and filesystem Unix sockets using explicit caller storage.
-- `stdlib/http.sal`: bounded fragmented HTTP/1.0–1.1 request framing, strict Content-Length handling, method/path views, and JSON response headers/body writes. Chunked requests and duplicate Content-Length are rejected; responses close the connection.
-- `stdlib/json.sal`: complete JSON value validation with depth limits, strict UTF-8 and surrogate handling, unsigned integers, and bounded string decoding/encoding. Writers may partially change their output buffer on an error; callers must not publish it as a successful result.
-- `stdlib/routing.sal`: exact raw path matching/captures, query exclusion, strict percent decoding and UTF-8 validation.
-- `stdlib/server.sal` and `stdlib/linux/process.sal`: bounded fork-per-request lifecycle, explicit SIGPIPE policy, socket timeouts, descriptor/mapping cleanup and child reaping. There is no language scheduler.
-- `stdlib/postgres.sal`: trust-authenticated PostgreSQL v3 startup, bounded frame parsing, parameterized Parse/Bind/Execute/Sync, validated DataRow views and SQLSTATE errors. No libpq or database driver is linked.
-- `stdlib/concurrency.sal`: bounded/rendezvous channels, atomic multi-arm selection, futex synchronization and native thread lifecycle. Compiler support supplies typed lowering and machine/OS intrinsics, not a foreign channel implementation.
+Every algorithm below is implemented in `.sal`; no foreign runtime is linked:
+
+| Module | Contents |
+|---|---|
+| `bytes`, `text`, `binary`, `math`, `hash` | Search and prefixes, decimal parsing and formatting, UTF-8 iteration and slicing, big/little-endian integers and VarInt/VarLong, checked integer helpers, FNV-1a and CRC32/CRC32C. |
+| `buffer`, `collections` | Allocator policy for `Buffer`, and `Vector`/`Map` storage, growth, hashing and probing. |
+| `json`, `json_model`, `text_list` | Strict JSON validation and string codecs (depth limits, UTF-8, surrogates), the schema runtime, and BE32-framed UTF-8 lists. |
+| `http`, `http_client`, `routing`, `server` | Bounded HTTP/1.x request framing (strict Content-Length, chunked requests rejected), a client, exact routing with captures and percent decoding, and a fork-per-request server. The server has a 32-child limit, socket timeouts, an explicit SIGPIPE policy and descriptor cleanup. |
+| `postgres` | PostgreSQL v3 with trust authentication only: startup, parameterized Parse/Bind/Execute/Sync, validated DataRow views and SQLSTATE errors. No libpq. |
+| `net`, `fs`, `time`, `linux/*` | TCP/UDP/poll, durable file operations, monotonic/wall clocks and sleep, and the raw syscall wrappers. |
+| `concurrency` | Bounded and rendezvous channels, atomic multi-arm selection, futex synchronization and native threads. |
 
 ```sh
 ./target/debug/sal build-exe examples/native/binary_io.sal --out /tmp/sal-binary
@@ -113,7 +148,7 @@ The following algorithms are actual `.sal` implementations:
 # 41 00 ff 0a
 ```
 
-These libraries use caller-owned buffers, not a foreign allocator or Rust protocol templates. Kernel `timeval` and signal-action structures use typed C-layout records instead of hand-packed byte offsets. Early returns, short-circuit guards and loop control are language constructs rather than library-specific state-flag workarounds. Contiguous data access is possible; no automatic cache-locality or application throughput improvement is claimed.
+These libraries use caller-owned buffers. No automatic cache-locality or throughput improvement is claimed.
 
 ## C ABI: exports, imports and record layouts
 
@@ -135,12 +170,12 @@ Produces `libexports.a` and `exports.h`. A C caller includes that header and lin
 
 The C boundary supports fixed-width scalar parameters/results, procedures and naturally aligned `layout "C".` records, including nested and by-value records. Linux x86-64 SysV lowering covers register/stack arguments, aggregate register rollback and hidden large-record return pointers. C exports must remain pure; Text/Bytes cannot cross this boundary. `size_of(Record)`, `align_of(Record)` and `offset_of(Record, "field")` are compile-time geometry queries. A record constructor is `Record(field1, field2)`; fields use `value.field`.
 
-A bodyless operation with `imports "C" as "foreign_symbol".` declares an explicit import and must declare **both** `SystemCall` and `UnsafeMemory`; callers inherit these effects. Link its implementation with repeated `build-exe … --link object.o --link library.a` arguments. Importing foreign code is an explicit application choice, never how the SAL HTTP/JSON/database libraries are implemented. Typed raw pointers, callbacks, unions, packed layouts, variadics and general FFI ownership rules remain unsupported. Raw machineword addresses are unsafe, not checked pointers. Export/import symbols must be valid identifiers and unambiguous. Textual pre/postconditions and unimplemented effects are rejected by native lowering rather than reported as enforced contracts.
+A bodyless operation with `imports "C" as "foreign_symbol".` declares an explicit import and must declare **both** `SystemCall` and `UnsafeMemory`; callers inherit these effects. Link its implementation with repeated `build-exe … --link object.o --link library.a` arguments. Importing foreign code is an explicit application choice, never how the SAL HTTP/JSON/database libraries are implemented. Typed raw pointers, callbacks, unions, packed layouts, variadics and general FFI ownership rules remain unsupported. Raw machineword addresses are unsafe, not checked pointers. Export/import symbols must be valid identifiers and unambiguous. Contracts on exported operations are lowered into the exported body like any other contract; non-boolean conditions and unimplemented effects are rejected.
 
 ## Native HTTP declaration frontend
 
 ```sh
-./target/debug/sal build-exe --ang examples/ang/tupoi.ang --out /tmp/tupoi
+./target/debug/sal build-exe examples/native/tupoi.sal --out /tmp/tupoi
 /tmp/tupoi/tupoi
 # In another terminal:
 curl http://127.0.0.1:8081/say/hello
@@ -186,7 +221,7 @@ For counters, create control/ack FIFOs and run `perf stat --delay=-1 --control=f
 
 ## Channels and `wait_for`
 
-Import `use "std/concurrency.sal".` and declare `effects: SystemCall, UnsafeMemory.` on operations using this API and their callers.
+Import `use "std/concurrency.sal".` and declare `effects: SystemCall.` on operations using this API and their callers.
 
 | Operation | Contract |
 |---|---|
@@ -213,7 +248,7 @@ target/debug/sal build-exe crates/sal_cli/tests/fixtures/concurrency/cancel_hete
 
 ## Warehouse API
 
-`apps/warehouse/{codec,warehouse}.sal` implement the Lamoda task in SAL: three JSON RPC-like POST actions backed by PostgreSQL. The application and readiness probe are native ELF binaries; the final scratch image contains no Rust, libc, Python, shell or database client. PostgreSQL is a separate infrastructure container. Python is used only by the functional test harness.
+`apps/warehouse/{codec,warehouse}.sal` implement the Lamoda task in SAL: three JSON RPC-like POST actions backed by PostgreSQL. Request and reply bodies are JSON schemas (`MutationInput`, `StockInput`, `ReserveReply`, `StockItem`, `ErrorReply`, …). Limits and status mappings are header `requires … otherwise` clauses, and the PostgreSQL wire format is handled in `std/postgres`. The application and readiness probe are native ELF binaries; the final scratch image contains no Rust, libc, Python, shell or database client. PostgreSQL runs in a separate infrastructure container.
 
 ### Start, stop and test
 
@@ -230,11 +265,11 @@ make test
 make integration-test
 ```
 
-`make test` also needs host Rust/Cargo and the native test tools listed above. `make integration-test` starts the Compose services, builds the host compiler, then exercises an isolated temporary database through the real native HTTP application; it additionally needs Python 3. The test database is created and dropped explicitly, never substituted for the persistent application database.
+`make test` needs host Rust/Cargo and the native test tools listed above; it also builds and runs the SAL library fixtures and Solaris examples (`make stdlib-test`, `make solaris-test`). `make integration-test` starts a Compose project with a unique name and its own fresh volumes. It then runs `apps/warehouse/test_api.sal`, the functional suite written in SAL, as a scratch image sharing the app's network namespace and database socket. The suite makes real HTTP requests and sets up fixtures over SQL through the SAL PostgreSQL client. The persistent application database is never touched, and the project's volumes are removed afterwards.
 
 `WAREHOUSE_PORT=18080 make up` changes the host port. The default bind is loopback; exposing it with `WAREHOUSE_BIND=0.0.0.0` requires your own firewall/authentication/TLS policy. This is a local development deployment: the PostgreSQL client currently supports **trust authentication only**, over the shared Unix socket, and PostgreSQL has no TCP listener. Do not expose or share that socket with untrusted processes. HTTP authentication, TLS, MD5/SCRAM and production secrets management are not implemented.
 
-When using a different port, pass the same `WAREHOUSE_PORT` to `make integration-test` and substitute that port in the requests below. Do not stop an unrelated service to claim the default port.
+Do not stop an unrelated service to claim the default port. The integration test binds an ephemeral loopback port (`WAREHOUSE_PORT=0`), so it never conflicts with a running deployment.
 
 Fresh database volumes run `apps/warehouse/sql/001_schema.sql` and `002_seed.sql` automatically. Existing volumes retain their state and are not reinitialized on restart. The schema has unique item codes, warehouse/item foreign keys and `0 <= reserved <= quantity` constraints. Seeds use `ON CONFLICT DO NOTHING` and do not reset reservations. A shared item can have independent inventory at multiple warehouses.
 
@@ -306,12 +341,27 @@ The real PostgreSQL functional suite covers exact-capacity concurrent reserve/re
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+make stdlib-test solaris-test
 readelf -lW /tmp/sal-hello/hello
 readelf -dW /tmp/sal-hello/hello
 ```
 
-Integration coverage builds and executes native programs, tests mutation/loops, checked arithmetic/conversions, binary memory/I/O and all seven syscall operands, resolves source diamonds/cycles, exercises HTTP framing and JSON/Unicode boundaries, links real C callers (including u8/Void), and inspects runtime dependencies. It checks repeated native builds with the same toolchain, not identical binaries across toolchains. Socket tests own their ephemeral listeners and use bounded cleanup/deadlines. The optional omp bridge was also exercised through real model translation, native compilation and execution.
+Integration tests build and run native programs. They cover:
+
+- mutation, loops, checked arithmetic and conversions;
+- contracts and schemas;
+- the memory checker's rejections and accepted patterns;
+- binary memory/I/O and all seven syscall operands;
+- source diamonds and cycles;
+- HTTP framing, JSON/Unicode boundaries and PostgreSQL framing;
+- channels and threads under stress;
+- real C callers, and the runtime dependencies of the produced binaries.
+
+Repeated builds with the same toolchain are checked; identical binaries across toolchains are not. Socket tests own their ephemeral listeners and use bounded cleanup and deadlines.
 
 ## Remaining language work
 
-General safe owned collections/borrowing and executable contracts beyond checked locals/spans and explicit unsafe memory access are **not implemented capabilities**. Channel/thread owner checking is deliberately narrower than a general borrow checker; it does not make raw memory access safe.
+- The compiler is not self-hosted.
+- `Character` and `Word` are not lowered natively.
+- Borrowed spans cannot cross the C ABI or travel through channels.
+- Raw `unsafe:` code is audited by hand, not proven safe.

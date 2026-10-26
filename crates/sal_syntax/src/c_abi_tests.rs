@@ -46,6 +46,32 @@ fn malformed_and_conflicting_c_metadata_is_rejected() {
 }
 
 #[test]
+fn contract_metadata_defaults_to_parser_false_and_empty() {
+    let (file, diagnostics) = parse(
+        "entity Pair:\n  layout \"C\".\n  has x of type i16.\noperation Foreign:\n  imports \"C\" as \"foreign_pair\".\n  returns Pair.\n  effects: SystemCall, UnsafeMemory.\n",
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let Item::Entity(record) = &file.items[0] else {
+        panic!("record")
+    };
+    assert!(!record.json.enabled);
+    assert!(record.json.defaults.is_empty());
+    assert!(record.json.requires.is_empty());
+    assert!(record.iteration.is_none());
+    assert!(!record.generated);
+    let Item::Operation(import) = &file.items[1] else {
+        panic!("import")
+    };
+    assert!(import.requires.is_empty());
+    assert!(import.ensures.is_empty());
+    assert!(import.ownership.borrows.is_empty());
+    assert!(import.ownership.consumes.is_empty());
+    assert!(import.ownership.return_from.is_empty());
+    assert!(!import.ownership.lowered);
+    assert!(!import.generated);
+}
+
+#[test]
 fn malformed_deep_reflection_operands_are_discarded_iteratively() {
     let nested = format!("{}1{}", "size_of(".repeat(20_000), ")".repeat(20_000));
     let (_, diagnostics) = parse(&format!(

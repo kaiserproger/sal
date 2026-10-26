@@ -253,20 +253,11 @@ operation Main:
 }
 
 #[test]
-fn anglish_translation_is_directly_compilable_as_sal() {
+fn canonical_hello_builds_and_prints_without_translation() {
     let fixture = Fixture::new();
-    let ang = fixture.0.join("hello.ang");
-    std::fs::write(&ang, "Say hello world.\n").expect("write Anglish");
-    let translated = Command::new(env!("CARGO_BIN_EXE_sal"))
-        .arg("run-ang")
-        .arg(&ang)
-        .output()
-        .expect("translate Anglish");
-    success(&translated);
-    let source = fixture.0.join("example.sal");
-    std::fs::write(&source, translated.stdout).expect("save canonical SAL");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/native/hello.sal");
     success(&fixture.build("build-exe", &source));
-    let output = Command::new(fixture.0.join("out/example"))
+    let output = Command::new(fixture.0.join("out/hello"))
         .output()
         .expect("run compiled SAL");
     success(&output);
@@ -398,43 +389,47 @@ fn sal_tcp_library_reads_and_echoes_binary_data_on_its_owned_ephemeral_socket() 
     }
 
     let fixture = Fixture::new();
-    let library = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stdlib/linux");
-    for name in ["io.sal", "memory.sal", "net.sal"] {
-        std::fs::copy(library.join(name), fixture.0.join(name)).expect("copy SAL transport");
-    }
     let source = fixture.source(
-        r#"use "net.sal".
-use "memory.sal".
+        r#"use "std/linux/net.sal".
+use "std/net.sal".
+use "std/binary.sal".
 operation Main:
   returns i64.
-  effects: SystemCall, UnsafeMemory.
+  effects: SystemCall.
   body:
-    let mapping = LinuxMapMemory(usize(4096)).
-    if mapping < 0:
-      return 1.
-    let buffer = usize(mapping).
-    if LinuxIpv4Address(buffer, 2130706433, 0) != 0:
+    let arena = buffer(usize(64)).
+    let endpoint = borrow_mut(arena, usize(0), usize(16)).
+    if LinuxIpv4Address(endpoint, u64(2130706433), 0) != 0:
+      borrow_end(endpoint).
+      buffer_drop(arena).
       return 2.
-    store8(buffer + 32, u8(1)).
-    let listener = LinuxTcpListen(buffer, buffer + 32, 1).
+    let listener = LinuxTcpListen(view(endpoint), 1).
+    borrow_end(endpoint).
     if listener < 0:
+      buffer_drop(arena).
       return 3.
-    store8(buffer + 24, u8(16)).
-    if syscall(51, listener, buffer, buffer + 24, 0, 0, 0) < 0:
-      return 4.
-    if LinuxWriteAll(1, bytes_at(buffer + 2, usize(2))) != 2:
+    let port = NetLocalPort(listener).
+    let ready = borrow_mut(arena, usize(16), usize(2)).
+    let encoded = BinaryWriteU16Be(ready, usize(0), port).
+    let published = LinuxWriteAll(1, view(ready)).
+    borrow_end(ready).
+    if port < 1 || encoded != 2 || published != 2:
+      LinuxClose(listener).
+      buffer_drop(arena).
       return 5.
     let client = LinuxTcpAccept(listener).
-    if client < 0:
-      return 6.
-    if LinuxReadExact(client, buffer + 64, usize(4)) != 4:
-      return 7.
-    let written = LinuxWriteAll(client, bytes_at(buffer + 64, usize(4))).
-    LinuxClose(client).
     LinuxClose(listener).
-    LinuxUnmapMemory(buffer, usize(4096)).
-    if written != 4:
-      return 8.
+    if client < 0:
+      buffer_drop(arena).
+      return 6.
+    let echo = borrow_mut(arena, usize(32), usize(4)).
+    let received = LinuxReadExact(client, echo).
+    let written = LinuxWriteAll(client, view(echo)).
+    borrow_end(echo).
+    LinuxClose(client).
+    buffer_drop(arena).
+    if received != 4 || written != 4:
+      return 7.
     return 0.
 "#,
     );
@@ -493,21 +488,11 @@ operation Main:
 #[test]
 fn sal_decimal_codec_handles_signed_extremes_and_preserves_short_output() {
     let fixture = Fixture::new();
-    let library = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stdlib");
-    std::fs::create_dir(fixture.0.join("linux")).expect("create Linux library directory");
-    std::fs::copy(library.join("bytes.sal"), fixture.0.join("bytes.sal"))
-        .expect("copy byte codecs");
-    std::fs::copy(
-        library.join("linux/memory.sal"),
-        fixture.0.join("linux/memory.sal"),
-    )
-    .expect("copy mapping support");
     let source = fixture.source(
-        r#"use "bytes.sal".
-use "linux/memory.sal".
+        r#"use "std/bytes.sal".
 operation Main:
   returns i64.
-  effects: SystemCall, UnsafeMemory.
+  effects: SystemCall.
   body:
     if BytesParseDecimal(bytes("9223372036854775807")) != 9223372036854775807:
       return 1.
@@ -523,36 +508,38 @@ operation Main:
       return 6.
     if BytesParseDecimal(bytes("00042")) != 42:
       return 7.
-    let mapping = LinuxMapMemory(usize(4096)).
-    if mapping < 0:
-      return 8.
-    let output = usize(mapping).
-    if BytesDecimal(-9223372036854775808, output, usize(20)) != 20:
-      return 9.
-    if bytes_at(output, usize(20)) != bytes("-9223372036854775808"):
-      return 10.
-    if BytesDecimal(0, output, usize(0)) != -28:
-      return 11.
-    if bytes_at(output, usize(20)) != bytes("-9223372036854775808"):
-      return 12.
-    if BytesDecimal(0, output, usize(1)) != 1:
-      return 13.
-    if load8(output) != 48:
-      return 14.
-    if BytesDecimal(9223372036854775807, output, usize(19)) != 19:
-      return 15.
-    if bytes_at(output, usize(19)) != bytes("9223372036854775807"):
-      return 16.
-    if BytesCopy(output, usize(3), bytes("copy")) != -28:
-      return 17.
-    if bytes_at(output, usize(4)) != bytes("9223"):
-      return 18.
-    if BytesCopy(output, usize(4), bytes("copy")) != 4:
-      return 19.
-    if bytes_at(output, usize(4)) != bytes("copy"):
-      return 20.
-    LinuxUnmapMemory(output, usize(4096)).
-    return 0.
+    let arena = buffer(usize(32)).
+    let output = borrow_mut(arena, usize(0), usize(32)).
+    let mut failure = 0.
+    let full = slice_mut(output, usize(0), usize(20)).
+    if BytesDecimal(-9223372036854775808, full) != 20 || view(full) != bytes("-9223372036854775808"):
+      set failure = 9.
+    let none = slice_mut(full, usize(0), usize(0)).
+    if BytesDecimal(0, none) != -28:
+      set failure = 11.
+    borrow_end(none).
+    if view(full) != bytes("-9223372036854775808"):
+      set failure = 12.
+    borrow_end(full).
+    let one = slice_mut(output, usize(0), usize(1)).
+    if BytesDecimal(0, one) != 1 || byte(one, usize(0)) != u8(48):
+      set failure = 13.
+    borrow_end(one).
+    let max = slice_mut(output, usize(0), usize(19)).
+    if BytesDecimal(9223372036854775807, max) != 19 || view(max) != bytes("9223372036854775807"):
+      set failure = 15.
+    borrow_end(max).
+    let short = slice_mut(output, usize(0), usize(3)).
+    if BytesCopy(short, bytes("copy")) != -28 || view(short) != bytes("922"):
+      set failure = 17.
+    borrow_end(short).
+    let exact = slice_mut(output, usize(0), usize(4)).
+    if BytesCopy(exact, bytes("copy")) != 4 || view(exact) != bytes("copy"):
+      set failure = 19.
+    borrow_end(exact).
+    borrow_end(output).
+    buffer_drop(arena).
+    return failure.
 "#,
     );
     success(&fixture.build("build-exe", &source));
@@ -564,7 +551,7 @@ operation Main:
 }
 
 #[test]
-fn model_execution_is_an_anglish_option_not_a_sal_compilation_step() {
+fn removed_model_flag_is_rejected_for_sal_builds() {
     let fixture = Fixture::new();
     let source = fixture.source("operation Main:\n  returns i64.\n  body:\n    return 0.\n");
     let output = Command::new(env!("CARGO_BIN_EXE_sal"))
@@ -575,9 +562,32 @@ fn model_execution_is_an_anglish_option_not_a_sal_compilation_step() {
         .arg("--model-command")
         .arg("sal-nonexistent-model-that-must-never-run")
         .output()
-        .expect("reject model execution in deterministic SAL mode");
+        .expect("reject removed model flag");
     assert_eq!(output.status.code(), Some(2));
     assert!(!fixture.0.join("out").exists());
+}
+
+#[test]
+fn removed_anglish_command_and_flag_are_rejected() {
+    let fixture = Fixture::new();
+    let source = fixture.source("operation Main:\n  returns i64.\n  body:\n    return 0.\n");
+    for args in [
+        vec!["run-ang".to_string(), source.display().to_string()],
+        vec![
+            "build-exe".to_string(),
+            "--ang".to_string(),
+            source.display().to_string(),
+            "--out".to_string(),
+            fixture.0.join("out").display().to_string(),
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sal"))
+            .args(&args)
+            .output()
+            .expect("reject removed Anglish entrypoint");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!fixture.0.join("out").exists());
+    }
 }
 
 #[test]

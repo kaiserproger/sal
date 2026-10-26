@@ -25,17 +25,19 @@ use "bytes.sal".
 # mismatch. name nonempty selects capture mode: returns the last slice whose
 # :name equals name, empty when nothing matches. Malformed patterns (empty,
 # missing leading slash, lone colon) return empty in both modes.
-# Pure, no allocation; returned views borrow path.
+# Pure, no allocation; returned views borrow path. Endpoint and slash bounds
+# are header requires clauses with empty-bytes otherwise values.
 operation RouteScan:
     accepts pattern of type Bytes.
     accepts path of type Bytes.
     accepts name of type Bytes.
-    returns Bytes.
+    returns Bytes from path.
+    requires:
+        len(pattern) > usize(0) otherwise bytes("").
+        len(path) > usize(0) otherwise bytes("").
+        byte(pattern, usize(0)) == 47 otherwise bytes("").
+        byte(path, usize(0)) == 47 otherwise bytes("").
     body:
-        if len(pattern) == 0 || len(path) == 0:
-            return bytes("").
-        if byte(pattern, usize(0)) != 47 || byte(path, usize(0)) != 47:
-            return bytes("").
         let internal = len(name) == 0.
         let mut pi = usize(1).
         let mut qi = usize(1).
@@ -84,11 +86,52 @@ operation RouteCapture:
     accepts pattern of type Bytes.
     accepts path of type Bytes.
     accepts name of type Bytes.
-    returns Bytes.
+    returns Bytes from path.
+    requires:
+        len(name) > usize(0) otherwise bytes("").
     body:
-        if len(name) == 0:
-            return bytes("").
         return RouteScan(pattern, path, name).
+
+# UTF-8 transition tables are separate from the decoder's prefix-writing loop.
+# A negative need is the malformed-input status; no output is written for it.
+entity RouteUtf8:
+    has need of type i64.
+    has scalar of type i64.
+    has minimum of type i64.
+
+operation RouteUtf8Lead:
+    accepts current of type i64.
+    returns RouteUtf8.
+    requires:
+        current >= 128 otherwise RouteUtf8(0, current, current).
+        current >= 194 otherwise RouteUtf8(-22, 0, 0).
+        current > 223 otherwise RouteUtf8(1, current - 192, 128).
+        current > 239 otherwise RouteUtf8(2, current - 224, 2048).
+        current <= 244 otherwise RouteUtf8(-22, 0, 0).
+    body:
+        return RouteUtf8(3, current - 240, 65536).
+
+operation RouteUtf8Complete:
+    accepts need of type i64.
+    accepts scalar of type i64.
+    accepts minimum of type i64.
+    returns RouteUtf8.
+    requires:
+        need != 0 || (scalar >= minimum && scalar <= 1114111 && (scalar < 55296 || scalar > 57343)) otherwise RouteUtf8(-22, 0, 0).
+    body:
+        return RouteUtf8(need, scalar, minimum).
+
+operation RouteUtf8Advance:
+    accepts current of type i64.
+    accepts need of type i64.
+    accepts scalar of type i64.
+    accepts minimum of type i64.
+    returns RouteUtf8.
+    requires:
+        need != 0 otherwise RouteUtf8Lead(current).
+        current >= 128 && current <= 191 otherwise RouteUtf8(-22, 0, 0).
+    body:
+        return RouteUtf8Complete(need - 1, scalar * 64 + current - 128, minimum).
 
 # Strict percent-decode with streaming UTF-8 validation in one pass.
 # Percent escapes (%HH, either hex case) emit one byte; + stays plus (43).
@@ -97,16 +140,14 @@ operation RouteCapture:
 # 240..244; continuations are 128..191. Overlongs, surrogates 55296..57343,
 # values above 1114111, lone continuations, and truncation are -22. Codepoint
 # arithmetic stays i64 because u8 math is checked. Hex uses BytesHexDigit.
-# Capacity is checked per emitted byte after validation, so -22 precedes -28
-# at the same byte; exact small capacities succeed (%41 needs one byte).
+# Loan length is checked per emitted byte after validation, so -22 precedes
+# -28 at the same byte; exact small loans succeed (%41 needs one byte).
 # Only bytes validated so far are stored, so errors leave a valid prefix.
-# No terminator, no allocation. Caller supplies disjoint writable output.
+# No terminator, no allocation. Caller supplies disjoint writable loan.
 operation RouteDecode:
     accepts value of type Bytes.
-    accepts output of type usize.
-    accepts capacity of type usize.
+    accepts output of type MutBytes.
     returns i64.
-    effects: UnsafeMemory.
     body:
         let mut read = usize(0).
         let mut written = usize(0).
@@ -129,45 +170,15 @@ operation RouteDecode:
                 set read = read + 3.
             else:
                 set read = read + 1.
-            if need == 0:
-                if current < 128:
-                    set scalar = current.
-                    set minimum = current.
-                else:
-                    if current < 194:
-                        return -22.
-                    if current <= 223:
-                        set scalar = current - 192.
-                        set minimum = 128.
-                        set need = 1.
-                    else:
-                        if current <= 239:
-                            set scalar = current - 224.
-                            set minimum = 2048.
-                            set need = 2.
-                        else:
-                            if current > 244:
-                                return -22.
-                            set scalar = current - 240.
-                            set minimum = 65536.
-                            set need = 3.
-            else:
-                if current < 128:
-                    return -22.
-                if current > 191:
-                    return -22.
-                set scalar = scalar * 64 + current - 128.
-                set need = need - 1.
-                if need == 0:
-                    if scalar < minimum:
-                        return -22.
-                    if scalar > 1114111:
-                        return -22.
-                    if scalar >= 55296 && scalar <= 57343:
-                        return -22.
-            if written >= capacity:
+            let next = RouteUtf8Advance(current, need, scalar, minimum).
+            if next.need < 0:
+                return -22.
+            set need = next.need.
+            set scalar = next.scalar.
+            set minimum = next.minimum.
+            if written >= len(output):
                 return -28.
-            store8(output + written, u8(current)).
+            put(output, written, u8(current)).
             set written = written + 1.
         if need != 0:
             return -22.

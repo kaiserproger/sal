@@ -1,0 +1,186 @@
+use "std/concurrency.sal".
+use "std/http_client.sal".
+use "qa_runner.sal".
+
+# Parallel races: 32 requests racing over native OS threads. A race
+# is a spawn/join chain: each link spawns the next link first, then sends its
+# own request on its own thread (so all 32 are in flight together), then
+# joins the rest. Each racer owns a small arena for its one exchange.
+#
+# Racers return their weight on the exact granted reply (200), 0 on the
+# exact refusal (409) and -1 on anything else; links add their results and
+# keep -1 sticky, so a race tally is an exact grant count, never a blend.
+# Warehouse-2 grants weigh 100, so the alternating-warehouse race reads as
+# grants(1) + 100 * grants(2).
+
+entity QaJob:
+    layout "C".
+    has race of type i64.
+    has index of type i64.
+    has count of type i64.
+
+entity QaEntry:
+    has path of type Bytes.
+    has body of type Bytes.
+    has granted of type Bytes.
+    has refused of type Bytes.
+    has weight of type i64.
+
+operation QaGrab:
+    accepts body of type Bytes.
+    accepts granted of type Bytes.
+    accepts weight of type i64.
+    returns QaEntry.
+    body:
+        return QaEntry(bytes("/reserve"), body, granted, QaNoStock(), weight).
+
+operation QaDrop:
+    accepts body of type Bytes.
+    accepts granted of type Bytes.
+    accepts weight of type i64.
+    returns QaEntry.
+    body:
+        return QaEntry(bytes("/release"), body, granted, QaNoReservation(), weight).
+
+# The bodies lists of the three test_concurrent_* methods. Races 1/2 reserve
+# and release [RED]; 3/4 send [RED, BLUE] on odd and [BLUE, RED] on even
+# indices; 5/6 target warehouse 1 on odd and warehouse 2 on even indices.
+operation QaRaceEntry:
+    accepts race of type i64.
+    accepts index of type i64.
+    returns QaEntry.
+    requires:
+        race != 1 otherwise QaGrab(bytes("{\"codes\":[\"SKU-RED-M\"]}"), bytes("{\"warehouse_id\":1,\"reserved\":1}"), 1).
+        race != 2 otherwise QaDrop(bytes("{\"codes\":[\"SKU-RED-M\"]}"), bytes("{\"warehouse_id\":1,\"released\":1}"), 1).
+        race != 3 || index % 2 == 0 otherwise QaGrab(bytes("{\"codes\":[\"SKU-RED-M\",\"SKU-BLUE-L\"]}"), bytes("{\"warehouse_id\":1,\"reserved\":2}"), 1).
+        race != 3 otherwise QaGrab(bytes("{\"codes\":[\"SKU-BLUE-L\",\"SKU-RED-M\"]}"), bytes("{\"warehouse_id\":1,\"reserved\":2}"), 1).
+        race != 4 || index % 2 == 0 otherwise QaDrop(bytes("{\"codes\":[\"SKU-RED-M\",\"SKU-BLUE-L\"]}"), bytes("{\"warehouse_id\":1,\"released\":2}"), 1).
+        race != 4 otherwise QaDrop(bytes("{\"codes\":[\"SKU-BLUE-L\",\"SKU-RED-M\"]}"), bytes("{\"warehouse_id\":1,\"released\":2}"), 1).
+        race != 5 || index % 2 == 0 otherwise QaGrab(bytes("{\"warehouse_id\":1,\"codes\":[\"SKU-RED-M\"]}"), bytes("{\"warehouse_id\":1,\"reserved\":1}"), 1).
+        race != 5 otherwise QaGrab(bytes("{\"warehouse_id\":2,\"codes\":[\"SKU-RED-M\"]}"), bytes("{\"warehouse_id\":2,\"reserved\":1}"), 100).
+        race != 6 || index % 2 == 0 otherwise QaDrop(bytes("{\"warehouse_id\":1,\"codes\":[\"SKU-RED-M\"]}"), bytes("{\"warehouse_id\":1,\"released\":1}"), 1).
+    body:
+        return QaDrop(bytes("{\"warehouse_id\":2,\"codes\":[\"SKU-RED-M\"]}"), bytes("{\"warehouse_id\":2,\"released\":1}"), 100).
+
+operation QaOutcome:
+    accepts entry of type QaEntry.
+    accepts status of type i64.
+    accepts framed of type bool.
+    accepts body of type Bytes.
+    returns i64.
+    requires:
+        framed otherwise -1.
+        status != 200 || body != entry.granted otherwise entry.weight.
+        status != 409 || body != entry.refused otherwise 0.
+    body:
+        return -1.
+
+operation QaRacer:
+    accepts entry of type QaEntry.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let arena = buffer(usize(73728)).
+        let response = borrow_mut(arena, usize(0), usize(65536)).
+        let header = borrow_mut(arena, usize(65536), usize(8192)).
+        let reply = HttpClientRequest(u64(2130706433), i64(8080), bytes("POST"), entry.path, entry.body, response, header).
+        let head = view(header).
+        let framed = QaFramedJson(head).
+        borrow_end(head).
+        let received = view(response).
+        let body = slice(received, reply.body_offset, reply.body_length).
+        let outcome = QaOutcome(entry, reply.status, framed, body).
+        borrow_end(body).
+        borrow_end(received).
+        borrow_end(response).
+        borrow_end(header).
+        buffer_drop(arena).
+        return outcome.
+
+operation QaTally:
+    accepts own of type i64.
+    accepts rest of type i64.
+    returns i64.
+    requires:
+        own >= 0 && rest >= 0 otherwise -1.
+    body:
+        return own + rest.
+
+operation QaRaceChain:
+    accepts job of type QaJob.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        job.count > 0 otherwise 0.
+    body:
+        let rest = spawn(QaRaceChain, QaJob(job.race, job.index + 1, job.count - 1)).
+        let own = QaRacer(QaRaceEntry(job.race, job.index)).
+        let others = join(rest).
+        return QaTally(own, others).
+
+# One 32-way race as a check: its tally must equal `want` exactly.
+operation QaRace:
+    accepts at of type i64.
+    accepts wire of type MutBytes.
+    accepts race of type i64.
+    accepts want of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        at >= 0 otherwise at.
+    body:
+        let tally = QaRaceChain(QaJob(race, 0, 32)).
+        QaExplain(tally == want, at + 1, bytes("race"), QaRaceEntry(race, 0).path, tally, want, bytes(""), wire).
+        return QaNext(at, tally == want).
+
+# test_concurrent_single_code_exact_capacity_and_release: 10 granted and 22
+# refused each way.
+operation QaGroupParallelSingle:
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    accepts work of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut at = QaReset(0, fd, wire).
+        set at = QaRace(at, wire, 1, 10).
+        set at = QaCount(at, wire, 1, bytes("SKU-RED-M"), 10, 10).
+        set at = QaCount(at, wire, 2, bytes("SKU-RED-M"), 3, 0).
+        set at = QaRace(at, wire, 2, 10).
+        set at = QaCount(at, wire, 1, bytes("SKU-RED-M"), 10, 0).
+        return QaReport(bytes("group-parallel-single"), at, work).
+
+# test_concurrent_opposite_order_arrays_are_atomic: 5 granted, 27 refused.
+operation QaGroupParallelOpposite:
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    accepts work of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut at = QaReset(0, fd, wire).
+        set at = QaRace(at, wire, 3, 5).
+        set at = QaCount(at, wire, 1, bytes("SKU-RED-M"), 10, 5).
+        set at = QaCount(at, wire, 1, bytes("SKU-BLUE-L"), 5, 5).
+        set at = QaRace(at, wire, 4, 5).
+        set at = QaCount(at, wire, 1, bytes("SKU-RED-M"), 10, 0).
+        set at = QaCount(at, wire, 1, bytes("SKU-BLUE-L"), 5, 0).
+        return QaReport(bytes("group-parallel-opposite"), at, work).
+
+# test_concurrent_warehouses_keep_independent_capacity: of 16 requests per
+# warehouse, 10 (warehouse 1) and 3 (warehouse 2) are granted.
+operation QaGroupParallelWarehouses:
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    accepts work of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut at = QaReset(0, fd, wire).
+        set at = QaRace(at, wire, 5, 310).
+        set at = QaCount(at, wire, 1, bytes("SKU-RED-M"), 10, 10).
+        set at = QaCount(at, wire, 2, bytes("SKU-RED-M"), 3, 3).
+        set at = QaRace(at, wire, 6, 310).
+        set at = QaCount(at, wire, 1, bytes("SKU-RED-M"), 10, 0).
+        set at = QaCount(at, wire, 2, bytes("SKU-RED-M"), 3, 0).
+        return QaReport(bytes("group-parallel-warehouses"), at, work).

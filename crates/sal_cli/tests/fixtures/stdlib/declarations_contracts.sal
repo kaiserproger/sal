@@ -1,0 +1,64 @@
+# Executable fixture: declarative contracts (success paths).
+#
+# Covers, with observable numeric results only:
+# - requires otherwise early return (violation returns the typed value).
+# - requires without otherwise lowers to a SalContractAssert guard (Trapped
+#   is called only with owner > 0 here; owner <= 0 would trap).
+# - ensures evaluation after the return expression exactly once.
+# - `result` header binding: a body local named `result` stays valid and
+#   does NOT shadow the header `result` (the returned value): Ensured returns
+#   its local plus one, and `result > owner` would trap if the postcondition
+#   read the body local instead.
+# - effectful callees in contracts are rejected at lower time (DEC203),
+#   covered by the lowerer's diagnostics, not by execution here.
+# Every check is one `Expect` line; the exit status is the first failing
+# check number, 0 when every check holds.
+operation Guarded:
+    accepts owner of type i64.
+    returns i64.
+    requires:
+        owner > 0 otherwise 0 - 1.
+    ensures:
+        result >= owner.
+    body:
+        return owner + 1.
+
+operation Trapped:
+    accepts owner of type i64.
+    returns i64.
+    requires:
+        owner > 0.
+    body:
+        return owner.
+
+operation Ensured:
+    accepts owner of type i64.
+    returns i64.
+    ensures:
+        result > owner.
+    body:
+        let result = owner.
+        return result + 1.
+
+# First failure wins: keeps an earlier failure, else reports `code` when the
+# check does not hold.
+operation Expect:
+    accepts failure of type i64.
+    accepts code of type i64.
+    accepts holds of type bool.
+    returns i64.
+    requires:
+        failure == 0 otherwise failure.
+        holds otherwise code.
+    body:
+        return 0.
+
+operation Main:
+    returns i64.
+    body:
+        let mut failure = 0.
+        set failure = Expect(failure, 1, Guarded(41) == 42).
+        set failure = Expect(failure, 2, Guarded(0 - 5) == 0 - 1).
+        set failure = Expect(failure, 3, Trapped(3) == 3).
+        set failure = Expect(failure, 4, Ensured(7) == 8).
+        return failure.

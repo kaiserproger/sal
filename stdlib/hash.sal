@@ -1,0 +1,148 @@
+# Non-cryptographic checksums: FNV-1a64 plus incremental CRC32 IEEE and
+# CRC32C (Castagnoli). Accidental-corruption detection only: not message
+# authentication, not collision resistance, and no throughput is promised.
+# Pure SAL over read-only Bytes: no effects, no allocation, no
+# UnsafeMemory, no lookup tables of any kind (nothing to license or copy).
+#
+# Required machine intrinsics (same-width integer T, result retains T):
+# wrapping_mul(T, T) -> T wraps mod 2^width; bit_xor/bit_and(T, T) -> T;
+# shift_right/shift_left(T, usize) -> T. Checked SAL arithmetic (+ - *)
+# traps on overflow and cannot express the mod-2^64 FNV product, so the
+# FNV fold must use wrapping_mul. The numeric/compiler workers own the
+# lowering of these spellings; this file only calls them.
+#
+# FNV-1a64 (xor-then-multiply over each octet):
+#   offset basis 14695981039346656037 (0xCBF29CE484222325)
+#   prime        1099511628211 (0x100000001B3)
+#   per octet: hash = (hash xor octet) * prime mod 2^64.
+# The basis exceeds i64 literal range, so HashFnv1a64Init builds it from
+# 32-bit halves with checked arithmetic that stays inside u64 range:
+# u64(3421674724) * u64(4294967296) + u64(2216829733). The intermediate
+# product 14695981037129826304 and the sum 14695981039346656037 both fit
+# u64, so no step traps. Empty input returns the basis. Update has no
+# finalize transform, so the one-shot equals Init followed by Update.
+#
+# CRC32 IEEE (Ethernet/PNG/ZIP: normal poly 0x04C11DB7, reflected
+# 0xEDB88320) and CRC32C Castagnoli (normal poly 0x1EDC6F41, reflected
+# 0x82F63B78). Both share init/finalize shape, spelled out per algorithm
+# so each reads exactly and the differing polynomial stays explicit:
+#   init register 0xFFFFFFFF; per octet, xor the low byte then run 8
+#   reflected shifts through the polynomial; finalize xors the register
+#   with 0xFFFFFFFF.
+# Update takes the raw register (post-init, pre-finish), so split feeds
+# chain exactly: Finish(Update(Update(Init, first), second)) equals the
+# one-shot over first followed by second. Bit-by-bit; no reflected
+# tables are generated or embedded.
+operation HashFnv1a64Init:
+    returns u64.
+    body:
+        let high = u64(3421674724).
+        let shift = u64(4294967296).
+        return high * shift + u64(2216829733).
+
+operation HashFnv1a64Update:
+    accepts state of type u64.
+    accepts data of type Bytes.
+    returns u64.
+    body:
+        let prime = u64(1099511628211).
+        let mut hash = state.
+        let mut index = usize(0).
+        while index < len(data):
+            set hash = wrapping_mul(bit_xor(hash, u64(byte(data, index))), prime).
+            set index = index + 1.
+        return hash.
+
+operation HashFnv1a64:
+    accepts data of type Bytes.
+    returns u64.
+    body:
+        return HashFnv1a64Update(HashFnv1a64Init(), data).
+
+# One reflected CRC32 bit step: shift right, folding in the polynomial
+# exactly when the bit shifted out was set.
+operation HashCrc32Step:
+    accepts register of type u32.
+    accepts poly of type u32.
+    returns u32.
+    requires:
+        bit_and(register, u32(1)) != u32(0) otherwise shift_right(register, usize(1)).
+    body:
+        return bit_xor(shift_right(register, usize(1)), poly).
+
+# Reflected bit-by-bit CRC32 over data for any reflected polynomial; the
+# IEEE and Castagnoli updates below differ only in `poly`.
+operation HashCrc32Update:
+    accepts crc of type u32.
+    accepts data of type Bytes.
+    accepts poly of type u32.
+    returns u32.
+    body:
+        let mut register = crc.
+        let mut index = usize(0).
+        while index < len(data):
+            set register = bit_xor(register, u32(byte(data, index))).
+            let mut bit = usize(0).
+            while bit < 8:
+                set register = HashCrc32Step(register, poly).
+                set bit = bit + 1.
+            set index = index + 1.
+        return register.
+
+operation HashCrc32IeeeReflectedPoly:
+    returns u32.
+    body:
+        return u32(3988292384).
+
+operation HashCrc32IeeeInit:
+    returns u32.
+    body:
+        return u32(4294967295).
+
+operation HashCrc32IeeeUpdate:
+    accepts crc of type u32.
+    accepts data of type Bytes.
+    returns u32.
+    body:
+        return HashCrc32Update(crc, data, HashCrc32IeeeReflectedPoly()).
+
+operation HashCrc32IeeeFinish:
+    accepts crc of type u32.
+    returns u32.
+    body:
+        return bit_xor(crc, u32(4294967295)).
+
+operation HashCrc32Ieee:
+    accepts data of type Bytes.
+    returns u32.
+    body:
+        return HashCrc32IeeeFinish(HashCrc32IeeeUpdate(HashCrc32IeeeInit(), data)).
+
+operation HashCrc32CReflectedPoly:
+    returns u32.
+    body:
+        return u32(2197175160).
+
+operation HashCrc32CInit:
+    returns u32.
+    body:
+        return u32(4294967295).
+
+operation HashCrc32CUpdate:
+    accepts crc of type u32.
+    accepts data of type Bytes.
+    returns u32.
+    body:
+        return HashCrc32Update(crc, data, HashCrc32CReflectedPoly()).
+
+operation HashCrc32CFinish:
+    accepts crc of type u32.
+    returns u32.
+    body:
+        return bit_xor(crc, u32(4294967295)).
+
+operation HashCrc32C:
+    accepts data of type Bytes.
+    returns u32.
+    body:
+        return HashCrc32CFinish(HashCrc32CUpdate(HashCrc32CInit(), data)).

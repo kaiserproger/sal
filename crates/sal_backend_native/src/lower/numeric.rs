@@ -45,13 +45,40 @@ impl Function<'_> {
             mutable: false,
         };
         self.store(saved);
+        if left_ty == Ty::Borrow {
+            // Slot arithmetic: `borrow(slot) + offset` is the generated
+            // wrapper address idiom. The Borrow word is the ORIGINAL owner
+            // slot address; an integer offset rides in the second operand.
+            // Anything else with a Borrow operand is a type error. The left
+            // side is spilled before the offset evaluates so nested calls
+            // cannot clobber the slot address.
+            if op != BinOp::Add {
+                return Err(self.error(
+                    "N100",
+                    "native borrows support no operators except borrow + usize offset",
+                ));
+            }
+            let right_ty = self.expression(right, Some(Ty::Usize))?;
+            self.require(right_ty, Ty::Usize, "binary operands")?;
+            self.code.push_str("    movq %rax, %rcx\n");
+            self.load(saved);
+            self.code.push_str("    addq %rcx, %rax\n");
+            let _ = writeln!(self.code, "    jc .Lsal_trap_{}", self.index);
+            return Ok(Ty::Usize);
+        }
         let right_ty = self.expression(right, Some(left_ty))?;
         self.require(right_ty, left_ty, "binary operands")?;
         if arithmetic {
             return self.arithmetic(op, left_ty, saved);
         }
-        if matches!(left_ty, Ty::Record(_)) {
-            return Err(self.error("N100", "native records support no comparison operators"));
+        if matches!(
+            left_ty,
+            Ty::Record(_) | Ty::Internal(_) | Ty::Buffer | Ty::MutBytes | Ty::Borrow
+        ) {
+            return Err(self.error(
+                "N100",
+                "native owners, borrows and records support no comparison operators",
+            ));
         }
         if left_ty.span() {
             if !matches!(op, BinOp::Eq | BinOp::Ne) {

@@ -1,0 +1,197 @@
+use "std/fs.sal".
+use "std/bytes.sal".
+
+# Durable-write proof for std/fs.sal against real files in the isolated
+# working directory. Every path is pid-suffixed, so concurrent runs never
+# share a name; only these owned names are ever removed. Covers the full
+# WAL cycle (create, write, sync, close, rename, directory sync, reopen,
+# remove), positioned I/O, truncate, seek, path validation, and negative
+# errno passthrough. Exit 0 is silent success; otherwise the first failing
+# check index. Uses only the safe File API plus buffer loans: no raw
+# addresses, no direct syscalls outside fs.sal, names framed with the
+# std/bytes cursor builders. No owner is live across an early return: every
+# check accumulates into `failure` and the buffers are dropped once.
+
+# Keeps the first failing check number: a check that already failed stays
+# recorded, otherwise the new code is recorded exactly when `failed` holds.
+operation FirstFailure:
+    accepts current of type i64.
+    accepts failed of type bool.
+    accepts code of type i64.
+    returns i64.
+    requires:
+        current == 0 otherwise current.
+        failed == false otherwise code.
+    body:
+        return 0.
+
+# `prefix` + decimal pid + `suffix` framed into `output`; returns the end
+# cursor or the negative errno of the first step that did not fit.
+operation FrameName:
+    accepts output of type MutBytes.
+    accepts prefix of type Bytes.
+    accepts pid of type i64.
+    accepts suffix of type Bytes.
+    returns i64.
+    body:
+        return BytesAppend(output, BytesDecimalAt(output, BytesAppend(output, 0, prefix), pid), suffix).
+
+# The first `count` bytes of `span` as a read-only span rooted in `span`.
+operation Head:
+    accepts span of type MutBytes.
+    accepts count of type i64.
+    returns Bytes from span.
+    requires:
+        count >= 0 otherwise bytes("").
+        usize(count) <= len(span) otherwise bytes("").
+    body:
+        return slice(view(span), usize(0), usize(count)).
+
+# Read the whole file back through `fd` and close it. Returns 0, or the
+# first failing check number starting at `first`: read count, content,
+# close. A negative `fd` means the open failure was already recorded.
+operation CheckReadBack:
+    accepts fd of type i64.
+    accepts io of type MutBytes.
+    accepts expected of type Bytes.
+    accepts first of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        fd >= 0 otherwise 0.
+    body:
+        let mut code = 0.
+        set code = FirstFailure(code, FileRead(fd, io) != i64(len(expected)), first).
+        set code = FirstFailure(code, Head(io, i64(len(expected))) != expected, first + 1).
+        set code = FirstFailure(code, FileClose(fd) != 0, first + 2).
+        return code.
+
+# O_APPEND descriptor cycle: append, positioned write rejected, seek, read
+# back, append again, close. Returns 0 or the first failing check number.
+operation CheckAppendCycle:
+    accepts fd of type i64.
+    accepts io of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        fd >= 0 otherwise 0.
+    body:
+        let mut code = 0.
+        set code = FirstFailure(code, FileWriteAll(fd, bytes("hello")) != 5, 62).
+        set code = FirstFailure(code, FileWriteAt(fd, 0, bytes("X")) != -22, 63).
+        set code = FirstFailure(code, FileSeek(fd, 0, 2) != 5, 64).
+        set code = FirstFailure(code, FileReadAt(fd, 0, slice_mut(io, usize(0), usize(5))) != 5, 65).
+        set code = FirstFailure(code, Head(io, 5) != bytes("hello"), 66).
+        set code = FirstFailure(code, FileWriteAll(fd, bytes("!")) != 1, 67).
+        set code = FirstFailure(code, FileClose(fd) != 0, 68).
+        return code.
+
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let pid = FilePid().
+        let nameBuf = buffer(usize(256)).
+        let finalBuf = buffer(usize(256)).
+        let missBuf = buffer(usize(64)).
+        let scratchBuf = buffer(usize(512)).
+        let smallBuf = buffer(usize(8)).
+        let tinyBuf = buffer(usize(8)).
+        let ioBuf = buffer(usize(64)).
+        let bigBuf = buffer(usize(4224)).
+        let pathBuild = borrow_mut(nameBuf, usize(0), usize(256)).
+        let finalBuild = borrow_mut(finalBuf, usize(0), usize(256)).
+        let missBuild = borrow_mut(missBuf, usize(0), usize(64)).
+        let pathScratch = borrow_mut(scratchBuf, usize(0), usize(512)).
+        let smallScratch = borrow_mut(smallBuf, usize(0), usize(8)).
+        let tinyScratch = borrow_mut(tinyBuf, usize(0), usize(8)).
+        let ioSpan = borrow_mut(ioBuf, usize(0), usize(64)).
+        let bigSpan = borrow_mut(bigBuf, usize(0), usize(4224)).
+        let pathEnd = FrameName(pathBuild, bytes("fs-wal-"), pid, bytes(".tmp")).
+        let finalEnd = FrameName(finalBuild, bytes("fs-final-"), pid, bytes(".dat")).
+        let missEnd = FrameName(missBuild, bytes("fs-missing-"), pid, bytes(".tmp")).
+        let mut failure = 0.
+        set failure = FirstFailure(failure, pid <= 0, 1).
+        set failure = FirstFailure(failure, pathEnd <= 7, 2).
+        set failure = FirstFailure(failure, finalEnd <= 10, 5).
+        set failure = FirstFailure(failure, missEnd <= 11, 8).
+        set failure = FirstFailure(failure, FileCopyPath(bytes(""), pathScratch, 0) != -22, 11).
+        set failure = FirstFailure(failure, BytesAppend(smallScratch, 0, bytes("a")) != 1, 12).
+        set failure = FirstFailure(failure, BytesAppend(smallScratch, 1, bytes("\u{0}b")) != 3, 13).
+        set failure = FirstFailure(failure, FileCopyPath(Head(smallScratch, 3), pathScratch, 0) != -22, 14).
+        let mut fill = i64(0).
+        while fill >= 0 && fill < 4160:
+            set fill = BytesAppend(bigSpan, fill, bytes("0123456789ABCDEF")).
+        set failure = FirstFailure(failure, fill < 0, 15).
+        set failure = FirstFailure(failure, fill != 4160, 16).
+        set failure = FirstFailure(failure, FileCopyPath(Head(bigSpan, 4160), pathScratch, 0) != -36, 17).
+        set failure = FirstFailure(failure, FileCopyPath(Head(pathBuild, pathEnd), tinyScratch, 0) != -28, 18).
+        set failure = FirstFailure(failure, FileOpen(bytes(""), pathScratch, 0, 0) != -22, 19).
+        set failure = FirstFailure(failure, FileOpen(Head(smallScratch, 3), pathScratch, 0, 0) != -22, 20).
+        set failure = FirstFailure(failure, FileOpen(Head(bigSpan, 4160), pathScratch, 0, 0) != -36, 21).
+        set failure = FirstFailure(failure, FileOpen(Head(pathBuild, pathEnd), pathScratch, -1, 0) != -22, 22).
+        set failure = FirstFailure(failure, FileOpen(Head(pathBuild, pathEnd), pathScratch, 0, 4096) != -22, 23).
+        set failure = FirstFailure(failure, FileOpen(Head(missBuild, missEnd), pathScratch, 0, 0) != -2, 24).
+        let fd = FileOpen(Head(pathBuild, pathEnd), pathScratch, 578, 384).
+        set failure = FirstFailure(failure, fd < 0, 25).
+        set failure = FirstFailure(failure, FileWriteAll(fd, bytes("")) != 0, 26).
+        set failure = FirstFailure(failure, FileWriteAll(fd, bytes("0123456789AB")) != 12, 27).
+        set failure = FirstFailure(failure, FileSync(fd) != 0, 28).
+        set failure = FirstFailure(failure, FileDataSync(fd) != 0, 29).
+        set failure = FirstFailure(failure, FileSeek(fd, 0, 0) != 0, 30).
+        set failure = FirstFailure(failure, FileRead(fd, slice_mut(ioSpan, usize(0), usize(0))) != 0, 31).
+        set failure = FirstFailure(failure, FileRead(fd, ioSpan) != 12, 32).
+        set failure = FirstFailure(failure, Head(ioSpan, 12) != bytes("0123456789AB"), 33).
+        set failure = FirstFailure(failure, FileSeek(fd, 0, 2) != 12, 34).
+        set failure = FirstFailure(failure, FileSeek(fd, 0 - 12, 1) != 0, 35).
+        set failure = FirstFailure(failure, FileSeek(fd, 0, 7) != -22, 36).
+        set failure = FirstFailure(failure, FileReadAt(fd, 4, slice_mut(ioSpan, usize(0), usize(8))) != 8, 37).
+        set failure = FirstFailure(failure, Head(ioSpan, 8) != bytes("456789AB"), 38).
+        set failure = FirstFailure(failure, FileReadAt(fd, -1, slice_mut(ioSpan, usize(0), usize(8))) != -22, 39).
+        set failure = FirstFailure(failure, FileWriteAt(fd, 0, bytes("ab")) != 2, 40).
+        set failure = FirstFailure(failure, FileWriteAt(fd, -1, bytes("ab")) != -22, 41).
+        set failure = FirstFailure(failure, FileTruncate(fd, 0 - 1) != -22, 42).
+        set failure = FirstFailure(failure, FileTruncate(fd, 4) != 0, 43).
+        set failure = FirstFailure(failure, FileSeek(fd, 0, 2) != 4, 44).
+        set failure = FirstFailure(failure, FileReadAt(fd, 0, slice_mut(ioSpan, usize(0), usize(4))) != 4, 45).
+        set failure = FirstFailure(failure, Head(ioSpan, 4) != bytes("ab23"), 46).
+        set failure = FirstFailure(failure, FileClose(fd) != 0, 47).
+        set failure = FirstFailure(failure, FileRename(Head(pathBuild, pathEnd), Head(finalBuild, finalEnd), pathScratch) != 0, 48).
+        set failure = FirstFailure(failure, FileSyncDir(bytes("."), pathScratch) != 0, 49).
+        set failure = FirstFailure(failure, FileRemove(Head(pathBuild, pathEnd), pathScratch) != -2, 50).
+        let fd2 = FileOpen(Head(finalBuild, finalEnd), pathScratch, 0, 0).
+        set failure = FirstFailure(failure, fd2 < 0, 51).
+        let readBack = CheckReadBack(fd2, ioSpan, bytes("ab23"), 52).
+        set failure = FirstFailure(failure, readBack != 0, readBack).
+        set failure = FirstFailure(failure, FileRemove(Head(finalBuild, finalEnd), pathScratch) != 0, 55).
+        set failure = FirstFailure(failure, FileOpen(Head(finalBuild, finalEnd), pathScratch, 0, 0) != -2, 56).
+        set failure = FirstFailure(failure, FileRemove(Head(missBuild, missEnd), pathScratch) != -2, 57).
+        set failure = FirstFailure(failure, BytesAppend(pathScratch, 0, bytes("zz")) != 2, 58).
+        set failure = FirstFailure(failure, FileCopyPath(Head(smallScratch, 3), pathScratch, 0) != -22, 59).
+        set failure = FirstFailure(failure, Head(pathScratch, 2) != bytes("zz"), 60).
+        let afd = FileOpen(Head(missBuild, missEnd), pathScratch, 1090, 384).
+        set failure = FirstFailure(failure, afd < 0, 61).
+        let appended = CheckAppendCycle(afd, ioSpan).
+        set failure = FirstFailure(failure, appended != 0, appended).
+        let rfd = FileOpen(Head(missBuild, missEnd), pathScratch, 0, 0).
+        set failure = FirstFailure(failure, rfd < 0, 69).
+        let reread = CheckReadBack(rfd, ioSpan, bytes("hello!"), 70).
+        set failure = FirstFailure(failure, reread != 0, reread).
+        set failure = FirstFailure(failure, FileRemove(Head(missBuild, missEnd), pathScratch) != 0, 73).
+        borrow_end(pathBuild).
+        borrow_end(finalBuild).
+        borrow_end(missBuild).
+        borrow_end(pathScratch).
+        borrow_end(smallScratch).
+        borrow_end(tinyScratch).
+        borrow_end(ioSpan).
+        borrow_end(bigSpan).
+        buffer_drop(nameBuf).
+        buffer_drop(finalBuf).
+        buffer_drop(missBuf).
+        buffer_drop(scratchBuf).
+        buffer_drop(smallBuf).
+        buffer_drop(tinyBuf).
+        buffer_drop(ioBuf).
+        buffer_drop(bigBuf).
+        return failure.

@@ -1,4 +1,7 @@
 //! One integer-only SysV argument classifier, shared by callers and callees.
+//! Internal records use their native geometry like C records; unlike C
+//! records they never cross the C boundary (callers reject them there).
+use super::InternalLayout;
 use sal_ir::CRecordLayout;
 use std::collections::BTreeMap;
 
@@ -17,26 +20,46 @@ pub(super) fn record(layouts: &BTreeMap<String, CRecordLayout>, ty: Ty) -> Optio
     }
 }
 
-pub(super) fn memory_result(layouts: &BTreeMap<String, CRecordLayout>, ty: Ty) -> bool {
+pub(super) fn memory_result(
+    layouts: &BTreeMap<String, CRecordLayout>,
+    internal: &BTreeMap<String, InternalLayout>,
+    ty: Ty,
+) -> bool {
     record(layouts, ty).is_some_and(|layout| layout.size > 16)
+        || internal_size(internal, ty).is_some_and(|size| size > 16)
 }
 
-pub(super) fn bytes(layouts: &BTreeMap<String, CRecordLayout>, ty: Ty) -> usize {
-    record(layouts, ty).map_or(ty.slots() * 8, |layout| layout.size.div_ceil(8) * 8)
+fn internal_size(internal: &BTreeMap<String, InternalLayout>, ty: Ty) -> Option<usize> {
+    match ty {
+        Ty::Internal(index) => internal.values().nth(index).map(|layout| layout.size),
+        _ => None,
+    }
+}
+
+pub(super) fn bytes(
+    layouts: &BTreeMap<String, CRecordLayout>,
+    internal: &BTreeMap<String, InternalLayout>,
+    ty: Ty,
+) -> usize {
+    record(layouts, ty).map_or(
+        internal_size(internal, ty).map_or(ty.slots() * 8, |size| size.div_ceil(8) * 8),
+        |layout| layout.size.div_ceil(8) * 8,
+    )
 }
 
 pub(super) fn arguments(
     layouts: &BTreeMap<String, CRecordLayout>,
+    internal: &BTreeMap<String, InternalLayout>,
     params: &[Ty],
     result: Ty,
 ) -> Option<(Vec<Place>, usize)> {
-    let mut register = usize::from(memory_result(layouts, result));
+    let mut register = usize::from(memory_result(layouts, internal, result));
     let mut stack = 0usize;
     let mut places = Vec::with_capacity(params.len());
     for &ty in params {
-        let size = bytes(layouts, ty);
+        let size = bytes(layouts, internal, ty);
         let words = size / 8;
-        if !memory_result(layouts, ty) && register + words <= 6 {
+        if !memory_result(layouts, internal, ty) && register + words <= 6 {
             places.push(Place::Registers {
                 first: register,
                 words,

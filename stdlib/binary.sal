@@ -1,0 +1,621 @@
+# Safe checked binary codecs: fixed-width big/little-endian integers plus
+# Minecraft signed VarInt (32-bit) and VarLong (64-bit) two's complement.
+#
+# Reference (read-only): ~/solaris crates/mc-protocol/src/codec.rs
+# read_varint/read_varlong/write_varint/write_varlong and
+# tools/harness/light_wire.py Reader.varint. Wire facts mirrored here:
+# VarInt is at most 5 bytes, VarLong at most 10, little-endian base-128
+# with the low 7 bits payload and high bit continuation; the signed value
+# is the two's-complement reinterpretation of the assembled 32/64 bits.
+# This is NOT generic unsigned LEB128 and NOT ZigZag: negative values
+# always use the full 5/10 bytes, and ZigZag lives in the separately
+# named BinaryZigZag* helpers below.
+#
+# Strictness (fail-closed for packet framing): truncation (input ends
+# before the continuation clears, empty input, offset past the end),
+# a set continuation on the 5th/10th byte, a 5th-byte payload above 15,
+# and a 10th-byte payload above 1 are all status -22 with consumed
+# zero. Bounded non-minimal encodings ARE accepted, matching Solaris
+# mc-protocol (e.g. 0x80 0x00 reads 0 consuming 2). Fixed-width reads
+# past the end are -22 the same way.
+#
+# Status vocabulary (shared with bytes/json/postgres helpers):
+#   0    success; value/consumed (reads) or the width (writes) is valid.
+#   -22  malformed or invalid: out-of-range offset, truncation, overlong
+#        or overflowing varint/varlong, or a value outside its width.
+#   -28  write capacity: the span has no room. Reads never report -28.
+#
+# Write contract: every writer preflights its full width (fixed widths
+# directly, varints through BinaryVarIntLength/BinaryVarLongLength)
+# before the first put, so a -28 leaves the span byte-identical. A -22
+# likewise writes nothing. Callers must only publish the span on a
+# non-negative return. Reads never write.
+#
+# Signed bits: signed assembly/disassembly goes through
+# bits_as(SameWidthUnsigned, signed) and bits_as(SameWidthSigned, bits),
+# never a checked negative-to-unsigned cast. Unsigned magnitudes are
+# built in their own width (every partial sum fits that width exactly,
+# so checked arithmetic cannot trap on valid input); the 5th/10th-byte
+# payload guard runs before the final multiply-add so hostile bytes
+# report -22 instead of trapping.
+#
+# Effects: none. No UnsafeMemory, no raw addresses, no syscalls. Reads
+# take immutable Bytes views; writes take MutBytes loans with put/len.
+# Lengths come from spans, never from caller-claimed capacities.
+entity BinaryRead:
+    layout "C".
+    has status of type i64.
+    has value of type i64.
+    has consumed of type usize.
+
+entity BinaryReadU64:
+    layout "C".
+    has status of type i64.
+    has value of type u64.
+    has consumed of type usize.
+
+# Fixed-width codec core. Every public U16/I16/U32/I32/I64/U64 reader and
+# writer below is one call into a generic big- or little-endian core with a
+# width: the preflight rules live in the core headers, the byte sequence in
+# its single loop. Public operations only state the value range and the
+# signed/unsigned view of the raw bits.
+
+# The canonical truncated/out-of-range read: status -22, nothing consumed.
+operation BinaryReadInvalid:
+    returns BinaryReadU64.
+    body:
+        return BinaryReadU64(-22, u64(0), usize(0)).
+
+# Big-endian read of `width` (1..8) bytes at offset into the raw u64 bits.
+operation BinaryReadBe:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    accepts width of type usize.
+    returns BinaryReadU64.
+    requires:
+        offset <= len(data) otherwise BinaryReadInvalid().
+        len(data) - offset >= width otherwise BinaryReadInvalid().
+    body:
+        let mut raw = u64(0).
+        let mut index = usize(0).
+        while index < width:
+            set raw = raw * u64(256) + u64(byte(data, offset + index)).
+            set index = index + 1.
+        return BinaryReadU64(0, raw, width).
+
+# Little-endian read of `width` (1..8) bytes at offset into the raw u64 bits.
+operation BinaryReadLe:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    accepts width of type usize.
+    returns BinaryReadU64.
+    requires:
+        offset <= len(data) otherwise BinaryReadInvalid().
+        len(data) - offset >= width otherwise BinaryReadInvalid().
+    body:
+        let mut raw = u64(0).
+        let mut index = width.
+        while index > 0:
+            set index = index - 1.
+            set raw = raw * u64(256) + u64(byte(data, offset + index)).
+        return BinaryReadU64(0, raw, width).
+
+# Raw bits of at most 32 bits as a non-negative i64 value (failures keep
+# status -22, value 0, consumed 0).
+operation BinaryReadUnsigned:
+    accepts raw of type BinaryReadU64.
+    returns BinaryRead.
+    body:
+        return BinaryRead(raw.status, i64(raw.value), raw.consumed).
+
+# Raw 16-bit pattern as a two's-complement i16 value.
+operation BinaryReadSigned16:
+    accepts raw of type BinaryReadU64.
+    returns BinaryRead.
+    body:
+        return BinaryRead(raw.status, i64(bits_as(i16, u16(raw.value))), raw.consumed).
+
+# Raw 32-bit pattern as a two's-complement i32 value.
+operation BinaryReadSigned32:
+    accepts raw of type BinaryReadU64.
+    returns BinaryRead.
+    body:
+        return BinaryRead(raw.status, i64(bits_as(i32, u32(raw.value))), raw.consumed).
+
+# Raw 64-bit pattern as a two's-complement i64 value.
+operation BinaryReadSigned64:
+    accepts raw of type BinaryReadU64.
+    returns BinaryRead.
+    body:
+        return BinaryRead(raw.status, bits_as(i64, raw.value), raw.consumed).
+
+# Unsigned 16-bit big-endian. Value is 0..65535.
+operation BinaryReadU16Be:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryRead.
+    body:
+        return BinaryReadUnsigned(BinaryReadBe(data, offset, usize(2))).
+
+# Unsigned 16-bit little-endian.
+operation BinaryReadU16Le:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryRead.
+    body:
+        return BinaryReadUnsigned(BinaryReadLe(data, offset, usize(2))).
+
+# Signed 16-bit big-endian, sign-extended through the raw u16 bits.
+operation BinaryReadI16Be:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryRead.
+    body:
+        return BinaryReadSigned16(BinaryReadBe(data, offset, usize(2))).
+
+# Signed 16-bit little-endian.
+operation BinaryReadI16Le:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryRead.
+    body:
+        return BinaryReadSigned16(BinaryReadLe(data, offset, usize(2))).
+
+# Unsigned 32-bit big-endian. Fits i64, so the value reports directly.
+operation BinaryReadU32Be:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryRead.
+    body:
+        return BinaryReadUnsigned(BinaryReadBe(data, offset, usize(4))).
+
+# Unsigned 32-bit little-endian.
+operation BinaryReadU32Le:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryRead.
+    body:
+        return BinaryReadUnsigned(BinaryReadLe(data, offset, usize(4))).
+
+# Signed 32-bit big-endian through the raw u32 bits.
+operation BinaryReadI32Be:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryRead.
+    body:
+        return BinaryReadSigned32(BinaryReadBe(data, offset, usize(4))).
+
+# Signed 32-bit little-endian.
+operation BinaryReadI32Le:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryRead.
+    body:
+        return BinaryReadSigned32(BinaryReadLe(data, offset, usize(4))).
+
+# Signed 64-bit big-endian through the raw u64 bits.
+operation BinaryReadI64Be:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryRead.
+    body:
+        return BinaryReadSigned64(BinaryReadBe(data, offset, usize(8))).
+
+# Signed 64-bit little-endian.
+operation BinaryReadI64Le:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryRead.
+    body:
+        return BinaryReadSigned64(BinaryReadLe(data, offset, usize(8))).
+
+# Unsigned 64-bit big-endian.
+operation BinaryReadU64Be:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryReadU64.
+    body:
+        return BinaryReadBe(data, offset, usize(8)).
+
+# Unsigned 64-bit little-endian.
+operation BinaryReadU64Le:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryReadU64.
+    body:
+        return BinaryReadLe(data, offset, usize(8)).
+
+# Smaller of two usize values (table form: `first` wins unless it is larger).
+operation BinaryUsizeMin:
+    accepts first of type usize.
+    accepts second of type usize.
+    returns usize.
+    requires:
+        first > second otherwise first.
+    body:
+        return second.
+
+# The largest u64, spelled without an out-of-range literal.
+operation BinaryU64Max:
+    returns u64.
+    body:
+        return u64(9223372036854775807) * u64(2) + u64(1).
+
+# Index of the first byte with a clear continuation bit among the first
+# `limit` bytes at offset, or `limit` when every inspected byte continues.
+operation BinaryVarTerminator:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    accepts limit of type usize.
+    returns usize.
+    body:
+        let mut index = usize(0).
+        while index < limit && byte(data, offset + index) >= 128:
+            set index = index + 1.
+        return index.
+
+# Payload bits of bytes `end` down to 1 joined most-significant first. At most
+# nine bytes (VarLong) are joined, so the result stays below 2^63.
+operation BinaryVarHigh:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    accepts end of type usize.
+    returns u64.
+    body:
+        let mut high = u64(0).
+        let mut index = end.
+        while index > 0:
+            set high = high * u64(128) + u64(byte(data, offset + index)) % u64(128).
+            set index = index - 1.
+        return high.
+
+# Joins the terminating byte 0 payload below the already joined `high` bytes.
+# `high * 128 + low <= ceiling` is checked as `high <= (ceiling - low) / 128`
+# first, so a width-overflowing payload (5th byte above 15, 10th above 1) is
+# -22 instead of a checked-arithmetic trap.
+operation BinaryVarJoin:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    accepts end of type usize.
+    accepts high of type u64.
+    accepts ceiling of type u64.
+    returns BinaryReadU64.
+    requires:
+        high <= (ceiling - u64(byte(data, offset)) % u64(128)) / u64(128) otherwise BinaryReadInvalid().
+    body:
+        return BinaryReadU64(0, high * u64(128) + u64(byte(data, offset)) % u64(128), end + usize(1)).
+
+# Terminated and in range: join the payloads. A missing terminator inside the
+# first `limit` bytes (truncation, or a continuation on the last allowed byte)
+# is -22.
+operation BinaryVarFinish:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    accepts end of type usize.
+    accepts limit of type usize.
+    accepts ceiling of type u64.
+    returns BinaryReadU64.
+    requires:
+        end < limit otherwise BinaryReadInvalid().
+    body:
+        return BinaryVarJoin(data, offset, end, BinaryVarHigh(data, offset, end), ceiling).
+
+# Little-endian base-128 read of at most `max_length` bytes whose assembled
+# unsigned value must not exceed `ceiling`; the raw (unsigned) bits.
+operation BinaryVarReadBits:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    accepts max_length of type usize.
+    accepts ceiling of type u64.
+    returns BinaryReadU64.
+    requires:
+        offset <= len(data) otherwise BinaryReadInvalid().
+    body:
+        let limit = BinaryUsizeMin(len(data) - offset, max_length).
+        return BinaryVarFinish(data, offset, BinaryVarTerminator(data, offset, limit), limit, ceiling).
+
+# Minecraft signed VarInt: 1..5 bytes, two's complement i32 range.
+# Matches Solaris mc-protocol read_varint: bounded non-minimal encodings
+# are accepted (e.g. 0x80 0x00 decodes to 0 consuming 2); only
+# truncation, 5th-payload-above-15 and 5th-continuation forms are -22.
+# Writers stay canonical (BinaryVarIntLength/Write emit the shortest
+# form). Deliberate boundary distinction from the Rust reference: Rust
+# truncates bits past 32/64 on overlong high bytes, we reject
+# width-overflow payloads outright (5th above 15, 10th above 1), so not
+# every Rust-malformed input decodes identically here.
+operation BinaryVarIntRead:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryRead.
+    body:
+        return BinaryReadSigned32(BinaryVarReadBits(data, offset, usize(5), u64(4294967295))).
+
+# Minecraft signed VarLong: 1..10 bytes, two's complement i64 range.
+# Same bounded-non-minimal acceptance as VarInt; only truncation,
+# 10th-payload-above-1 and 10th-continuation forms are -22.
+operation BinaryVarLongRead:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns BinaryRead.
+    body:
+        return BinaryReadSigned64(BinaryVarReadBits(data, offset, usize(10), BinaryU64Max())).
+
+# Wire length (1..10) of the unsigned base-128 form of `bits`.
+operation BinaryVarBitsLength:
+    accepts bits of type u64.
+    returns i64.
+    body:
+        let mut rest = bits.
+        let mut length = 1.
+        while rest >= u64(128):
+            set rest = rest / u64(128).
+            set length = length + 1.
+        return length.
+
+# VarInt wire length 1..5 for an i32-range value, else -22.
+operation BinaryVarIntLength:
+    accepts value of type i64.
+    returns i64.
+    requires:
+        value >= -2147483648 otherwise -22.
+        value <= 2147483647 otherwise -22.
+    body:
+        return BinaryVarBitsLength(u64(bits_as(u32, i32(value)))).
+
+# VarLong wire length 1..10 for any i64 value.
+operation BinaryVarLongLength:
+    accepts value of type i64.
+    returns i64.
+    body:
+        return BinaryVarBitsLength(bits_as(u64, value)).
+
+# Big-endian write of the low `width` (1..8) bytes of `bits`. Offset past the
+# end is -22; a span without `width` bytes of room is -28. Both are decided
+# before the first put, so a failure leaves the span byte-identical.
+operation BinaryWriteBe:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts bits of type u64.
+    accepts width of type usize.
+    returns i64.
+    requires:
+        offset <= len(span) otherwise -22.
+        len(span) - offset >= width otherwise -28.
+    body:
+        let mut rest = bits.
+        let mut index = width.
+        while index > 0:
+            set index = index - 1.
+            put(span, offset + index, u8(rest % u64(256))).
+            set rest = rest / u64(256).
+        return i64(width).
+
+# Little-endian write of the low `width` (1..8) bytes of `bits`; same
+# -22/-28 preflight as BinaryWriteBe.
+operation BinaryWriteLe:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts bits of type u64.
+    accepts width of type usize.
+    returns i64.
+    requires:
+        offset <= len(span) otherwise -22.
+        len(span) - offset >= width otherwise -28.
+    body:
+        let mut rest = bits.
+        let mut index = usize(0).
+        while index < width:
+            put(span, offset + index, u8(rest % u64(256))).
+            set rest = rest / u64(256).
+            set index = index + 1.
+        return i64(width).
+
+# Unsigned 16-bit big-endian write. Returns 2, -22, or -28.
+operation BinaryWriteU16Be:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    requires:
+        value >= 0 otherwise -22.
+        value <= 65535 otherwise -22.
+    body:
+        return BinaryWriteBe(span, offset, u64(value), usize(2)).
+
+# Unsigned 16-bit little-endian write.
+operation BinaryWriteU16Le:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    requires:
+        value >= 0 otherwise -22.
+        value <= 65535 otherwise -22.
+    body:
+        return BinaryWriteLe(span, offset, u64(value), usize(2)).
+
+# Signed 16-bit big-endian write through the raw u16 bits.
+operation BinaryWriteI16Be:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    requires:
+        value >= -32768 otherwise -22.
+        value <= 32767 otherwise -22.
+    body:
+        return BinaryWriteBe(span, offset, u64(bits_as(u16, i16(value))), usize(2)).
+
+# Signed 16-bit little-endian write.
+operation BinaryWriteI16Le:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    requires:
+        value >= -32768 otherwise -22.
+        value <= 32767 otherwise -22.
+    body:
+        return BinaryWriteLe(span, offset, u64(bits_as(u16, i16(value))), usize(2)).
+
+# Unsigned 32-bit big-endian write.
+operation BinaryWriteU32Be:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    requires:
+        value >= 0 otherwise -22.
+        value <= 4294967295 otherwise -22.
+    body:
+        return BinaryWriteBe(span, offset, u64(value), usize(4)).
+
+# Unsigned 32-bit little-endian write.
+operation BinaryWriteU32Le:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    requires:
+        value >= 0 otherwise -22.
+        value <= 4294967295 otherwise -22.
+    body:
+        return BinaryWriteLe(span, offset, u64(value), usize(4)).
+
+# Signed 32-bit big-endian write through the raw u32 bits.
+operation BinaryWriteI32Be:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    requires:
+        value >= -2147483648 otherwise -22.
+        value <= 2147483647 otherwise -22.
+    body:
+        return BinaryWriteBe(span, offset, u64(bits_as(u32, i32(value))), usize(4)).
+
+# Signed 32-bit little-endian write.
+operation BinaryWriteI32Le:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    requires:
+        value >= -2147483648 otherwise -22.
+        value <= 2147483647 otherwise -22.
+    body:
+        return BinaryWriteLe(span, offset, u64(bits_as(u32, i32(value))), usize(4)).
+
+# Signed 64-bit big-endian write through the raw u64 bits.
+operation BinaryWriteI64Be:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    body:
+        return BinaryWriteBe(span, offset, bits_as(u64, value), usize(8)).
+
+# Signed 64-bit little-endian write.
+operation BinaryWriteI64Le:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    body:
+        return BinaryWriteLe(span, offset, bits_as(u64, value), usize(8)).
+
+# Unsigned 64-bit big-endian write.
+operation BinaryWriteU64Be:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type u64.
+    returns i64.
+    body:
+        return BinaryWriteBe(span, offset, value, usize(8)).
+
+# Unsigned 64-bit little-endian write.
+operation BinaryWriteU64Le:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type u64.
+    returns i64.
+    body:
+        return BinaryWriteLe(span, offset, value, usize(8)).
+
+# Base-128 little-endian write of the unsigned `bits`: continuation bit on
+# every byte but the last. Returns the byte count; offset past the end is
+# -22 and a span without room for the full length is -28, both before the
+# first put.
+operation BinaryVarWriteBits:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts bits of type u64.
+    returns i64.
+    requires:
+        offset <= len(span) otherwise -22.
+        usize(BinaryVarBitsLength(bits)) <= len(span) - offset otherwise -28.
+    body:
+        let mut rest = bits.
+        let mut index = usize(0).
+        while rest >= u64(128):
+            put(span, offset + index, u8(rest % u64(128) + u64(128))).
+            set rest = rest / u64(128).
+            set index = index + 1.
+        put(span, offset + index, u8(rest)).
+        return i64(index + usize(1)).
+
+# VarInt write: 1..5 bytes for an i32-range value, else -22/-28.
+# Capacity is preflighted, so -28 writes nothing.
+operation BinaryVarIntWrite:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    requires:
+        value >= -2147483648 otherwise -22.
+        value <= 2147483647 otherwise -22.
+    body:
+        return BinaryVarWriteBits(span, offset, u64(bits_as(u32, i32(value)))).
+
+# VarLong write: 1..10 bytes for any i64 value, else -22/-28.
+operation BinaryVarLongWrite:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    body:
+        return BinaryVarWriteBits(span, offset, bits_as(u64, value)).
+
+# ZigZag maps signed to unsigned so small magnitudes stay short.
+# Distinct from the wire VarInt/VarLong above, which are two's complement.
+operation BinaryZigZagEncode32:
+    accepts value of type i32.
+    returns u32.
+    requires:
+        i64(value) < 0 otherwise u32(i64(value) * 2).
+    body:
+        return u32((0 - i64(value)) * 2 - 1).
+
+operation BinaryZigZagDecode32:
+    accepts value of type u32.
+    returns i32.
+    requires:
+        value % u32(2) == u32(1) otherwise i32(i64(value / u32(2))).
+    body:
+        return i32(0 - i64(value / u32(2)) - 1).
+
+operation BinaryZigZagEncode64:
+    accepts value of type i64.
+    returns u64.
+    requires:
+        value < 0 otherwise u64(value) * u64(2).
+    body:
+        return u64(0 - (value + 1)) * u64(2) + u64(1).
+
+operation BinaryZigZagDecode64:
+    accepts value of type u64.
+    returns i64.
+    requires:
+        value % u64(2) == u64(1) otherwise i64(value / u64(2)).
+    body:
+        return 0 - i64(value / u64(2)) - 1.

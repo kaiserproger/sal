@@ -1,0 +1,604 @@
+# Generic HTTP/1.x origin-form client over the shared TCP helper. No
+# warehouse JSON, no allocator, no hidden runtime; every byte is bounded by
+# caller scratch, and exactly one attempt is made per call (no blind retry).
+#
+# Declarative contract: rules live in operation headers next to
+# accepts/returns, bodies only sequence work. Pure argument guards are
+# `requires: COND otherwise STATUS.` lines evaluated in order; small status
+# mappings (status digits, length overflow via shared HttpLengthStatus) are
+# tiny requires-table helpers; request framing threads one signed cursor
+# `at` through the shared std/bytes builders, whose negative cursors
+# propagate without ladders. Genuine scanners keep their loops (CRLF
+# search, reason and header walks, socket exchanges with close-on-error).
+# No manual framing bytes: every put goes through BytesAppend/BytesDecimalAt.
+# Response bodies drain through HttpClientDrainDelimited/HttpClientDrainFixed,
+# whose bounds are header tables; the exchange closes the internally opened
+# socket exactly once per path.
+#
+# Buffer roles: header carries request framing, then inbound response
+# headers; response carries only the response body. method/path/body are
+# borrowed read-only views; header/response are exclusive writable loans.
+# Callers must supply header/response disjoint from each other and from any
+# live view of method/path/body; the compiler checks these loans at the
+# call. This file phases work strictly: request puts complete before any
+# read-only framing view is taken, and no view is retained across a
+# conflicting write.
+#
+# Reply: body_offset/body_length index the body inside response. Negative
+# status is transport/protocol/capacity, otherwise the 3-digit HTTP status
+# (000 is not a strict status and is -400). Timeouts surface as the
+# kernel's negative errno (typically -11) after the socket is closed; every
+# failure closes the internally opened socket, never retries, and never
+# mutates caller state beyond scratch. -22 bad arguments (bad ip/port,
+# empty or non-token method, path not origin-form, unframing control
+# bytes), -28 request framing exceeds header scratch, -75 body length
+# outside the i64 range, -400 malformed response (bad status
+# line/version/headers, duplicate or conflicting Content-Length, any
+# Transfer-Encoding, exact-length shortfall or early EOF), -413 body
+# exceeds response scratch, -431 response headers exceed header scratch.
+# Negative errno values from connect/timeout/write/read pass through
+# unchanged.
+use "std/net.sal".
+use "std/bytes.sal".
+use "std/linux/io.sal".
+use "std/linux/net.sal".
+use "std/http.sal".
+
+entity HttpClientReply:
+    layout "C".
+    has status of type i64.
+    has body_offset of type usize.
+    has body_length of type usize.
+
+# Preserve usize offset arithmetic until a successful write count is known.
+# Capacity failures must win before narrowing a potentially oversized offset.
+operation HttpClientOffsetResult:
+    accepts offset of type usize.
+    accepts written of type i64.
+    returns i64.
+    requires:
+        written >= 0 otherwise written.
+    body:
+        return i64(offset + usize(written)).
+
+# Append one value at a usize offset; returns the new offset, or -28 when
+# it does not fit. Delegates to the shared BytesAppend cursor: bounds hold
+# exactly, no partial write, and negative propagation is shared.
+operation HttpClientPutBytes:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type Bytes.
+    returns i64.
+    requires:
+        offset <= len(span) otherwise -28.
+    body:
+        let window = slice_mut(span, offset, len(span) - offset).
+        let copied = BytesAppend(window, 0, value).
+        borrow_end(window).
+        return HttpClientOffsetResult(offset, copied).
+
+# Signed decimal append, including MIN, via the shared BytesDecimalAt: -28
+# when it does not fit, with no partial write.
+operation HttpClientPutDecimal:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts value of type i64.
+    returns i64.
+    requires:
+        offset <= len(span) otherwise -28.
+    body:
+        let window = slice_mut(span, offset, len(span) - offset).
+        let written = BytesDecimalAt(window, 0, value).
+        borrow_end(window).
+        return HttpClientOffsetResult(offset, written).
+
+# Request framing threads one signed cursor through the shared builders
+# below; no wrapper is needed because BytesDecimalAt already propagates a
+# negative cursor with identical offset semantics.
+
+# CR index of the first CRLF at or after start within [start, used), or -1.
+operation HttpClientFindCrlf:
+    accepts data of type Bytes.
+    accepts used of type usize.
+    accepts start of type usize.
+    returns i64.
+    requires:
+        start <= used && used <= len(data) otherwise -1.
+    body:
+        let mut index = start.
+        while index < used:
+            if used - index < 2:
+                return -1.
+            if byte(data, index) == 13 && byte(data, index + 1) == 10:
+                return i64(index).
+            set index = index + 1.
+        return -1.
+
+# One-past index of the first CRLFCRLF at or after start within
+# [start, used), or -1 when headers are still fragmented.
+operation HttpClientFindHeaderEnd:
+    accepts data of type Bytes.
+    accepts used of type usize.
+    accepts start of type usize.
+    returns i64.
+    requires:
+        start <= used && used <= len(data) otherwise -1.
+    body:
+        let mut index = start.
+        while index <= used:
+            if used - index < 4:
+                return -1.
+            if byte(data, index) == 13 && byte(data, index + 1) == 10 && byte(data, index + 2) == 13 && byte(data, index + 3) == 10:
+                return i64(index + 4).
+            set index = index + 1.
+        return -1.
+
+# Three ASCII digits to a strict status value: any non-digit position is
+# -400, and 000 is not a status (-400). Each clause requires one shape
+# fact; the body computes only when all hold. Pure table, no ladders.
+operation HttpClientStatusValue:
+    accepts first of type u8.
+    accepts second of type u8.
+    accepts third of type u8.
+    returns i64.
+    requires:
+        first >= 48 && first <= 57 otherwise -400.
+        second >= 48 && second <= 57 otherwise -400.
+        third >= 48 && third <= 57 otherwise -400.
+        first != 48 || second != 48 || third != 48 otherwise -400.
+    body:
+        return (i64(first) - 48) * 100 + (i64(second) - 48) * 10 + (i64(third) - 48).
+
+# Visible reason scan: tab or 32..126 to CRLF; controls and DEL are -400.
+# Stays a loop (genuine scan over caller bounds), called only after the
+# header tables above accept the fixed prefix.
+operation HttpClientCheckReason:
+    accepts data of type Bytes.
+    accepts start of type usize.
+    accepts end of type usize.
+    returns i64.
+    requires:
+        start <= end && end <= len(data) otherwise -400.
+    body:
+        let mut index = start.
+        while index < end:
+            let value = byte(data, index).
+            if (value < 32 && value != 9) || value == 127:
+                return -400.
+            set index = index + 1.
+        return 0.
+
+# Strict status line: HTTP/1.0 or HTTP/1.1, space, three digits, space,
+# visible reason to CRLF. Returns the status, or -400 (000 is not a strict
+# status). Fixed-prefix shape is a header table; the three digit checks and
+# the zero-status rejection live in HttpClientStatusValue above.
+operation HttpClientParseStatus:
+    accepts data of type Bytes.
+    accepts used of type usize.
+    returns i64.
+    requires:
+        used <= len(data) otherwise -400.
+        used >= 13 otherwise -400.
+        slice(data, usize(0), usize(8)) == bytes("HTTP/1.0") || slice(data, usize(0), usize(8)) == bytes("HTTP/1.1") otherwise -400.
+        byte(data, usize(8)) == 32 otherwise -400.
+        byte(data, usize(12)) == 32 otherwise -400.
+    body:
+        let line = HttpClientFindCrlf(data, used, usize(0)).
+        if line < 13:
+            return -400.
+        let status = HttpClientStatusValue(byte(data, usize(9)), byte(data, usize(10)), byte(data, usize(11))).
+        if status < 0:
+            return status.
+        if HttpClientCheckReason(data, usize(13), usize(line)) < 0:
+            return -400.
+        return status.
+
+# One header value slice to a checked Content-Length: trims spaces/tabs,
+# then maps the shared BytesParseDecimal result via HttpLengthStatus
+# (overflow -413, any other parse failure -400, empty value -400). Called
+# only for a content-length line after framing checks pass.
+operation HttpClientContentValue:
+    accepts field of type Bytes.
+    returns i64.
+    requires:
+        len(field) > usize(0) otherwise -400.
+    body:
+        let mut start = usize(0).
+        while true:
+            if start == len(field):
+                return -400.
+            let value = byte(field, start).
+            if value != 32 && value != 9:
+                break.
+            set start = start + 1.
+        let mut end = len(field).
+        while true:
+            let value = byte(field, end - 1).
+            if value != 32 && value != 9:
+                break.
+            set end = end - 1.
+        return HttpLengthStatus(BytesParseDecimal(slice(field, start, end - start))).
+
+# Scan response headers in [start, end): every line is a token name, a
+# colon, a checked value, and CRLF; the region ends with the final CRLF.
+# Any Transfer-Encoding is rejected (no chunked coding); a repeated
+# Content-Length is rejected even when the values agree. Returns the
+# Content-Length, -1 when absent, -400 on malformed or ambiguous framing,
+# -413 when the length overflows.
+operation HttpClientContentLength:
+    accepts data of type Bytes.
+    accepts start of type usize.
+    accepts end of type usize.
+    returns i64.
+    requires:
+        start <= end && end <= len(data) otherwise -400.
+    body:
+        let mut index = start.
+        let mut contentLength = -1.
+        let mut seenLength = false.
+        while index < end:
+            if end - index < 2:
+                return -400.
+            if byte(data, index) == 13:
+                if byte(data, index + 1) != 10:
+                    return -400.
+                if end - index != 2:
+                    return -400.
+                return contentLength.
+            let nameStart = index.
+            while true:
+                if index >= end:
+                    return -400.
+                let value = byte(data, index).
+                if value == 58:
+                    break.
+                if HttpToken(value) == false:
+                    return -400.
+                set index = index + 1.
+            if index == nameStart:
+                return -400.
+            let name = slice(data, nameStart, index - nameStart).
+            set index = index + 1.
+            let mut valueStart = index.
+            while true:
+                if index >= end:
+                    return -400.
+                let value = byte(data, index).
+                if value == 13:
+                    break.
+                if (value < 32 && value != 9) || value == 127:
+                    return -400.
+                set index = index + 1.
+            if end - index < 2:
+                return -400.
+            if byte(data, index + 1) != 10:
+                return -400.
+            let valueEnd = index.
+            set index = index + 2.
+            if HttpHeaderNameEquals(name, bytes("transfer-encoding")):
+                return -400.
+            if HttpHeaderNameEquals(name, bytes("content-length")) == false:
+                continue.
+            if seenLength:
+                return -400.
+            set seenLength = true.
+            let parsed = HttpClientContentValue(slice(data, valueStart, valueEnd - valueStart)).
+            if parsed < 0:
+                return parsed.
+            set contentLength = parsed.
+        return -400.
+
+# Copy exactly count bytes from a read-only view into a writable loan via
+# the shared BytesCopy. Bounds are checked before any write; -400 for a bad
+# source range, -28 when the loan is short.
+operation HttpClientCopyBody:
+    accepts source of type Bytes.
+    accepts start of type usize.
+    accepts target of type MutBytes.
+    accepts offset of type usize.
+    accepts count of type usize.
+    returns i64.
+    requires:
+        start <= len(source) otherwise -400.
+        count <= len(source) - start otherwise -400.
+        offset <= len(target) otherwise -28.
+        count <= len(target) - offset otherwise -28.
+    body:
+        let slot = slice_mut(target, offset, count).
+        let copied = BytesCopy(slot, slice(source, start, count)).
+        borrow_end(slot).
+        return copied.
+
+# Frame one origin-form request into header scratch. Returns the framed
+# length, or -28 when framing does not fit. One signed cursor `at` threads
+# every literal, octet and port through the shared builders; a negative
+# propagates with the valid prefix partly written, exactly as before.
+operation HttpClientBuildRequest:
+    accepts header of type MutBytes.
+    accepts method of type Bytes.
+    accepts path of type Bytes.
+    accepts bodyLength of type i64.
+    accepts ipv4 of type u64.
+    accepts port of type i64.
+    returns i64.
+    body:
+        let mut at = BytesAppend(header, 0, method).
+        set at = BytesAppend(header, at, bytes(" ")).
+        set at = BytesAppend(header, at, path).
+        set at = BytesAppend(header, at, bytes(" HTTP/1.1\r\nHost: ")).
+        set at = BytesDecimalAt(header, at, i64(ipv4 / 16777216)).
+        set at = BytesAppend(header, at, bytes(".")).
+        set at = BytesDecimalAt(header, at, i64(ipv4 / 65536 % 256)).
+        set at = BytesAppend(header, at, bytes(".")).
+        set at = BytesDecimalAt(header, at, i64(ipv4 / 256 % 256)).
+        set at = BytesAppend(header, at, bytes(".")).
+        set at = BytesDecimalAt(header, at, i64(ipv4 % 256)).
+        set at = BytesAppend(header, at, bytes(":")).
+        set at = BytesDecimalAt(header, at, port).
+        set at = BytesAppend(header, at, bytes("\r\nContent-Length: ")).
+        set at = BytesDecimalAt(header, at, bodyLength).
+        return BytesAppend(header, at, bytes("\r\nConnection: close\r\n\r\n")).
+
+# Pure guards for the exchange below: all-method-token, path starting with
+# `/` with no out-of-range or `#` byte. Loops stay (genuine scans); only
+# the -22 mapping folds into header tables on the callers.
+operation HttpClientValidMethod:
+    accepts method of type Bytes.
+    returns bool.
+    body:
+        let mut index = usize(0).
+        while index < len(method):
+            if HttpToken(byte(method, index)) == false:
+                return false.
+            set index = index + 1.
+        return true.
+
+operation HttpClientValidPath:
+    accepts path of type Bytes.
+    returns bool.
+    requires:
+        len(path) > usize(0) otherwise false.
+        byte(path, usize(0)) == 47 otherwise false.
+    body:
+        let mut index = usize(0).
+        while index < len(path):
+            let framing = byte(path, index).
+            # Fragments never appear on the wire in origin-form; the server
+            # rejects them, so fail closed before framing the request.
+            if framing < 33 || framing > 126 || framing == 35:
+                return false.
+            set index = index + 1.
+        return true.
+
+# Dial plus 5s I/O timeouts on the internally opened socket: returns the
+# descriptor, or the negative errno (timeout setup failures already closed
+# the socket). No view is retained across the blocking connect.
+operation HttpClientDial:
+    accepts ipv4 of type u64.
+    accepts port of type i64.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let fd = NetTcpConnect(ipv4, port).
+        if fd < 0:
+            return fd.
+        let timeout = LinuxSocketTimeouts(fd, i64(5)).
+        if timeout < 0:
+            LinuxClose(fd).
+            return timeout.
+        return fd.
+
+# Write the framed request plus body: returns the body byte count, or the
+# negative errno with the socket left open for the caller to close.
+# Request views end before returning either outcome.
+operation HttpClientSendRequest:
+    accepts fd of type i64.
+    accepts header of type MutBytes.
+    accepts requestLength of type usize.
+    accepts body of type Bytes.
+    returns i64.
+    requires:
+        requestLength <= len(header) otherwise -28.
+    effects: SystemCall.
+    body:
+        let requestView = view(header).
+        let requestFrame = slice(requestView, usize(0), requestLength).
+        let sent = LinuxWriteAll(fd, requestFrame).
+        borrow_end(requestView).
+        borrow_end(requestFrame).
+        if sent < 0:
+            return sent.
+        return LinuxWriteAll(fd, body).
+
+# Keep both scan outputs, so splitting the I/O phase adds no delimiter rescan.
+entity HttpClientHeaderRead:
+    has status of type i64.
+    has used of type usize.
+    has body_offset of type usize.
+
+# Read to CRLFCRLF, retaining already-buffered body bytes. Scratch exhaustion
+# is -431, early EOF -400, and read errno propagates without closing the fd.
+operation HttpClientReadHeaders:
+    accepts fd of type i64.
+    accepts header of type MutBytes.
+    accepts used of type usize.
+    returns HttpClientHeaderRead.
+    requires:
+        used <= len(header) otherwise HttpClientHeaderRead(-400, usize(0), usize(0)).
+    effects: SystemCall.
+    body:
+        let capacity = len(header).
+        let mut consumed = used.
+        let mut headerEnd = -1.
+        while headerEnd < 0:
+            if consumed == capacity:
+                return HttpClientHeaderRead(-431, usize(0), usize(0)).
+            let readWindow = slice_mut(header, consumed, capacity - consumed).
+            let received = LinuxReadInto(fd, readWindow).
+            borrow_end(readWindow).
+            if received < 0:
+                return HttpClientHeaderRead(received, usize(0), usize(0)).
+            if received == 0:
+                return HttpClientHeaderRead(-400, usize(0), usize(0)).
+            set consumed = consumed + usize(received).
+            let scanView = view(header).
+            set headerEnd = HttpClientFindHeaderEnd(scanView, consumed, usize(0)).
+            borrow_end(scanView).
+        return HttpClientHeaderRead(0, consumed, usize(headerEnd)).
+
+# Delimited (no length) body drain: `count` body bytes are already seeded
+# into response by the caller. Reads to close or response capacity, probing
+# one byte of scratch past capacity to distinguish clean EOF from a -413
+# overlong body. Returns body bytes, or the negative read/overlong status.
+# Socket stays open for the caller to close.
+operation HttpClientDrainDelimited:
+    accepts fd of type i64.
+    accepts count of type usize.
+    accepts response of type MutBytes.
+    accepts scratch of type MutBytes.
+    returns i64.
+    requires:
+        count <= len(response) otherwise -413.
+        len(scratch) > usize(0) otherwise -400.
+    effects: SystemCall.
+    body:
+        let mut have = count.
+        let mut closed = false.
+        while have < len(response):
+            let tail = slice_mut(response, have, len(response) - have).
+            let delimited = LinuxReadInto(fd, tail).
+            borrow_end(tail).
+            if delimited < 0:
+                return delimited.
+            if delimited == 0:
+                set closed = true.
+                break.
+            set have = have + usize(delimited).
+        if closed == false:
+            let probeSlot = slice_mut(scratch, usize(0), usize(1)).
+            let probe = LinuxReadInto(fd, probeSlot).
+            borrow_end(probeSlot).
+            if probe < 0:
+                return probe.
+            if probe > 0:
+                return -413.
+        return i64(have).
+
+# Declared-length body drain: `count` of `total` bytes are already seeded
+# into response by the caller; reads exactly the remainder, where shortfall
+# or early EOF is -400. Overlong/overrun are header-table guards, never
+# branches here. Socket stays open for the caller to close.
+operation HttpClientDrainFixed:
+    accepts fd of type i64.
+    accepts count of type usize.
+    accepts total of type usize.
+    accepts response of type MutBytes.
+    returns i64.
+    requires:
+        total <= len(response) otherwise -413.
+        count <= total otherwise -400.
+    effects: SystemCall.
+    body:
+        let mut have = count.
+        while have < total:
+            # Exactly the declared remainder: a shortfall or early EOF is
+            # -400, and any byte past the declared length is ambiguous
+            # framing, never silently swallowed pipelined input.
+            let piece = slice_mut(response, have, total - have).
+            let chunk = LinuxReadInto(fd, piece).
+            borrow_end(piece).
+            if chunk < 0:
+                return chunk.
+            if chunk == 0:
+                return -400.
+            set have = have + usize(chunk).
+        return i64(have).
+
+# One fully checked HTTP exchange. See the file header for the contract.
+operation HttpClientRequest:
+    accepts ipv4 of type u64.
+    accepts port of type i64.
+    accepts method of type Bytes.
+    accepts path of type Bytes.
+    accepts body of type Bytes.
+    accepts response of type MutBytes.
+    accepts header of type MutBytes.
+    returns HttpClientReply.
+    requires:
+        ipv4 <= 4294967295 otherwise HttpClientReply(-22, usize(0), usize(0)).
+        port >= 1 && port <= 65535 otherwise HttpClientReply(-22, usize(0), usize(0)).
+        len(method) > 0 otherwise HttpClientReply(-22, usize(0), usize(0)).
+        HttpClientValidMethod(method) otherwise HttpClientReply(-22, usize(0), usize(0)).
+        HttpClientValidPath(path) otherwise HttpClientReply(-22, usize(0), usize(0)).
+        len(body) <= usize(9223372036854775807) otherwise HttpClientReply(-75, usize(0), usize(0)).
+    effects: SystemCall.
+    body:
+        let bodyLength = i64(len(body)).
+        let requestLength = HttpClientBuildRequest(header, method, path, bodyLength, ipv4, port).
+        if requestLength < 0:
+            return HttpClientReply(requestLength, usize(0), usize(0)).
+        # Internally opened socket: bound blocked I/O internally since the
+        # public caller cannot set timeouts. Timeout setup failure and any
+        # later timeout/error close the socket with no retry: the drain
+        # helpers return the negative status and this body closes once per
+        # path. Seeding copies run before the drains so no read-only view
+        # is ever live across the scratch loan.
+        let fd = HttpClientDial(ipv4, port).
+        if fd < 0:
+            return HttpClientReply(fd, usize(0), usize(0)).
+        let sent = HttpClientSendRequest(fd, header, usize(requestLength), body).
+        if sent < 0:
+            LinuxClose(fd).
+            return HttpClientReply(sent, usize(0), usize(0)).
+        let readEnd = HttpClientReadHeaders(fd, header, usize(0)).
+        if readEnd.status < 0:
+            LinuxClose(fd).
+            return HttpClientReply(readEnd.status, usize(0), usize(0)).
+        let used = readEnd.used.
+        let headerEnd = readEnd.body_offset.
+        let lineView = view(header).
+        let lineEnd = HttpClientFindCrlf(lineView, used, usize(0)).
+        borrow_end(lineView).
+        let parseView = view(header).
+        let status = HttpClientParseStatus(parseView, used).
+        borrow_end(parseView).
+        if status < 0:
+            LinuxClose(fd).
+            return HttpClientReply(status, usize(0), usize(0)).
+        let lengthView = view(header).
+        let content = HttpClientContentLength(lengthView, usize(lineEnd) + 2, usize(headerEnd)).
+        borrow_end(lengthView).
+        if content < 0 && content != -1:
+            LinuxClose(fd).
+            return HttpClientReply(content, usize(0), usize(0)).
+        if content == -1:
+            let bufferedBody = used - usize(headerEnd).
+            if bufferedBody > len(response):
+                LinuxClose(fd).
+                return HttpClientReply(-413, usize(0), usize(0)).
+            let seedView = view(header).
+            HttpClientCopyBody(seedView, usize(headerEnd), response, usize(0), bufferedBody).
+            borrow_end(seedView).
+            let drained = HttpClientDrainDelimited(fd, bufferedBody, response, header).
+            if drained < 0:
+                LinuxClose(fd).
+                return HttpClientReply(drained, usize(0), usize(0)).
+            LinuxClose(fd).
+            return HttpClientReply(status, usize(0), usize(drained)).
+        let total = usize(content).
+        if total > len(response):
+            LinuxClose(fd).
+            return HttpClientReply(-413, usize(0), usize(0)).
+        let initial = used - usize(headerEnd).
+        if initial > total:
+            LinuxClose(fd).
+            return HttpClientReply(-400, usize(0), usize(0)).
+        let firstView = view(header).
+        HttpClientCopyBody(firstView, usize(headerEnd), response, usize(0), initial).
+        borrow_end(firstView).
+        let filled = HttpClientDrainFixed(fd, initial, total, response).
+        if filled < 0:
+            LinuxClose(fd).
+            return HttpClientReply(filled, usize(0), usize(0)).
+        LinuxClose(fd).
+        return HttpClientReply(status, usize(0), total).

@@ -1,20 +1,27 @@
-# Arbitrary bytes are not UTF-8 Text. Search results are byte offsets or -1.
+# Byte loans, cursors and decimal/hex codecs over arbitrary (non-UTF8) bytes.
+#
+# Header contracts: every `requires:` line is a precondition checked in order
+# before the body runs; `otherwise X` is the exact value returned on failure
+# (-22 malformed, -28 loan too small, -75 overflow, -1 miss, or a propagated
+# cursor). Bodies below the headers hold only the copy/scan/format algorithm.
+# Search results are byte offsets or -1; a malformed later hex digit may leave
+# a decoded prefix in the output loan.
 operation BytesStartsWith:
     accepts data of type Bytes.
     accepts prefix of type Bytes.
     returns bool.
+    requires:
+        len(prefix) <= len(data) otherwise false.
     body:
-        if len(prefix) > len(data):
-            return false.
         return slice(data, usize(0), len(prefix)) == prefix.
 
 operation BytesFind:
     accepts data of type Bytes.
     accepts needle of type Bytes.
     returns i64.
+    requires:
+        len(needle) <= len(data) otherwise -1.
     body:
-        if len(needle) > len(data):
-            return -1.
         let last = len(data) - len(needle).
         let mut offset = usize(0).
         while offset <= last:
@@ -27,30 +34,95 @@ operation BytesFind:
         return -1.
 
 # Like memcpy: source and writable destination must not overlap.
+# Lengths come from the destination loan, never a caller-claimed capacity.
 # Capacity is checked before any write; no terminator is appended.
+# Returns the copied count, or -28 when the value exceeds the loan.
 operation BytesCopy:
-    accepts destination of type usize.
-    accepts capacity of type usize.
+    accepts destination of type MutBytes.
     accepts value of type Bytes.
     returns i64.
-    effects: UnsafeMemory.
+    requires:
+        len(value) <= len(destination) otherwise -28.
     body:
         let count = len(value).
-        if count > capacity:
-            return -28.
         let mut index = usize(0).
         while index < count:
-            store8(destination + index, byte(value, index)).
+            put(destination, index, byte(value, index)).
             set index = index + 1.
         return i64(count).
+
+# Fill the entire caller loan, including zero-length loans; no terminator.
+operation BytesFill:
+    accepts output of type MutBytes.
+    accepts value of type u8.
+    returns i64.
+    requires:
+        len(output) <= usize(9223372036854775807) otherwise -75.
+    body:
+        let mut index = usize(0).
+        while index < len(output):
+            put(output, index, value).
+            set index = index + usize(1).
+        return i64(len(output)).
+
+# Decode pairs of ASCII hex digits into arbitrary bytes, not UTF-8 Text.
+# Odd length/malformed digits are -22; insufficient loan is -28. Bounds are
+# checked before writing; a malformed later digit may leave a decoded prefix.
+operation BytesDecodeHex:
+    accepts value of type Bytes.
+    accepts output of type MutBytes.
+    returns i64.
+    requires:
+        len(value) % usize(2) == usize(0) otherwise -22.
+        len(value) / usize(2) <= len(output) otherwise -28.
+    body:
+        let count = len(value) / usize(2).
+        let mut index = usize(0).
+        while index < count:
+            let offset = index * usize(2).
+            let high = BytesHexDigit(byte(value, offset)).
+            let low = BytesHexDigit(byte(value, offset + usize(1))).
+            if high < 0 || low < 0:
+                return -22.
+            put(output, index, u8(high * 16 + low)).
+            set index = index + usize(1).
+        return i64(count).
+
+# Shared cursor addition: folds `offset + count` with error propagation.
+# A negative count is an earlier error and propagates unchanged; the caller
+# validates offset, so there is no offset guard here and count wins.
+operation BytesAdvance:
+    accepts offset of type i64.
+    accepts count of type i64.
+    returns i64.
+    requires:
+        count >= 0 otherwise count.
+    body:
+        return offset + count.
+
+# Append at a signed cursor. Negative cursors propagate an earlier error.
+# Returns the next cursor; capacity failures leave the destination unchanged.
+operation BytesAppend:
+    accepts output of type MutBytes.
+    accepts offset of type i64.
+    accepts value of type Bytes.
+    returns i64.
+    requires:
+        offset >= 0 otherwise offset.
+        usize(offset) <= len(output) otherwise -28.
+    body:
+        let window = slice_mut(output, usize(offset), len(output) - usize(offset)).
+        let result = BytesCopy(window, value).
+        borrow_end(window).
+        return BytesAdvance(offset, result).
 
 # Nonnegative decimal, including leading zeros; -22 malformed, -75 overflow.
 operation BytesParseDecimal:
     accepts value of type Bytes.
     returns i64.
+    requires:
+        len(value) > 0 otherwise -22.
     body:
-        if len(value) == 0:
-            return -22.
         let mut number = 0.
         let mut index = usize(0).
         while index < len(value):
@@ -66,14 +138,13 @@ operation BytesParseDecimal:
             set index = index + 1.
         return number.
 
-# Full signed i64 decimal, including MIN, without negating MIN or allocating.
-# Insufficient capacity is -28 and leaves the output untouched.
-operation BytesDecimal:
+# Signed decimal with at least minimum_digits magnitude digits, including MIN.
+# Insufficient loan length is -28 and leaves the output untouched.
+operation BytesDecimalPadded:
     accepts value of type i64.
-    accepts output of type usize.
-    accepts capacity of type usize.
+    accepts minimum_digits of type usize.
+    accepts output of type MutBytes.
     returns i64.
-    effects: UnsafeMemory.
     body:
         let mut number = value.
         if value > 0:
@@ -86,33 +157,55 @@ operation BytesDecimal:
         let mut sign = usize(0).
         if value < 0:
             set sign = usize(1).
-        let count = digits + sign.
-        if count > capacity:
+        if minimum_digits > digits:
+            set digits = minimum_digits.
+        if sign > len(output):
             return -28.
+        if digits > len(output) - sign:
+            return -28.
+        let count = digits + sign.
         let mut position = count.
         while position > sign:
             set position = position - 1.
             let digit = 0 - number % 10.
-            store8(output + position, u8(48 + digit)).
+            put(output, position, u8(48 + digit)).
             set number = number / 10.
         if sign == 1:
-            store8(output, u8(45)).
+            put(output, usize(0), u8(45)).
         return i64(count).
 
+operation BytesDecimal:
+    accepts value of type i64.
+    accepts output of type MutBytes.
+    returns i64.
+    body:
+        return BytesDecimalPadded(value, usize(0), output).
+
+# Decimal formatting at a signed cursor, with the same error propagation.
+operation BytesDecimalAt:
+    accepts output of type MutBytes.
+    accepts offset of type i64.
+    accepts value of type i64.
+    returns i64.
+    requires:
+        offset >= 0 otherwise offset.
+        usize(offset) <= len(output) otherwise -28.
+    body:
+        let window = slice_mut(output, usize(offset), len(output) - usize(offset)).
+        let result = BytesDecimal(value, window).
+        borrow_end(window).
+        return BytesAdvance(offset, result).
+
+# ASCII hex digit value table in source order; anything else is -22.
 operation BytesHexDigit:
     accepts value of type u8.
     returns i64.
+    requires:
+        value >= 48 otherwise -22.
+        value > 57 otherwise i64(value) - 48.
+        value >= 65 otherwise -22.
+        value > 70 otherwise i64(value) - 55.
+        value >= 97 otherwise -22.
+        value > 102 otherwise i64(value) - 87.
     body:
-        if value < 48:
-            return -22.
-        if value <= 57:
-            return i64(value) - 48.
-        if value < 65:
-            return -22.
-        if value <= 70:
-            return i64(value) - 55.
-        if value < 97:
-            return -22.
-        if value <= 102:
-            return i64(value) - 87.
         return -22.

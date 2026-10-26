@@ -1,0 +1,467 @@
+# Typed POD collection runtime: Vector/Map storage, growth, hashing, probing.
+#
+# All allocation/growth/hash/probe/delete algorithms are SAL source in this
+# file. The compiler (sal_ir/src/collections.rs) only validates the original
+# `Vector<T>` / `Map<K,V>` types and generates thin typed marshalling wrappers
+# (private `SalColl*` names); those wrappers call into these generic
+# byte-oriented runtime operations. No Rust Vec/HashMap policy hides here.
+#
+# Naming: every helper here uses an ordinary `Collection*` name, never the
+# compiler-reserved `SalColl*` prefix. The `*Result` entities are distinct
+# from the same-named operations.
+#
+# Safety contract: each operation that accepts a forgable raw address
+# (`usize` storage base, source, or table pointer) and dereferences, copies
+# through, or unmaps it declares `UnsafeMemory` — plus `SystemCall` when it
+# also issues mmap/munmap. Raw `load8`/`store8`/`load64`/`store64` and
+# `syscall` words sit inside narrow `unsafe:` blocks. Safe callers therefore
+# cannot reach these helpers without an `unsafe:` proof context; the
+# generated typed wrappers supply that context with owner-derived addresses
+# and compiler-checked widths, and expose only safe owner signatures.
+#
+# Ownership model (enforced by the compiler passes, mirrored here):
+# - Element metadata lives on the CALLER stack (generated records holding
+#   data/len/cap, maps also used). Zero capacity means `data == 0` and no
+#   heap mapping.
+# - Every wrapper passes its slot address via `borrow(slot)` plus fixed field
+#   offsets (Vec: data@0, len@8, cap@16; Map: data@0, len@8, cap@16, used@24).
+#   Reads/writes therefore hit the original owner slot, never a copy.
+# - Vectors store elements back to back with stride `width` (the full C size
+#   of one boxed element, padding included; padding is never compared).
+# - Maps are open-addressed with linear probing. Each slot holds one state
+#   byte (0 empty, 1 occupied, 2 tombstone), then `keywidth` canonical packed
+#   key bytes, then `valwidth` value bytes. Stride is `1 + keywidth + valwidth`.
+#   Keys are field-wise packed by the generated key-pack helper (scalars
+#   little-endian, records concatenated in declaration order), so C padding
+#   bytes never affect hashing or equality. No raw record memcmp.
+# - Failure atomicity: reserve/push/insert map to a fresh table first and only
+#   publish (data/cap/used) plus unmap the old table on success. A `-12`
+#   leaves the prior contents intact.
+#
+# Status vocabulary:
+#   0    success (`map_insert` returns 1 when an existing key was replaced).
+#   -12  allocation failure (ENOMEM); prior data intact.
+#   -22  invalid argument (out-of-range index, zero element width).
+# Constructors (the generated wrappers) never return failure:
+# nonzero-capacity allocation failure exits nonzero (70); zero capacity
+# allocates nothing. Reads, removals, pops and contains never allocate and
+# never rehash; tombstone cleanup happens only on the fallible insert/reserve
+# paths. Lookups distinguish missing/out-of-range from stored zeros through
+# the typed `{found, value}` result; they never fake success.
+
+# Byte copy with no allocation: whole words would need alignment cover, so
+# this copies byte by byte. Lengths come from computed widths/capacities,
+# never from caller-claimed capacities. Raw addresses: UnsafeMemory.
+operation CollectionVecCopy:
+    accepts destination of type usize.
+    accepts source of type usize.
+    accepts count of type usize.
+    effects: UnsafeMemory.
+    body:
+        let mut index = usize(0).
+        let mut cell = u8(0).
+        while index < count:
+            unsafe:
+                set cell = load8(source + index).
+                store8(destination + index, cell).
+            set index = index + 1.
+
+entity CollectionVecGrowResult:
+    layout "C".
+    has status of type i64.
+    has data of type usize.
+
+# mmap result as a status/base pair: the mapped address, or -12 (ENOMEM)
+# with base 0 for a negative errno.
+operation CollectionAreaStatus:
+    accepts mapped of type i64.
+    returns CollectionVecGrowResult.
+    requires:
+        mapped >= 0 otherwise CollectionVecGrowResult(-12, usize(0)).
+    body:
+        return CollectionVecGrowResult(0, usize(mapped)).
+
+# Map a zeroed area of `total` bytes. Zeroed mappings give empty map states
+# for free. Raw mmap: SystemCall + UnsafeMemory.
+operation CollectionAreaNew:
+    accepts total of type usize.
+    returns CollectionVecGrowResult.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        let mut mapped = 0.
+        unsafe:
+            set mapped = syscall(9, 0, i64(total), 3, 34, -1, 0).
+        return CollectionAreaStatus(mapped).
+
+# Allocate a zeroed element area for `cap` elements of `width` bytes. Returns
+# the data address, or 0 when `cap` is 0, the width is 0, the product would
+# overflow the mmap bound, or the kernel mapping fails.
+operation CollectionVecNew:
+    accepts width of type usize.
+    accepts cap of type usize.
+    returns usize.
+    effects: SystemCall, UnsafeMemory.
+    requires:
+        cap != usize(0) otherwise usize(0).
+        width != usize(0) otherwise usize(0).
+        cap <= usize(4611686018427387903) / width otherwise usize(0).
+    body:
+        let area = CollectionAreaNew(cap * width).
+        return area.data.
+
+# Release an element area. No-op unless both the base and the total are
+# nonzero, so zero-capacity metadata needs no special case at call sites.
+# Raw munmap: SystemCall + UnsafeMemory.
+operation CollectionVecFree:
+    accepts data of type usize.
+    accepts total of type usize.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if data != usize(0) && total != usize(0):
+            unsafe:
+                syscall(11, i64(data), i64(total), 0, 0, 0, 0).
+
+# Copy the live prefix of the old area into a fresh mapping and release the
+# old area. A failed mapping (non-zero status) is returned untouched: the
+# old area stays intact.
+operation CollectionVecGrowCopy:
+    accepts area of type CollectionVecGrowResult.
+    accepts data of type usize.
+    accepts width of type usize.
+    accepts len of type usize.
+    accepts cap of type usize.
+    returns CollectionVecGrowResult.
+    effects: SystemCall, UnsafeMemory.
+    requires:
+        area.status == 0 otherwise area.
+    body:
+        CollectionVecCopy(area.data, data, len * width).
+        CollectionVecFree(data, cap * width).
+        return area.
+
+# Grow (or initially allocate) a vector area to exactly `newcap` elements,
+# copying the live prefix. Returns status 0 with the fresh base, or a
+# negative status with data 0; on failure the old area is untouched.
+# Raw mmap/munmap plus raw copy: SystemCall + UnsafeMemory.
+operation CollectionVecGrow:
+    accepts data of type usize.
+    accepts width of type usize.
+    accepts len of type usize.
+    accepts cap of type usize.
+    accepts newcap of type usize.
+    returns CollectionVecGrowResult.
+    effects: SystemCall, UnsafeMemory.
+    requires:
+        width != usize(0) otherwise CollectionVecGrowResult(-22, usize(0)).
+        newcap > cap otherwise CollectionVecGrowResult(0, data).
+        newcap <= usize(4611686018427387903) / width otherwise CollectionVecGrowResult(-12, usize(0)).
+    body:
+        return CollectionVecGrowCopy(CollectionAreaNew(newcap * width), data, width, len, cap).
+
+# Copy the element at `index` to `out` (exactly `width` bytes). Returns true
+# on success, false when the index is out of range or there is no storage.
+# Raw addresses: UnsafeMemory.
+operation CollectionVecGet:
+    accepts data of type usize.
+    accepts width of type usize.
+    accepts len of type usize.
+    accepts index of type usize.
+    accepts out of type usize.
+    returns bool.
+    effects: UnsafeMemory.
+    requires:
+        index < len otherwise false.
+        data != usize(0) otherwise false.
+    body:
+        CollectionVecCopy(out, data + index * width, width).
+        return true.
+
+# Overwrite the element at `index` from `element` (`width` bytes). Returns 0
+# on success, -22 when the index is out of range or there is no storage.
+# Raw addresses: UnsafeMemory.
+operation CollectionVecSet:
+    accepts data of type usize.
+    accepts width of type usize.
+    accepts len of type usize.
+    accepts index of type usize.
+    accepts element of type usize.
+    returns i64.
+    effects: UnsafeMemory.
+    requires:
+        index < len otherwise -22.
+        data != usize(0) otherwise -22.
+    body:
+        CollectionVecCopy(data + index * width, element, width).
+        return 0.
+
+# Append one element image at the tail position `len`. The caller guarantees
+# `len < cap`; no checks, no allocation here. Raw addresses: UnsafeMemory.
+operation CollectionVecPushTail:
+    accepts data of type usize.
+    accepts width of type usize.
+    accepts len of type usize.
+    accepts element of type usize.
+    effects: UnsafeMemory.
+    body:
+        CollectionVecCopy(data + len * width, element, width).
+
+# Copy the tail element to `out`. Returns true on success, false when the
+# vector is empty or has no storage. The caller publishes `len - 1`.
+# Raw addresses: UnsafeMemory.
+operation CollectionVecPopTail:
+    accepts data of type usize.
+    accepts width of type usize.
+    accepts len of type usize.
+    accepts out of type usize.
+    returns bool.
+    effects: UnsafeMemory.
+    requires:
+        len != usize(0) otherwise false.
+        data != usize(0) otherwise false.
+    body:
+        CollectionVecCopy(out, data + (len - usize(1)) * width, width).
+        return true.
+
+# FNV-1a 64 over exactly `len` bytes. Arithmetic stays in usize with explicit
+# wrapping, so hashing can never trap. The offset basis is rebuilt from its
+# high/low halves because the full constant does not fit a signed literal.
+# Raw addresses: UnsafeMemory.
+operation CollectionMapHash:
+    accepts data of type usize.
+    accepts len of type usize.
+    returns usize.
+    effects: UnsafeMemory.
+    body:
+        let high = usize(3421674724).
+        let shift = usize(4294967296).
+        let mut hash = high * shift + usize(2216829733).
+        let prime = usize(1099511628211).
+        let mut index = usize(0).
+        let mut cell = u8(0).
+        while index < len:
+            unsafe:
+                set cell = load8(data + index).
+            set hash = wrapping_mul(bit_xor(hash, usize(cell)), prime).
+            set index = index + 1.
+        return hash.
+
+# Byte equality over exactly `len` bytes. Canonical packed keys make this a
+# complete key comparison: padding never reaches this function.
+# Raw addresses: UnsafeMemory.
+operation CollectionMapKeyEqual:
+    accepts left of type usize.
+    accepts right of type usize.
+    accepts len of type usize.
+    returns bool.
+    effects: UnsafeMemory.
+    body:
+        let mut index = usize(0).
+        let mut first = u8(0).
+        let mut second = u8(0).
+        while index < len:
+            unsafe:
+                set first = load8(left + index).
+                set second = load8(right + index).
+            if first != second:
+                return false.
+            set index = index + 1.
+        return true.
+
+entity CollectionMapProbe:
+    layout "C".
+    has found of type bool.
+    has empty of type bool.
+    has index of type usize.
+
+# Probe for `keyptr`/`keylen`. When found, copies `valwidth` bytes to `out`
+# unless `out` is 0 and tombstones the slot when `tomb` is nonzero. Pure
+# lookup passes `out = 0, tomb = 0`; removal passes a real `out` and
+# `tomb = 1`. Never allocates, never rehashes. Raw addresses: UnsafeMemory.
+operation CollectionMapLookup:
+    accepts data of type usize.
+    accepts cap of type usize.
+    accepts stride of type usize.
+    accepts keyptr of type usize.
+    accepts keylen of type usize.
+    accepts valwidth of type usize.
+    accepts out of type usize.
+    accepts tomb of type usize.
+    returns CollectionMapProbe.
+    effects: UnsafeMemory.
+    requires:
+        cap != usize(0) otherwise CollectionMapProbe(false, false, usize(0)).
+        data != usize(0) otherwise CollectionMapProbe(false, false, usize(0)).
+    body:
+        let mut index = CollectionMapHash(keyptr, keylen) % cap.
+        let mut count = usize(0).
+        let mut state = u8(0).
+        while count < cap:
+            let base = data + index * stride.
+            unsafe:
+                set state = load8(base).
+            if state == u8(1) && CollectionMapKeyEqual(base + usize(1), keyptr, keylen):
+                if tomb != usize(0):
+                    unsafe:
+                        store8(base, u8(2)).
+                if out != usize(0):
+                    CollectionVecCopy(out, base + usize(1) + keylen, valwidth).
+                return CollectionMapProbe(true, false, index).
+            set index = (index + usize(1)) % cap.
+            set count = count + 1.
+        return CollectionMapProbe(false, false, usize(0)).
+
+# Find the slot for insertion: the existing index when the key is present,
+# otherwise the first tombstone when one precedes the terminating empty
+# slot, otherwise that empty slot. `empty` reports whether the returned
+# slot was empty (the caller bumps `used` only then). Index `cap` with
+# `found == false` means the table holds no reusable slot.
+# Raw addresses: UnsafeMemory.
+operation CollectionMapFindSlot:
+    accepts data of type usize.
+    accepts cap of type usize.
+    accepts stride of type usize.
+    accepts keyptr of type usize.
+    accepts keylen of type usize.
+    returns CollectionMapProbe.
+    effects: UnsafeMemory.
+    requires:
+        cap != usize(0) otherwise CollectionMapProbe(false, false, usize(0)).
+        data != usize(0) otherwise CollectionMapProbe(false, false, cap).
+    body:
+        let mut index = CollectionMapHash(keyptr, keylen) % cap.
+        let mut first = cap.
+        let mut count = usize(0).
+        let mut state = u8(0).
+        while count < cap:
+            let base = data + index * stride.
+            unsafe:
+                set state = load8(base).
+            if state == u8(1) && CollectionMapKeyEqual(base + usize(1), keyptr, keylen):
+                return CollectionMapProbe(true, false, index).
+            if state == u8(0):
+                return CollectionMapEmptySlot(first, cap, index).
+            if state != u8(1) && first == cap:
+                set first = index.
+            set index = (index + usize(1)) % cap.
+            set count = count + 1.
+        return CollectionMapProbe(false, false, first).
+
+# The terminating empty slot: the first tombstone seen before it (`first`
+# != cap) is reused, otherwise the empty slot itself is the insertion slot.
+operation CollectionMapEmptySlot:
+    accepts first of type usize.
+    accepts cap of type usize.
+    accepts index of type usize.
+    returns CollectionMapProbe.
+    requires:
+        first == cap otherwise CollectionMapProbe(false, false, first).
+    body:
+        return CollectionMapProbe(false, true, index).
+
+# Write a fresh entry: mark occupied, copy the canonical key, copy the
+# value image. The caller publishes `len`/`used`. Raw addresses:
+# UnsafeMemory.
+operation CollectionMapSlotInsert:
+    accepts data of type usize.
+    accepts index of type usize.
+    accepts stride of type usize.
+    accepts keyptr of type usize.
+    accepts keylen of type usize.
+    accepts valptr of type usize.
+    accepts valwidth of type usize.
+    effects: UnsafeMemory.
+    body:
+        let base = data + index * stride.
+        unsafe:
+            store8(base, u8(1)).
+        CollectionVecCopy(base + usize(1), keyptr, keylen).
+        CollectionVecCopy(base + usize(1) + keylen, valptr, valwidth).
+
+# Replace the value image of an occupied entry; the key is unchanged.
+# Raw addresses: UnsafeMemory.
+operation CollectionMapSlotWriteVal:
+    accepts data of type usize.
+    accepts index of type usize.
+    accepts stride of type usize.
+    accepts keylen of type usize.
+    accepts valptr of type usize.
+    accepts valwidth of type usize.
+    effects: UnsafeMemory.
+    body:
+        let base = data + index * stride.
+        CollectionVecCopy(base + usize(1) + keylen, valptr, valwidth).
+
+entity CollectionMapRehashResult:
+    layout "C".
+    has status of type i64.
+    has data of type usize.
+
+# Place one occupied entry (`source` is its slot base in the old table) into
+# the first empty slot probing from its hash in the fresh table.
+# Raw addresses: UnsafeMemory.
+operation CollectionMapPlace:
+    accepts fresh of type usize.
+    accepts newcap of type usize.
+    accepts stride of type usize.
+    accepts source of type usize.
+    accepts keywidth of type usize.
+    accepts valwidth of type usize.
+    effects: UnsafeMemory.
+    body:
+        let mut slot = CollectionMapHash(source + usize(1), keywidth) % newcap.
+        let mut probe = u8(0).
+        unsafe:
+            set probe = load8(fresh + slot * stride).
+        while probe != u8(0):
+            set slot = (slot + usize(1)) % newcap.
+            unsafe:
+                set probe = load8(fresh + slot * stride).
+        CollectionMapSlotInsert(fresh, slot, stride, source + usize(1), keywidth, source + usize(1) + keywidth, valwidth).
+
+# Move every occupied entry of the old table into the fresh mapping, then
+# release the old table. A failed mapping is reported unchanged, the old
+# table untouched. The fresh mapping is zeroed, so every slot starts empty
+# and insertion probing always terminates.
+# Raw munmap plus raw copy: SystemCall + UnsafeMemory.
+operation CollectionMapRehashFill:
+    accepts area of type CollectionVecGrowResult.
+    accepts data of type usize.
+    accepts keywidth of type usize.
+    accepts valwidth of type usize.
+    accepts cap of type usize.
+    accepts newcap of type usize.
+    returns CollectionMapRehashResult.
+    effects: SystemCall, UnsafeMemory.
+    requires:
+        area.status == 0 otherwise CollectionMapRehashResult(area.status, usize(0)).
+    body:
+        let stride = usize(1) + keywidth + valwidth.
+        let mut index = usize(0).
+        let mut state = u8(0).
+        while index < cap:
+            let base = data + index * stride.
+            unsafe:
+                set state = load8(base).
+            if state == u8(1):
+                CollectionMapPlace(area.data, newcap, stride, base, keywidth, valwidth).
+            set index = index + 1.
+        CollectionVecFree(data, cap * stride).
+        return CollectionMapRehashResult(0, area.data).
+
+# Rebuild the table at exactly `newcap` slots, dropping tombstones. Returns
+# status 0 with the fresh base, or a negative status with data 0; on failure
+# the old table is untouched.
+# Raw mmap/munmap plus raw copy: SystemCall + UnsafeMemory.
+operation CollectionMapRehash:
+    accepts data of type usize.
+    accepts keywidth of type usize.
+    accepts valwidth of type usize.
+    accepts cap of type usize.
+    accepts newcap of type usize.
+    returns CollectionMapRehashResult.
+    effects: SystemCall, UnsafeMemory.
+    requires:
+        newcap != usize(0) otherwise CollectionMapRehashResult(-22, usize(0)).
+        newcap <= usize(4611686018427387903) / (usize(1) + keywidth + valwidth) otherwise CollectionMapRehashResult(-12, usize(0)).
+    body:
+        return CollectionMapRehashFill(CollectionAreaNew(newcap * (usize(1) + keywidth + valwidth)), data, keywidth, valwidth, cap, newcap).

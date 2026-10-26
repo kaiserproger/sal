@@ -1,4 +1,5 @@
-# Linux x86-64 kernel sigaction ABI. No scratch allocation or byte packing.
+# Linux x86-64 process-wide signal policy. No scratch allocation.
+# Children inherit the SIGPIPE disposition.
 entity LinuxSignalAction:
     layout "C".
     has handler of type usize.
@@ -6,11 +7,30 @@ entity LinuxSignalAction:
     has restorer of type usize.
     has mask of type u64.
 
-# Explicit process-wide policy: writes to closed peers return -32 (EPIPE)
-# instead of terminating on SIGPIPE. Children inherit this disposition.
 operation LinuxIgnoreBrokenPipe:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let action = LinuxSignalAction(usize(1), u64(0), usize(0), u64(0)).
-        return syscall(13, 13, address(action), 0, 8, 0, 0).
+        let mut result = 0.
+        unsafe:
+            set result = syscall(13, 13, address(action), 0, 8, 0, 0).
+        return result.
+
+# Process address-space ceiling used by bounded-memory workloads. Both soft
+# and hard RLIMIT_AS are set; Linux preserves errno for invalid/denied limits.
+entity LinuxResourceLimit:
+    layout "C".
+    has soft of type usize.
+    has hard of type usize.
+
+operation LinuxSetAddressSpaceLimit:
+    accepts bytes of type usize.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let limit = LinuxResourceLimit(bytes, bytes).
+        let mut result = 0.
+        unsafe:
+            set result = syscall(160, 9, address(limit), 0, 0, 0, 0).
+        return result.

@@ -1,0 +1,206 @@
+use "std/http_client.sal".
+use "std/http.sal".
+use "std/bytes.sal".
+use "std/server.sal".
+use "std/net.sal".
+use "std/concurrency.sal".
+use "std/linux/io.sal".
+use "std/linux/net.sal".
+# Consumer proof for the generic HTTP client, single finite Main. Main
+# opens an ephemeral port-0 listener via NetTcpListen, discovers the
+# bound port with NetLocalPort, spawns one server worker (worker-owned
+# Buffer, ServerServe owns the fd and its drop), drives the full check
+# matrix as a client, then NetShutdowns the listener to wake the blocked
+# accept and joins the worker. Server and client share ServerDispatch;
+# every byte crosses a real socket. No fixed ports, no raw fork/syscall/
+# mmap, no host logic. Exit 0 is silent success.
+operation ServerDispatch:
+    accepts client of type i64.
+    accepts arena of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let requestWindow = slice_mut(arena, usize(0), usize(32768)).
+        let requestLength = HttpReadRequest(client, requestWindow).
+        borrow_end(requestWindow).
+        if requestLength < 0:
+            let badScratch = slice_mut(arena, usize(32768), usize(16384)).
+            let bad = HttpWriteTextResponse(client, 400, bytes("bad request"), badScratch).
+            borrow_end(badScratch).
+            if bad < 0:
+                return 41.
+            return 0.
+        let requestView = view(arena).
+        let request = slice(requestView, usize(0), usize(requestLength)).
+        let path = HttpPath(request).
+        borrow_end(requestView).
+        borrow_end(request).
+        if path == bytes("/slow"):
+            let shortScratch = slice_mut(arena, usize(32768), usize(16384)).
+            let headerSize = HttpResponseHeader(200, usize(100), false, shortScratch).
+            borrow_end(shortScratch).
+            if headerSize < 0:
+                return 42.
+            let outView = view(arena).
+            let outHeader = slice(outView, usize(32768), usize(headerSize)).
+            let sentHead = LinuxWriteAll(client, outHeader).
+            borrow_end(outView).
+            borrow_end(outHeader).
+            if sentHead < 0:
+                return 43.
+            if LinuxWriteAll(client, bytes("ab")) < 0:
+                return 44.
+            return 0.
+        if path == bytes("/chunk"):
+            if LinuxWriteAll(client, bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n")) < 0:
+                return 45.
+            return 0.
+        let okScratch = slice_mut(arena, usize(32768), usize(16384)).
+        let ok = HttpWriteTextResponse(client, 200, path, okScratch).
+        borrow_end(okScratch).
+        if ok < 0:
+            return 46.
+        return 0.
+
+operation ServerWorker:
+    accepts listener of type i64.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let arena = buffer(usize(65536)).
+        return ServerServe(listener, arena, 32).
+
+operation ClientDriver:
+    accepts port of type i64.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let headerBuf = buffer(usize(8192)).
+        let responseBuf = buffer(usize(8192)).
+        let tinyBuf = buffer(usize(64)).
+        let header = borrow_mut(headerBuf, usize(0), usize(8192)).
+        let response = borrow_mut(responseBuf, usize(0), usize(8192)).
+        let tiny = borrow_mut(tinyBuf, usize(0), usize(8)).
+        let mut failure = 0.
+        let getReply = HttpClientRequest(2130706433, port, bytes("GET"), bytes("/hello"), bytes(""), response, header).
+        if getReply.status != 200:
+            if failure == 0:
+                set failure = 1.
+        if getReply.body_offset != usize(0):
+            if failure == 0:
+                set failure = 2.
+        if getReply.body_length != usize(6):
+            if failure == 0:
+                set failure = 3.
+        let seen = view(response).
+        let got = slice(seen, getReply.body_offset, getReply.body_length).
+        let same = got == bytes("/hello").
+        borrow_end(seen).
+        borrow_end(got).
+        if same == false:
+            if failure == 0:
+                set failure = 4.
+        let posted = HttpClientRequest(2130706433, port, bytes("POST"), bytes("/items"), bytes("ab"), response, header).
+        if posted.status != 200:
+            if failure == 0:
+                set failure = 5.
+        let postedView = view(response).
+        let postedGot = slice(postedView, posted.body_offset, posted.body_length).
+        let postedSame = postedGot == bytes("/items").
+        borrow_end(postedView).
+        borrow_end(postedGot).
+        if postedSame == false:
+            if failure == 0:
+                set failure = 6.
+        let short = HttpClientRequest(2130706433, port, bytes("GET"), bytes("/slow"), bytes(""), response, header).
+        if short.status != -400:
+            if failure == 0:
+                set failure = 7.
+        let coded = HttpClientRequest(2130706433, port, bytes("GET"), bytes("/chunk"), bytes(""), response, header).
+        if coded.status != -400:
+            if failure == 0:
+                set failure = 8.
+        let refused = HttpClientRequest(2130706433, 1, bytes("GET"), bytes("/"), bytes(""), response, header).
+        if refused.status >= 0:
+            if failure == 0:
+                set failure = 9.
+        let empty = HttpClientRequest(2130706433, port, bytes(""), bytes("/"), bytes(""), response, header).
+        if empty.status != -22:
+            if failure == 0:
+                set failure = 10.
+        let relative = HttpClientRequest(2130706433, port, bytes("GET"), bytes("no-slash"), bytes(""), response, header).
+        if relative.status != -22:
+            if failure == 0:
+                set failure = 11.
+        let fragment = HttpClientRequest(2130706433, port, bytes("GET"), bytes("/a#b"), bytes(""), response, header).
+        if fragment.status != -22:
+            if failure == 0:
+                set failure = 12.
+        let cramped = HttpClientRequest(2130706433, port, bytes("GET"), bytes("/"), bytes(""), response, tiny).
+        if cramped.status != -28:
+            if failure == 0:
+                set failure = 13.
+        let evil = bytes("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n").
+        let evilLine = HttpClientFindCrlf(evil, len(evil), usize(0)).
+        let evilEnd = HttpClientFindHeaderEnd(evil, len(evil), usize(0)).
+        if HttpClientContentLength(evil, usize(evilLine) + 2, usize(evilEnd)) != -400:
+            if failure == 0:
+                set failure = 14.
+        let encoded = bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").
+        let encodedLine = HttpClientFindCrlf(encoded, len(encoded), usize(0)).
+        let encodedEnd = HttpClientFindHeaderEnd(encoded, len(encoded), usize(0)).
+        if HttpClientContentLength(encoded, usize(encodedLine) + 2, usize(encodedEnd)) != -400:
+            if failure == 0:
+                set failure = 15.
+        if HttpClientParseStatus(bytes("HTTP/2.0 200 OK\r\n\r\n"), usize(19)) != -400:
+            if failure == 0:
+                set failure = 16.
+        if HttpClientParseStatus(bytes("HTTP/1.1 000 Empty\r\n\r\n"), usize(23)) != -400:
+            if failure == 0:
+                set failure = 17.
+        if HttpClientBuildRequest(tiny, bytes("GET"), bytes("/"), 0, 2130706433, 80) != -28:
+            if failure == 0:
+                set failure = 18.
+        if HttpClientPutBytes(tiny, usize(6), bytes("abcd")) != -28:
+            if failure == 0:
+                set failure = 19.
+        let overflow = bytes("HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\n").
+        let overflowLine = HttpClientFindCrlf(overflow, len(overflow), usize(0)).
+        let overflowEnd = HttpClientFindHeaderEnd(overflow, len(overflow), usize(0)).
+        if HttpClientContentLength(overflow, usize(overflowLine) + 2, usize(overflowEnd)) != -413:
+            if failure == 0:
+                set failure = 20.
+        borrow_end(header).
+        borrow_end(response).
+        borrow_end(tiny).
+        buffer_drop(headerBuf).
+        buffer_drop(responseBuf).
+        buffer_drop(tinyBuf).
+        return failure.
+
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        # Ephemeral port-0 listener via the generic net module; the bound
+        # port comes from NetLocalPort and the accept wake from NetShutdown
+        # (shutdown, not close: ServerServe owns the fd and its drop).
+        let listener = NetTcpListen(2130706433, 0, 16).
+        if listener < 0:
+            return 90.
+        let port = NetLocalPort(listener).
+        if port < 0:
+            # Worker never spawned: Main still owns the listener here.
+            LinuxClose(listener).
+            return 91.
+        let worker = spawn(ServerWorker, listener).
+        let result = ClientDriver(port).
+        # Shutdown+join run on every path: ClientDriver reports status,
+        # Main never returns early here.
+        let stopped = NetShutdown(listener, 2).
+        let status = join(worker).
+        if result != 0:
+            return result.
+        if stopped != 0 || status != -22:
+            return 92.
+        return 0.

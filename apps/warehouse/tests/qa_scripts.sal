@@ -1,0 +1,241 @@
+use "qa_runner.sal".
+use "qa_payloads.sal".
+
+# Sequential scenario scripts, one per behavioral scenario and in its
+# order. Each line is one check: a QaCall record (or fixture SQL, or an
+# assert_counts read through /stock) handed to the runner with the group
+# cursor. Groups start from the setUp fixture reset, report PASS/FAIL and
+# return 0 or 1. `work` holds the group's runtime-built payloads.
+
+operation QaRed:
+    returns Bytes.
+    body:
+        return bytes("SKU-RED-M").
+
+operation QaBlue:
+    returns Bytes.
+    body:
+        return bytes("SKU-BLUE-L").
+
+# The seeded warehouse-1 listing, exactly (sorted by code bytes).
+operation QaSeededListing:
+    returns Bytes.
+    body:
+        return bytes("{\"warehouse\":{\"id\":1,\"name\":\"Central warehouse\",\"available\":true},\"items\":[{\"name\":\"Blue \\\"wind\\\" jacket\",\"size\":\"L\",\"code\":\"SKU-BLUE-L\",\"quantity\":5,\"reserved\":0,\"available_quantity\":5},{\"name\":\"Red shirt\",\"size\":\"M\",\"code\":\"SKU-RED-M\",\"quantity\":10,\"reserved\":0,\"available_quantity\":10},{\"name\":\"Black shoes\",\"size\":\"42\",\"code\":\"SKU-ZERO-42\",\"quantity\":0,\"reserved\":0,\"available_quantity\":0},{\"name\":\"Куртка\",\"size\":\"M\",\"code\":\"SKU-ЁЖ-М\",\"quantity\":7,\"reserved\":0,\"available_quantity\":7}]}").
+
+# test_metadata_unicode_json_escaping_and_zero_stock.
+operation QaGroupMetadata:
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    accepts work of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let name = bytes("Склад \"A\"\\north\n\t").
+        let code = bytes("quoted\"\\\n' OR 1=1 -- Ё").
+        let size = bytes("M\"\\\t").
+        let mut at = QaReset(0, fd, wire).
+        set at = QaRun(at, wire, QaPost(bytes("/stock"), bytes("{\"warehouse_id\":1}"), 200, QaSeededListing())).
+        let renamed = QaBind(slice_mut(work, usize(0), len(work)), name).
+        set at = QaSqlBound(at, fd, wire, bytes("UPDATE warehouses SET name=$1 WHERE id=1"), 1, renamed).
+        borrow_end(renamed).
+        let item = QaBindThree(slice_mut(work, usize(0), len(work)), name, size, code).
+        set at = QaSqlBound(at, fd, wire, bytes("INSERT INTO items(id,name,size,code) VALUES(100,$1,$2,$3)"), 3, item).
+        borrow_end(item).
+        set at = QaSql(at, fd, wire, bytes("INSERT INTO inventory(warehouse_id,item_id,quantity) VALUES(1,100,2)")).
+        let head = QaRenamedHead(slice_mut(work, usize(0), len(work)), name).
+        set at = QaRun(at, wire, QaShows(bytes("{\"warehouse_id\":1}"), head)).
+        borrow_end(head).
+        let row = QaQuotedRow(slice_mut(work, usize(0), len(work)), name, size, code).
+        set at = QaRun(at, wire, QaShows(bytes("{\"warehouse_id\":1}"), row)).
+        borrow_end(row).
+        let reserve = QaCodeBody(slice_mut(work, usize(0), len(work)), code).
+        set at = QaRun(at, wire, QaPost(bytes("/reserve"), reserve, 200, bytes("{\"warehouse_id\":1,\"reserved\":1}"))).
+        set at = QaCount(at, wire, 1, code, 2, 1).
+        set at = QaCount(at, wire, 1, QaRed(), 10, 0).
+        set at = QaRun(at, wire, QaPost(bytes("/release"), reserve, 200, bytes("{\"warehouse_id\":1,\"released\":1}"))).
+        borrow_end(reserve).
+        set at = QaCount(at, wire, 1, code, 2, 0).
+        return QaReport(bytes("group-metadata"), at, work).
+
+# test_arrays_are_atomic_and_missing_codes_do_not_mutate.
+operation QaGroupAtomic:
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    accepts work of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut at = QaReset(0, fd, wire).
+        set at = QaRun(at, wire, QaPost(bytes("/reserve"), bytes("{\"codes\":[\"SKU-RED-M\",\"SKU-ZERO-42\"]}"), 409, QaNoStock())).
+        set at = QaCount(at, wire, 1, QaRed(), 10, 0).
+        set at = QaRun(at, wire, QaPost(bytes("/reserve"), bytes("{\"codes\":[\"SKU-RED-M\",\"absent\"]}"), 404, QaNoItem())).
+        set at = QaCount(at, wire, 1, QaRed(), 10, 0).
+        set at = QaRun(at, wire, QaPost(bytes("/reserve"), bytes("{\"codes\":[\"SKU-RED-M\"]}"), 200, bytes("{\"warehouse_id\":1,\"reserved\":1}"))).
+        set at = QaRun(at, wire, QaPost(bytes("/release"), bytes("{\"codes\":[\"SKU-RED-M\",\"SKU-BLUE-L\"]}"), 409, QaNoReservation())).
+        set at = QaCount(at, wire, 1, QaRed(), 10, 1).
+        set at = QaRun(at, wire, QaPost(bytes("/release"), bytes("{\"codes\":[\"SKU-RED-M\",\"absent\"]}"), 404, QaNoItem())).
+        set at = QaCount(at, wire, 1, QaRed(), 10, 1).
+        set at = QaRun(at, wire, QaPost(bytes("/release"), bytes("{\"codes\":[\"SKU-RED-M\"]}"), 200, bytes("{\"warehouse_id\":1,\"released\":1}"))).
+        set at = QaCount(at, wire, 1, QaRed(), 10, 0).
+        return QaReport(bytes("group-atomic"), at, work).
+
+# test_multiwarehouse_closed_and_empty_warehouses. The closed-warehouse
+# listing is compared whole: available false plus RED at (4, 0).
+operation QaGroupWarehouses:
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    accepts work of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut at = QaReset(0, fd, wire).
+        set at = QaRun(at, wire, QaPost(bytes("/reserve"), bytes("{\"warehouse_id\":2,\"codes\":[\"SKU-RED-M\",\"SKU-BLUE-L\"]}"), 200, bytes("{\"warehouse_id\":2,\"reserved\":2}"))).
+        set at = QaCount(at, wire, 1, QaRed(), 10, 0).
+        set at = QaCount(at, wire, 2, QaRed(), 3, 1).
+        set at = QaCount(at, wire, 2, QaBlue(), 2, 1).
+        set at = QaRun(at, wire, QaPost(bytes("/reserve"), bytes("{\"warehouse_id\":2,\"codes\":[\"SKU-RED-M\",\"SKU-ЁЖ-М\"]}"), 404, QaNoItem())).
+        set at = QaCount(at, wire, 2, QaRed(), 3, 1).
+        set at = QaRun(at, wire, QaPost(bytes("/release"), bytes("{\"warehouse_id\":2,\"codes\":[\"SKU-BLUE-L\",\"SKU-RED-M\"]}"), 200, bytes("{\"warehouse_id\":2,\"released\":2}"))).
+        set at = QaCount(at, wire, 2, QaRed(), 3, 0).
+        set at = QaRun(at, wire, QaPost(bytes("/reserve"), bytes("{\"warehouse_id\":3,\"codes\":[\"SKU-RED-M\"]}"), 409, bytes("{\"error\":{\"code\":\"warehouse_unavailable\"}}"))).
+        set at = QaSql(at, fd, wire, bytes("UPDATE inventory SET reserved=1 WHERE warehouse_id=3 AND item_id=1")).
+        set at = QaRun(at, wire, QaPost(bytes("/release"), bytes("{\"warehouse_id\":3,\"codes\":[\"SKU-RED-M\"]}"), 200, bytes("{\"warehouse_id\":3,\"released\":1}"))).
+        set at = QaRun(at, wire, QaPost(bytes("/stock"), bytes("{\"warehouse_id\":3}"), 200, bytes("{\"warehouse\":{\"id\":3,\"name\":\"Closed warehouse\",\"available\":false},\"items\":[{\"name\":\"Red shirt\",\"size\":\"M\",\"code\":\"SKU-RED-M\",\"quantity\":4,\"reserved\":0,\"available_quantity\":4}]}"))).
+        set at = QaSql(at, fd, wire, bytes("INSERT INTO warehouses(id,name) VALUES(100,'Empty')")).
+        set at = QaRun(at, wire, QaPost(bytes("/stock"), bytes("{\"warehouse_id\":100}"), 200, bytes("{\"warehouse\":{\"id\":100,\"name\":\"Empty\",\"available\":true},\"items\":[]}"))).
+        set at = QaSql(at, fd, wire, bytes("DELETE FROM warehouses WHERE id=100")).
+        set at = QaRun(at, wire, QaPost(bytes("/stock"), bytes("{\"warehouse_id\":99999,\"codes\":[\"SKU-RED-M\"]}"), 404, QaNoWarehouse())).
+        set at = QaRun(at, wire, QaPost(bytes("/reserve"), bytes("{\"warehouse_id\":99999,\"codes\":[\"SKU-RED-M\"]}"), 404, QaNoWarehouse())).
+        set at = QaRun(at, wire, QaPost(bytes("/release"), bytes("{\"warehouse_id\":99999,\"codes\":[\"SKU-RED-M\"]}"), 404, QaNoWarehouse())).
+        return QaReport(bytes("group-warehouses"), at, work).
+
+# test_invalid_bodies_ids_duplicates_and_limits: the `for value in (...)`
+# warehouse_id matrix crossed with the three actions.
+operation QaBadWarehouseId:
+    accepts index of type i64.
+    returns Bytes.
+    requires:
+        index != 0 otherwise bytes("{\"warehouse_id\":0,\"codes\":[\"SKU-RED-M\"]}").
+        index != 1 otherwise bytes("{\"warehouse_id\":-1,\"codes\":[\"SKU-RED-M\"]}").
+        index != 2 otherwise bytes("{\"warehouse_id\":1.5,\"codes\":[\"SKU-RED-M\"]}").
+        index != 3 otherwise bytes("{\"warehouse_id\":1e+20,\"codes\":[\"SKU-RED-M\"]}").
+        index != 4 otherwise bytes("{\"warehouse_id\":\"1\",\"codes\":[\"SKU-RED-M\"]}").
+        index != 5 otherwise bytes("{\"warehouse_id\":true,\"codes\":[\"SKU-RED-M\"]}").
+    body:
+        return bytes("{\"warehouse_id\":null,\"codes\":[\"SKU-RED-M\"]}").
+
+operation QaAction:
+    accepts index of type i64.
+    returns Bytes.
+    requires:
+        index != 0 otherwise bytes("/reserve").
+        index != 1 otherwise bytes("/release").
+    body:
+        return bytes("/stock").
+
+operation QaRejected:
+    accepts path of type Bytes.
+    accepts body of type Bytes.
+    returns QaCall.
+    body:
+        return QaPost(path, body, 400, QaInvalid()).
+
+operation QaGroupInvalid:
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    accepts work of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut at = QaReset(0, fd, wire).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes(""))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("[]"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("null"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{} trailing"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"x\",]}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"x\"],\"warehouse_id\":1,\"wareh\\u006fuse_id\":2}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"SKU-RED-M\",\"SKU-RED-\\u004d\"]}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"SKU-RED-M\"],\"codes\":[\"SKU-BLUE-L\"]}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"x\"],\"unknown\":[1,]}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"\\ud800\"]}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"\\u0000\"]}"))).
+        # {"codes":["\xff"]}: a raw non-UTF-8 byte.
+        let raw = QaHexBody(slice_mut(work, usize(0), len(work)), bytes("7b22636f646573223a5b22ff225d7d")).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), raw)).
+        borrow_end(raw).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"x\"],\"warehouse_id\":1.0}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"x\"],\"warehouse_id\":1e0}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"x\"],\"warehouse_id\":9223372036854775808}"))).
+        let mut value = 0.
+        while value < 7:
+            let mut action = 0.
+            while action < 3:
+                set at = QaRun(at, wire, QaRejected(QaAction(action), QaBadWarehouseId(value))).
+                set action = action + 1.
+            set value = value + 1.
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[]}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"SKU-RED-M\",null]}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":\"not-array\"}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"\"]}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{\"codes\":[\"SKU-RED-M\",\"SKU-RED-M\"]}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/reserve"), bytes("{}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/release"), bytes("{}"))).
+        set at = QaRun(at, wire, QaRejected(bytes("/stock"), bytes("{}"))).
+        let long = QaLongCodeBody(slice_mut(work, usize(0), len(work)), 129).
+        set at = QaRun(at, wire, QaPost(bytes("/reserve"), long, 413, QaTooLarge())).
+        borrow_end(long).
+        let many = QaCodesBody(slice_mut(work, usize(0), len(work)), bytes("code-"), 65, false).
+        set at = QaRun(at, wire, QaPost(bytes("/reserve"), many, 413, QaTooLarge())).
+        borrow_end(many).
+        let spaces = QaSpaces(slice_mut(work, usize(0), len(work)), 65537).
+        set at = QaRun(at, wire, QaPost(bytes("/stock"), spaces, 413, QaTooLarge())).
+        borrow_end(spaces).
+        set at = QaRun(at, wire, QaPost(bytes("/reserve"), bytes("{\"codes\":[\"SKU-RED-M\"],\"wareh\\u006fuse_id\":1,\"nested\":{\"ok\":[true,null,1e2]}}"), 200, bytes("{\"warehouse_id\":1,\"reserved\":1}"))).
+        set at = QaCount(at, wire, 1, QaRed(), 10, 1).
+        return QaReport(bytes("group-invalid"), at, work).
+
+# test_full_64_code_batch_and_explicit_result_limit. Encoding doubles the
+# 3000 quoted names, so the full listing exceeds the application's two-MiB
+# arena: it must be a complete 413 reply, never a truncated 200.
+operation QaGroupBatch:
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    accepts work of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut at = QaReset(0, fd, wire).
+        set at = QaSql(at, fd, wire, bytes("INSERT INTO items(id,name,size,code) SELECT 100+i, 'Batch item', 'M', 'BATCH-' || i FROM generate_series(0,63) AS i")).
+        set at = QaSql(at, fd, wire, bytes("INSERT INTO inventory(warehouse_id,item_id,quantity) SELECT 1,100+i,1 FROM generate_series(0,63) AS i")).
+        let forward = QaCodesBody(slice_mut(work, usize(0), len(work)), bytes("BATCH-"), 64, false).
+        set at = QaRun(at, wire, QaPost(bytes("/reserve"), forward, 200, bytes("{\"warehouse_id\":1,\"reserved\":64}"))).
+        borrow_end(forward).
+        let mut index = 0.
+        while index < 64:
+            let code = QaNumbered(slice_mut(work, usize(0), len(work)), bytes("BATCH-"), index).
+            set at = QaCount(at, wire, 1, code, 1, 1).
+            borrow_end(code).
+            set index = index + 1.
+        let reversed = QaCodesBody(slice_mut(work, usize(0), len(work)), bytes("BATCH-"), 64, true).
+        set at = QaRun(at, wire, QaPost(bytes("/release"), reversed, 200, bytes("{\"warehouse_id\":1,\"released\":64}"))).
+        borrow_end(reversed).
+        set at = QaSql(at, fd, wire, bytes("DO $$BEGIN IF (SELECT sum(reserved) FROM inventory WHERE item_id>=100) IS DISTINCT FROM 0 THEN RAISE EXCEPTION 'batch reservations remain'; END IF; END$$")).
+        set at = QaSql(at, fd, wire, bytes("INSERT INTO items(id,name,size,code) SELECT 1000+i,repeat(chr(34),256),repeat(chr(34),64),lpad(i::text,128,'x') FROM generate_series(0,2999) AS i")).
+        set at = QaSql(at, fd, wire, bytes("INSERT INTO inventory(warehouse_id,item_id,quantity) SELECT 1,1000+i,1 FROM generate_series(0,2999) AS i")).
+        set at = QaRun(at, wire, QaPost(bytes("/stock"), bytes("{\"warehouse_id\":1}"), 413, bytes("{\"error\":{\"code\":\"result_too_large\"}}"))).
+        return QaReport(bytes("group-batch"), at, work).
+
+# test_action_routing.
+operation QaGroupRouting:
+    accepts wire of type MutBytes.
+    accepts work of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut at = QaRun(0, wire, QaPost(bytes("/unknown"), bytes("{}"), 404, bytes("{\"error\":{\"code\":\"action_not_found\"}}"))).
+        let mut action = 0.
+        while action < 3:
+            set at = QaRun(at, wire, QaVia(bytes("GET"), QaAction(action), bytes("{}"), 405, bytes("{\"error\":{\"code\":\"method_not_allowed\"}}"))).
+            set action = action + 1.
+        return QaReport(bytes("group-routing"), at, work).

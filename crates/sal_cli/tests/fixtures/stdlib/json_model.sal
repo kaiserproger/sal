@@ -1,0 +1,341 @@
+use "std/text_list.sal".
+use "std/json_model.sal".
+use "std/binary.sal".
+use "std/buffer.sal".
+
+# Executable fixture for the declarative JSON data runtime. Exercises the
+# generic cursor/reader/writer surface against known vectors (no warehouse
+# shapes beyond one structurally similar probe object), boundary and limit
+# behavior, forged-frame safety, and cross-module decode/encode agreement.
+# Asserts only observable statuses, offsets, counts, and byte contents, never
+# source text or wiring. No host mocks.
+#
+# Every check is one `Expect` line; the exit status is the first failing
+# check number, 0 when every check holds. Readers that return view-holding
+# records are wrapped by probe helpers that copy plain facts into C records
+# and end the views before returning, so each fixed arena window is reusable
+# and the arena drops once at the end.
+
+# First failure wins: keeps an earlier failure, else reports `code` when the
+# check does not hold.
+operation Expect:
+    accepts failure of type i64.
+    accepts code of type i64.
+    accepts holds of type bool.
+    returns i64.
+    requires:
+        failure == 0 otherwise failure.
+        holds otherwise code.
+    body:
+        return 0.
+
+operation FixtureItemAt:
+    accepts list of type TextList.
+    accepts want of type usize.
+    returns Text from list.
+    body:
+        let mut cursor = list.
+        let mut index = usize(0).
+        while true:
+            let step = TextListNext(cursor).
+            if step.valid == false || step.has == false:
+                return "".
+            if index == want:
+                return step.value.
+            set cursor = step.next.
+            set index = index + 1.
+
+# True when the first `wrote` bytes of target equal expected.
+operation WrittenEquals:
+    accepts target of type MutBytes.
+    accepts wrote of type i64.
+    accepts expected of type Bytes.
+    returns bool.
+    requires:
+        wrote >= 0 otherwise false.
+        usize(wrote) <= len(target) otherwise false.
+    body:
+        let written = view(target).
+        let prefix = slice(written, usize(0), usize(wrote)).
+        let same = prefix == expected.
+        borrow_end(prefix).
+        borrow_end(written).
+        return same.
+
+# One Next step followed by a decoded-key comparison.
+operation NextKeyIs:
+    accepts input of type Bytes.
+    accepts cursor of type JsonModelCursor.
+    accepts expected of type Text.
+    accepts key of type MutBytes.
+    returns bool.
+    body:
+        let member = JsonModelNext(input, cursor, key).
+        return member.status == 0 && JsonModelKeyEquals(key, member.key_length, expected).
+
+entity TextProbe:
+    layout "C".
+    has status of type i64.
+    has written of type usize.
+    has read_end of type usize.
+    has matches of type bool.
+
+operation ProbeText:
+    accepts input of type Bytes.
+    accepts expected of type Bytes.
+    accepts output of type MutBytes.
+    returns TextProbe.
+    body:
+        let read = JsonModelReadText(input, usize(0), output).
+        let probe = TextProbe(read.status, read.written, read.read_end, bytes(read.value) == expected).
+        borrow_end(read).
+        return probe.
+
+entity ListProbe:
+    layout "C".
+    has status of type i64.
+    has read_end of type usize.
+    has written of type usize.
+    has count of type usize.
+    has first_matches of type bool.
+    has second_matches of type bool.
+    has non_empty of type bool.
+    has at_most_one of type bool.
+    has at_most_two of type bool.
+    has no_nul of type bool.
+    has unique of type bool.
+
+operation ProbeList:
+    accepts input of type Bytes.
+    accepts max_items of type usize.
+    accepts max_item_bytes of type usize.
+    accepts first of type Bytes.
+    accepts second of type Bytes.
+    accepts output of type MutBytes.
+    returns ListProbe.
+    body:
+        let read = JsonModelReadTextList(input, usize(0), output, max_items, max_item_bytes).
+        let list = read.value.
+        let head = FixtureItemAt(list, usize(0)).
+        let next = FixtureItemAt(list, usize(1)).
+        let probe = ListProbe(read.status, read.read_end, read.written, TextListLen(list), bytes(head) == first, bytes(next) == second, TextListEachNonEmpty(list), TextListEachAtMost(list, usize(1)), TextListEachAtMost(list, usize(2)), TextListNoNul(list), TextListUnique(list)).
+        borrow_end(head).
+        borrow_end(next).
+        borrow_end(list).
+        borrow_end(read).
+        return probe.
+
+# Decode a JSON array into scratch, re-encode it into target, compare bytes.
+operation ListRoundTrip:
+    accepts input of type Bytes.
+    accepts scratch of type MutBytes.
+    accepts target of type MutBytes.
+    returns bool.
+    body:
+        let read = JsonModelReadTextList(input, usize(0), scratch, usize(0), usize(0)).
+        let wrote = JsonModelWriteTextList(read.value, target, usize(0)).
+        let status = read.status.
+        borrow_end(read).
+        return status == 0 && WrittenEquals(target, wrote, input).
+
+# A forged one-entry TextList whose BE32 length (9) runs past its 4 bytes:
+# Next must report invalid, never trap or fabricate an item.
+operation ForgedRejected:
+    accepts frame of type MutBytes.
+    returns bool.
+    body:
+        let framed = BinaryWriteU32Be(frame, usize(0), 9).
+        let raw = view(frame).
+        let step = TextListNext(TextList(raw, usize(1))).
+        let rejected = framed == 4 && step.valid == false && step.has == false.
+        borrow_end(step).
+        borrow_end(raw).
+        return rejected.
+
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        let fixtureNegativeOne = -1.
+        let fixtureU64Max = bits_as(u64, fixtureNegativeOne).
+        let arena = buffer(usize(4096)).
+        let scratch = borrow_mut(arena, usize(0), usize(4096)).
+        # Fixed disjoint windows of one arena loan.
+        let textOut = slice_mut(scratch, usize(0), usize(64)).
+        let narrow = slice_mut(scratch, usize(64), usize(2)).
+        let listOut = slice_mut(scratch, usize(128), usize(128)).
+        let target = slice_mut(scratch, usize(256), usize(256)).
+        let roundOut = slice_mut(scratch, usize(512), usize(128)).
+        let small = slice_mut(scratch, usize(640), usize(3)).
+        let forged = slice_mut(scratch, usize(648), usize(4)).
+        let cursorOut = slice_mut(scratch, usize(656), usize(16)).
+        let shortOut = slice_mut(scratch, usize(672), usize(3)).
+        let tinyKey = slice_mut(scratch, usize(680), usize(1)).
+        let shortKey = slice_mut(scratch, usize(684), usize(4)).
+        let key = slice_mut(scratch, usize(4000), usize(96)).
+        # --- JsonModelBegin: object brace after whitespace.
+        set failure = Expect(failure, 1, JsonModelBegin(bytes("  {\"a\":1}"), usize(0)).status == 0).
+        set failure = Expect(failure, 2, JsonModelBegin(bytes("  {\"a\":1}"), usize(0)).cursor.offset == usize(3)).
+        set failure = Expect(failure, 3, JsonModelBegin(bytes("  {\"a\":1}"), usize(0)).cursor.first).
+        set failure = Expect(failure, 4, JsonModelBegin(bytes("  [1]"), usize(0)).status == -22).
+        # --- JsonModelNext: first key, separators, present/value_start.
+        let idObject = bytes("{\"id\":7}").
+        let first = JsonModelNext(idObject, JsonModelCursor(usize(1), true), key).
+        set failure = Expect(failure, 5, first.status == 0 && first.present).
+        set failure = Expect(failure, 6, first.key_length == 2 && first.value_start == usize(6)).
+        set failure = Expect(failure, 7, NextKeyIs(idObject, JsonModelCursor(usize(1), true), "id", key)).
+        set failure = Expect(failure, 8, !NextKeyIs(idObject, JsonModelCursor(usize(1), true), "codes", key)).
+        # --- Unknown skip: derived-style skip via JsonValueEnd then continue.
+        let multi = bytes("{\"zzz\":[1,2],\"id\":9}").
+        let mFirst = JsonModelNext(multi, JsonModelCursor(usize(1), true), key).
+        set failure = Expect(failure, 9, mFirst.present && mFirst.key_length == 3).
+        set failure = Expect(failure, 10, !NextKeyIs(multi, JsonModelCursor(usize(1), true), "id", key)).
+        let skipEnd = JsonValueEnd(multi, mFirst.value_start, usize(64)).
+        set failure = Expect(failure, 11, skipEnd == 12).
+        let mSecond = JsonModelNext(multi, JsonModelCursor(usize(12), false), key).
+        set failure = Expect(failure, 12, mSecond.present && mSecond.key_length == 2).
+        set failure = Expect(failure, 13, NextKeyIs(multi, JsonModelCursor(usize(12), false), "id", key)).
+        let idValue = JsonModelReadI64(multi, mSecond.value_start).
+        set failure = Expect(failure, 14, idValue.status == 0 && idValue.value == 9).
+        let mAfter = JsonModelNext(multi, JsonModelCursor(idValue.read_end, false), key).
+        set failure = Expect(failure, 15, mAfter.status == 0 && !mAfter.present).
+        # --- Too-long valid unknown key: key_length -1, still skippable.
+        let longKey = bytes("{\"abcdefghij\":1}").
+        let lFirst = JsonModelNext(longKey, JsonModelCursor(usize(1), true), shortKey).
+        set failure = Expect(failure, 16, lFirst.status == 0 && lFirst.present).
+        set failure = Expect(failure, 17, lFirst.key_length == -1).
+        set failure = Expect(failure, 18, !NextKeyIs(longKey, JsonModelCursor(usize(1), true), "abcdefghij", shortKey)).
+        set failure = Expect(failure, 19, JsonValueEnd(longKey, lFirst.value_start, usize(64)) == 15).
+        # --- Trailing comma rejected; empty object closes clean.
+        set failure = Expect(failure, 20, JsonModelNext(bytes("{\"a\":1,}"), JsonModelCursor(usize(6), false), key).status == -22).
+        let emptyNext = JsonModelNext(bytes("{}"), JsonModelCursor(usize(1), true), key).
+        set failure = Expect(failure, 21, emptyNext.status == 0 && !emptyNext.present).
+        set failure = Expect(failure, 22, emptyNext.read_end == usize(2)).
+        # --- Integer readers: known vectors, loopholes, full MIN/MAX.
+        let negMin = JsonModelReadI64(bytes("-9223372036854775808"), usize(0)).
+        set failure = Expect(failure, 23, negMin.status == 0 && negMin.value == 0 - 9223372036854775807 - 1).
+        set failure = Expect(failure, 24, negMin.read_end == usize(20)).
+        let posMax = JsonModelReadI64(bytes("9223372036854775807"), usize(0)).
+        set failure = Expect(failure, 25, posMax.status == 0 && posMax.value == 9223372036854775807).
+        set failure = Expect(failure, 26, JsonModelReadI64(bytes("9223372036854775808"), usize(0)).status == -75).
+        set failure = Expect(failure, 27, JsonModelReadI64(bytes("-9223372036854775809"), usize(0)).status == -75).
+        set failure = Expect(failure, 28, JsonModelReadI64(bytes("+12"), usize(0)).status == -22).
+        set failure = Expect(failure, 29, JsonModelReadI64(bytes("01"), usize(0)).status == -22).
+        set failure = Expect(failure, 30, JsonModelReadI64(bytes("12.5"), usize(0)).status == -22).
+        let negZero = JsonModelReadI64(bytes("-0"), usize(0)).
+        set failure = Expect(failure, 31, negZero.status == 0 && negZero.value == 0).
+        let zeroU64 = JsonModelReadU64(bytes("0"), usize(0)).
+        set failure = Expect(failure, 32, zeroU64.status == 0 && zeroU64.value == u64(0)).
+        let bigU64 = JsonModelReadU64(bytes("18446744073709551615"), usize(0)).
+        set failure = Expect(failure, 33, bigU64.status == 0 && bigU64.value == fixtureU64Max).
+        set failure = Expect(failure, 34, bigU64.read_end == usize(20)).
+        set failure = Expect(failure, 35, JsonModelReadU64(bytes("18446744073709551616"), usize(0)).status == -75).
+        set failure = Expect(failure, 36, JsonModelReadU64(bytes("-1"), usize(0)).status == -22).
+        let trueRead = JsonModelReadBool(bytes("true"), usize(0)).
+        set failure = Expect(failure, 37, trueRead.status == 0 && trueRead.value).
+        set failure = Expect(failure, 38, trueRead.read_end == usize(4)).
+        let falseRead = JsonModelReadBool(bytes("false  "), usize(0)).
+        set failure = Expect(failure, 39, falseRead.status == 0 && !falseRead.value).
+        set failure = Expect(failure, 40, falseRead.read_end == usize(5)).
+        set failure = Expect(failure, 41, JsonModelReadBool(bytes("True"), usize(0)).status == -22).
+        # --- Text reader: escapes, capacity edge.
+        let cafe = ProbeText(bytes("\"caf\\u00e9\""), bytes("caf\u{e9}"), textOut).
+        set failure = Expect(failure, 42, cafe.status == 0).
+        set failure = Expect(failure, 43, cafe.written == usize(5) && cafe.read_end == usize(11)).
+        set failure = Expect(failure, 44, cafe.matches).
+        set failure = Expect(failure, 45, ProbeText(bytes("\"abc\""), bytes("abc"), narrow).status == -28).
+        # --- TextList reader: framing, limits, invalid UTF-8.
+        let pair = ProbeList(bytes("[\"a\",\"bc\"]"), usize(0), usize(0), bytes("a"), bytes("bc"), listOut).
+        set failure = Expect(failure, 46, pair.status == 0).
+        set failure = Expect(failure, 47, pair.read_end == usize(10)).
+        set failure = Expect(failure, 48, pair.written == usize(11)).
+        set failure = Expect(failure, 49, pair.first_matches).
+        set failure = Expect(failure, 50, pair.second_matches).
+        set failure = Expect(failure, 51, pair.count == usize(2)).
+        set failure = Expect(failure, 52, ProbeList(bytes("[\"a\",\"b\",\"c\"]"), usize(2), usize(0), bytes(""), bytes(""), listOut).status == -28).
+        set failure = Expect(failure, 53, ProbeList(bytes("[\"abcdef\"]"), usize(0), usize(3), bytes(""), bytes(""), listOut).status == -28).
+        set failure = Expect(failure, 54, ProbeList(bytes("[\"\\ud800\"]"), usize(0), usize(0), bytes(""), bytes(""), listOut).status == -22).
+        let empty = ProbeList(bytes("[]"), usize(0), usize(0), bytes(""), bytes(""), listOut).
+        set failure = Expect(failure, 55, empty.status == 0 && empty.written == usize(0)).
+        set failure = Expect(failure, 56, empty.count == usize(0)).
+        # --- Semantic helpers over a decoded list.
+        let helpers = ProbeList(bytes("[\"ab\",\"cd\"]"), usize(0), usize(0), bytes("ab"), bytes("cd"), listOut).
+        set failure = Expect(failure, 57, helpers.status == 0).
+        set failure = Expect(failure, 58, helpers.non_empty).
+        set failure = Expect(failure, 59, helpers.at_most_two).
+        set failure = Expect(failure, 60, !helpers.at_most_one).
+        set failure = Expect(failure, 61, helpers.no_nul).
+        set failure = Expect(failure, 62, helpers.unique).
+        let dup = ProbeList(bytes("[\"x\",\"x\"]"), usize(0), usize(0), bytes("x"), bytes("x"), listOut).
+        set failure = Expect(failure, 63, dup.status == 0).
+        set failure = Expect(failure, 64, !dup.unique).
+        # --- Forged TextList frames: invalid-safe, never traps.
+        set failure = Expect(failure, 65, ForgedRejected(forged)).
+        set failure = Expect(failure, 66, TextListNext(TextList(bytes(""), usize(0))).valid).
+        set failure = Expect(failure, 67, !TextListNext(TextList(bytes(""), usize(0))).has).
+        set failure = Expect(failure, 68, !TextListNext(TextList(bytes(""), usize(1))).valid).
+        # --- Writers: known framing vectors plus cross-module roundtrip.
+        let wField = JsonModelWriteField("id", true, target, usize(0)).
+        set failure = Expect(failure, 69, wField == 5).
+        let wNum = JsonModelWriteI64(0 - 9223372036854775807 - 1, target, usize(wField)).
+        set failure = Expect(failure, 70, wNum == 25).
+        let wSep = JsonModelWriteField("ok", false, target, usize(wNum)).
+        set failure = Expect(failure, 71, wSep == 31).
+        let wBool = JsonModelWriteBool(true, target, usize(wSep)).
+        set failure = Expect(failure, 72, wBool == 35).
+        set failure = Expect(failure, 73, WrittenEquals(target, wBool, bytes("\"id\":-9223372036854775808,\"ok\":true"))).
+        set failure = Expect(failure, 74, JsonModelWriteI64(12345, small, usize(0)) == -28).
+        let wU64 = JsonModelWriteU64(fixtureU64Max, target, usize(0)).
+        set failure = Expect(failure, 75, wU64 == 20).
+        set failure = Expect(failure, 76, WrittenEquals(target, wU64, bytes("18446744073709551615"))).
+        let wText = JsonModelWriteText("a\"b", target, usize(0)).
+        set failure = Expect(failure, 77, wText == 6).
+        set failure = Expect(failure, 78, WrittenEquals(target, wText, bytes("\"a\\\"b\""))).
+        set failure = Expect(failure, 79, ListRoundTrip(bytes("[\"m\",\"n\"]"), roundOut, target)).
+        set failure = Expect(failure, 80, ListRoundTrip(bytes("[]"), roundOut, target)).
+        set failure = Expect(failure, 81, ListRoundTrip(bytes("[\"\\\"q\\\\\",\"\\u00e9\"]"), roundOut, target) == false && ListRoundTrip(bytes("[\"\\\"q\\\\\"]"), roundOut, target)).
+        # --- Bounded string decode: capacity is reported before a later
+        # malformed escape is scanned.
+        let cursorRead = JsonDecodeStringAt(bytes("\"a\\u20ac\",true"), usize(0), cursorOut).
+        set failure = Expect(failure, 82, cursorRead.status == 0 && cursorRead.written == usize(4) && cursorRead.read_end == usize(9)).
+        set failure = Expect(failure, 83, WrittenEquals(cursorOut, 4, bytes("a€"))).
+        let capacityFirst = JsonDecodeStringAt(bytes("\"abcd\\q\""), usize(0), shortOut).
+        set failure = Expect(failure, 84, capacityFirst.status == -28 && capacityFirst.written == usize(3) && capacityFirst.read_end == usize(4)).
+        set failure = Expect(failure, 85, ProbeList(bytes("[\"abcd\\q\"]"), usize(0), usize(3), bytes(""), bytes(""), cursorOut).status == -28).
+        set failure = Expect(failure, 86, JsonModelNext(bytes("{\"abcd\\q\":0}"), JsonModelCursor(usize(1), true), tinyKey).status == -22).
+        # Header guards preserve invalid-position echoes and integer grammar.
+        set failure = Expect(failure, 87, JsonModelBegin(bytes(""), usize(0)).status == -22).
+        set failure = Expect(failure, 88, JsonModelBegin(bytes(" "), usize(0)).cursor.offset == usize(0)).
+        set failure = Expect(failure, 89, JsonModelNext(bytes("{}"), JsonModelCursor(usize(2), false), key).status == -22).
+        set failure = Expect(failure, 90, JsonModelNext(bytes("{}"), JsonModelCursor(usize(3), false), key).read_end == usize(3)).
+        set failure = Expect(failure, 91, !JsonModelKeyEquals(key, -1, "")).
+        set failure = Expect(failure, 92, !JsonModelKeyEquals(key, 97, "")).
+        set failure = Expect(failure, 93, JsonModelReadI64(bytes(""), usize(1)).read_end == usize(1)).
+        set failure = Expect(failure, 94, JsonModelReadI64(bytes(" "), usize(0)).status == -22).
+        set failure = Expect(failure, 95, JsonModelReadI64(bytes("-"), usize(0)).status == -22).
+        set failure = Expect(failure, 96, JsonModelReadI64(bytes("-01"), usize(0)).status == -22).
+        set failure = Expect(failure, 97, JsonModelReadI64(bytes("1e0"), usize(0)).status == -22).
+        set failure = Expect(failure, 98, JsonModelReadU64(bytes("01"), usize(0)).status == -22).
+        set failure = Expect(failure, 99, JsonModelReadU64(bytes("1.0"), usize(0)).status == -22).
+        set failure = Expect(failure, 100, JsonModelReadU64(bytes("1E0"), usize(0)).status == -22).
+        set failure = Expect(failure, 101, JsonModelReadBool(bytes("tru"), usize(0)).status == -22).
+        set failure = Expect(failure, 102, JsonModelReadBool(bytes("fals"), usize(0)).status == -22).
+        set failure = Expect(failure, 103, JsonModelWriteLiteral(bytes(""), target, usize(257)) == -22).
+        set failure = Expect(failure, 104, JsonModelWriteField("long", false, small, usize(3)) == -28).
+        set failure = Expect(failure, 105, JsonModelWriteTextList(TextList(bytes(""), usize(0)), small, usize(2)) == -28).
+        borrow_end(key).
+        borrow_end(shortKey).
+        borrow_end(tinyKey).
+        borrow_end(shortOut).
+        borrow_end(cursorOut).
+        borrow_end(forged).
+        borrow_end(small).
+        borrow_end(roundOut).
+        borrow_end(target).
+        borrow_end(listOut).
+        borrow_end(narrow).
+        borrow_end(textOut).
+        borrow_end(scratch).
+        buffer_drop(arena).
+        return failure.

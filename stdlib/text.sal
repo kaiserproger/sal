@@ -1,0 +1,212 @@
+# General safe UTF-8 text iteration, boundary checks, slicing and search.
+# Built for Solaris-style command and protocol strings: ASCII roots and
+# delimiters around arbitrary UTF-8 arguments, validated without allocation.
+#
+# Conventions (shared with bytes.sal, json.sal and routing.sal):
+# -22 means malformed UTF-8 or an out-of-range position; search misses are -1.
+# TextStep.status is 0 decoded, 1 end of input (start == length), or -22.
+# On any nonzero status TextStep.scalar is 0 and TextStep.next echoes start.
+# TextSliceResult.status is 0 with value the requested view, or -22 with an
+# empty value that MUST NOT be used; check status before value.
+#
+# Validation rejects overlong encodings, surrogate codepoints 55296..57343,
+# scalars above U+10FFFF, truncated sequences and stray continuation bytes.
+# Empty input is valid; start == length names the end, not an error position.
+#
+# Results are immutable Bytes views borrowing the input, iteration scalars and
+# an explicit slice-result record; no Text is fabricated, no lossy decoding,
+# no allocation, no UnsafeMemory.
+# Folding covers ASCII A-Z only and every such operation is ASCII-named;
+# non-ASCII bytes compare exactly. There is no Unicode case mapping here.
+# Preconditions live in operation `requires:` headers next to accepts/returns,
+# checked in order before the body runs; bodies below hold only the
+# decode/scan/compare algorithm.
+use "bytes.sal".
+
+entity TextStep:
+    layout "C".
+    has status of type i64.
+    has scalar of type i64.
+    has next of type usize.
+
+# Decode the single scalar starting at start; see the header for status codes.
+operation TextNext:
+    accepts value of type Bytes.
+    accepts start of type usize.
+    returns TextStep.
+    requires:
+        start <= len(value) otherwise TextStep(-22, 0, start).
+        start != len(value) otherwise TextStep(1, 0, start).
+    body:
+        let first = i64(byte(value, start)).
+        if first < 128:
+            return TextStep(0, first, start + 1).
+        if first < 194:
+            return TextStep(-22, 0, start).
+        let mut width = usize(2).
+        let mut scalar = first - 192.
+        let mut minimum = 128.
+        if first >= 224:
+            set width = usize(3).
+            set scalar = first - 224.
+            set minimum = 2048.
+        if first >= 240:
+            set width = usize(4).
+            set scalar = first - 240.
+            set minimum = 65536.
+        if first > 244:
+            return TextStep(-22, 0, start).
+        if len(value) - start < width:
+            return TextStep(-22, 0, start).
+        let mut index = usize(1).
+        while index < width:
+            let next = i64(byte(value, start + index)).
+            if next < 128:
+                return TextStep(-22, 0, start).
+            if next > 191:
+                return TextStep(-22, 0, start).
+            set scalar = scalar * 64 + next - 128.
+            set index = index + 1.
+        if scalar < minimum:
+            return TextStep(-22, 0, start).
+        if scalar > 1114111:
+            return TextStep(-22, 0, start).
+        if scalar >= 55296 && scalar <= 57343:
+            return TextStep(-22, 0, start).
+        return TextStep(0, scalar, start + width).
+
+# Byte width of one validated scalar. Call only with a scalar from a
+# successful TextNext; every other input still yields a 1..4 width.
+operation TextScalarWidth:
+    accepts scalar of type i64.
+    returns usize.
+    requires:
+        scalar >= 128 otherwise usize(1).
+        scalar >= 2048 otherwise usize(2).
+        scalar >= 65536 otherwise usize(3).
+    body:
+        return usize(4).
+
+# True for positions 0 and length and for leading bytes; continuation bytes
+# and positions past length are not boundaries.
+operation TextIsBoundary:
+    accepts value of type Bytes.
+    accepts position of type usize.
+    returns bool.
+    requires:
+        position <= len(value) otherwise false.
+        position != 0 otherwise true.
+        position != len(value) otherwise true.
+    body:
+        let lead = byte(value, position).
+        return lead < 128 || lead >= 192.
+
+# Validate from start to the end; returns the end offset or -22.
+operation TextEnd:
+    accepts value of type Bytes.
+    accepts start of type usize.
+    returns i64.
+    requires:
+        start <= len(value) otherwise -22.
+    body:
+        let mut offset = start.
+        while offset < len(value):
+            let step = TextNext(value, offset).
+            if step.status != 0:
+                return -22.
+            set offset = step.next.
+        return i64(offset).
+
+# True only when the whole span is well-formed UTF-8; empty input is valid.
+operation TextValidate:
+    accepts value of type Bytes.
+    returns bool.
+    body:
+        return TextEnd(value, usize(0)) == i64(len(value)).
+
+# Boundary-checked zero-copy view with explicit status: 0 success (value is
+# the requested view; an empty range on a boundary succeeds with empty
+# value), -22 for reversed/out-of-range bounds or split scalars. A valid
+# empty slice and an error never share a representation: status differs.
+# On error value is empty and MUST NOT be used; always check status first.
+# The view borrows value; the caller keeps value alive while using it.
+entity TextSliceResult:
+    has status of type i64.
+    has value of type Bytes.
+
+operation TextSlice:
+    accepts value of type Bytes.
+    accepts start of type usize.
+    accepts end of type usize.
+    returns TextSliceResult from value.
+    requires:
+        start <= end otherwise TextSliceResult(-22, bytes("")).
+        end <= len(value) otherwise TextSliceResult(-22, bytes("")).
+        TextIsBoundary(value, start) otherwise TextSliceResult(-22, bytes("")).
+        TextIsBoundary(value, end) otherwise TextSliceResult(-22, bytes("")).
+    body:
+        return TextSliceResult(0, slice(value, start, end - start)).
+
+# First offset at or after start holding delimiter, else -1. Intended for
+# ASCII delimiters; the result is a raw byte offset, not a scalar index.
+operation TextFindByte:
+    accepts value of type Bytes.
+    accepts start of type usize.
+    accepts delimiter of type u8.
+    returns i64.
+    requires:
+        start <= len(value) otherwise -1.
+    body:
+        let mut offset = start.
+        while offset < len(value):
+            if byte(value, offset) == delimiter:
+                return i64(offset).
+            set offset = offset + 1.
+        return -1.
+
+# First offset at or after start where needle occurs, else -1. An empty
+# needle matches at start; byte offsets, no scalar alignment promises.
+operation TextFind:
+    accepts value of type Bytes.
+    accepts start of type usize.
+    accepts needle of type Bytes.
+    returns i64.
+    requires:
+        start <= len(value) otherwise -1.
+    body:
+        let found = BytesFind(slice(value, start, len(value) - start), needle).
+        return BytesAdvance(i64(start), found).
+
+# ASCII-only fold of one byte; non-ASCII bytes pass through unchanged.
+operation TextAsciiLowerByte:
+    accepts value of type u8.
+    returns u8.
+    requires:
+        value < 65 || value > 90 otherwise value + 32.
+    body:
+        return value.
+
+# ASCII case-insensitive equality; non-ASCII bytes must match exactly.
+operation TextEqualsAsciiFold:
+    accepts left of type Bytes.
+    accepts right of type Bytes.
+    returns bool.
+    requires:
+        len(left) == len(right) otherwise false.
+    body:
+        let mut index = usize(0).
+        while index < len(left):
+            if TextAsciiLowerByte(byte(left, index)) != TextAsciiLowerByte(byte(right, index)):
+                return false.
+            set index = index + 1.
+        return true.
+
+# ASCII case-insensitive prefix match; an overlong prefix never matches.
+operation TextStartsWithAsciiFold:
+    accepts value of type Bytes.
+    accepts prefix of type Bytes.
+    returns bool.
+    requires:
+        len(prefix) <= len(value) otherwise false.
+    body:
+        return TextEqualsAsciiFold(slice(value, usize(0), len(prefix)), prefix).

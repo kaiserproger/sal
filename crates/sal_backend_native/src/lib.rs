@@ -1,17 +1,23 @@
 //! Linux x86-64 GNU assembly, without implicit application-runtime imports.
 //!
 //! Text and Bytes are immutable byte spans, returned internally in rax/rdx.
+//! Buffer/MutBytes are owned/borrowed (ptr, len) pairs in rax/rdx: never
+//! general spans (no equality, no address, no C ABI), with range- and
+//! overflow-checked borrow_mut/slice_mut/put/byte and length metadata.
+//! Borrow<T> is one address word aliasing the original owner slot.
 //! Scalar arguments use the SysV integer registers; stack arguments hold the
-//! remainder in source order. Integer records classify as one/two INTEGER
-//! eightbytes or MEMORY per the AMD64 ABI; larger returns use a hidden RDI.
+//! remainder in source order. Integer and internal records classify as
+//! one/two INTEGER eightbytes or MEMORY per the AMD64 ABI; larger returns use
+//! a hidden RDI. Internal records permit span/pair/borrow fields but never
+//! cross the C boundary; declared-C geometry stays strict.
 //! Checked integer arithmetic (add/sub/mul/div/rem) traps with `ud2` on
 //! overflow, divide-by-zero, or range violation; span comparisons compare
 //! content, never pointer identity.
 //! C exports and imports are restricted to integer scalars, bool, C records,
-//! and Void results: spans are never C ABI safe and Void never appears as a
-//! parameter. Only Pure effects may cross the C boundary on exports; imports
-//! require both SystemCall and UnsafeMemory. Contracts and unknown effects are
-//! rejected everywhere.
+//! and Void results: spans, owners, borrows and internal records are never C
+//! ABI safe and Void never appears as a parameter. Only Pure effects may cross
+//! the C boundary on exports; imports require both SystemCall and UnsafeMemory.
+//! Contracts and unknown effects are rejected everywhere.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -41,6 +47,9 @@ pub struct NativeProgram {
 enum Ty {
     Text,
     Bytes,
+    Buffer,
+    MutBytes,
+    Borrow,
     I8,
     I16,
     I32,
@@ -54,6 +63,7 @@ enum Ty {
     Bool,
     Void,
     Record(usize),
+    Internal(usize),
 }
 
 impl Ty {
@@ -62,6 +72,8 @@ impl Ty {
             TypeRef::Named(name) => match name.as_str() {
                 "Text" => Some(Self::Text),
                 "Bytes" => Some(Self::Bytes),
+                "Buffer" => Some(Self::Buffer),
+                "MutBytes" => Some(Self::MutBytes),
                 "i8" => Some(Self::I8),
                 "i16" => Some(Self::I16),
                 "i32" => Some(Self::I32),
@@ -80,7 +92,17 @@ impl Ty {
         }
     }
 
-    fn resolve(ty: &TypeRef, layouts: &BTreeMap<String, CRecordLayout>) -> Option<Self> {
+    fn resolve(
+        ty: &TypeRef,
+        layouts: &BTreeMap<String, CRecordLayout>,
+        internal: &BTreeMap<String, crate::lower::InternalLayout>,
+    ) -> Option<Self> {
+        if let TypeRef::Generic { name, args } = ty {
+            if name == "Borrow" && args.len() == 1 {
+                return Some(Self::Borrow);
+            }
+            return None;
+        }
         match ty {
             TypeRef::Generic { .. } => None,
             TypeRef::Named(name) => {
@@ -89,24 +111,39 @@ impl Ty {
                     // collisions are rejected by layout validation and fail
                     // closed here via the caller's diagnostics.
                     Some(primitive)
+                } else if let Some(index) = layouts.keys().position(|key| key == name) {
+                    Some(Self::Record(index))
                 } else {
-                    layouts.keys().position(|key| key == name).map(Self::Record)
+                    internal
+                        .keys()
+                        .position(|key| key == name)
+                        .map(Self::Internal)
                 }
             }
         }
     }
 
     fn span(self) -> bool {
+        // Only readable immutable spans participate in span operations.
+        // `Buffer` is an ABI pair, never a general span, so it stays out;
+        // `MutBytes` is rejected per-site everywhere except its own loans.
         matches!(self, Self::Text | Self::Bytes)
+    }
+
+    fn pair(self) -> bool {
+        matches!(
+            self,
+            Self::Text | Self::Bytes | Self::Buffer | Self::MutBytes
+        )
     }
 
     fn slots(self) -> usize {
         match self {
             Self::Void => 0,
-            Self::Text | Self::Bytes => 2,
-            // Records use their own C geometry in abi::bytes; this is only a
-            // defensive fallback so an accidental call cannot panic.
-            Self::Record(_) => 1,
+            Self::Text | Self::Bytes | Self::Buffer | Self::MutBytes => 2,
+            // Internal records use their native geometry in abi::bytes; like
+            // C records this fallback only avoids a panic on invalid input.
+            Self::Record(_) | Self::Internal(_) => 1,
             _ => 1,
         }
     }
@@ -140,9 +177,16 @@ impl Ty {
             Self::I16 | Self::U16 => 16,
             Self::I32 | Self::U32 => 32,
             Self::I64 | Self::U64 | Self::Usize | Self::Isize => 64,
-            // Spans, Void, and records never reach narrow lowering; report a
-            // full word so an accidental use emits a wide move, not a panic.
-            Self::Text | Self::Bytes | Self::Void | Self::Record(_) => 64,
+            // Pairs, Void, borrows, and records never reach narrow lowering;
+            // report a full word so an accidental use emits a wide move.
+            Self::Text
+            | Self::Bytes
+            | Self::Buffer
+            | Self::MutBytes
+            | Self::Borrow
+            | Self::Void
+            | Self::Record(_)
+            | Self::Internal(_) => 64,
         }
     }
 
@@ -174,8 +218,14 @@ impl Ty {
             Self::U8 => "uint8_t",
             Self::Bool => "bool",
             Self::Void => "void",
-            Self::Text | Self::Bytes | Self::Record(_) => {
-                unreachable!("spans and records cannot pass C export validation")
+            Self::Text
+            | Self::Bytes
+            | Self::Buffer
+            | Self::MutBytes
+            | Self::Borrow
+            | Self::Record(_)
+            | Self::Internal(_) => {
+                unreachable!("spans, owners, borrows and records cannot pass C export validation")
             }
         }
     }
@@ -492,6 +542,7 @@ pub fn emit_native(ir: &Ir, target: NativeTarget) -> Result<NativeProgram, Vec<D
     // Ty::resolve without duplicating every E2010 diagnostic.
     let layouts: BTreeMap<String, CRecordLayout> =
         c_record_layouts(ir, CAbiTarget::LinuxX86_64).unwrap_or_default();
+    let internal = lower::internal_layouts(ir, &layouts);
     let fallback = Span::single(1, 1);
     let mut unsupported_servers: Vec<_> = ir
         .servers
@@ -552,16 +603,16 @@ pub fn emit_native(ir: &Ir, target: NativeTarget) -> Result<NativeProgram, Vec<D
         let params: Option<Vec<_>> = operation
             .accepts
             .iter()
-            .map(|p| Ty::resolve(&p.ty, &layouts))
+            .map(|p| Ty::resolve(&p.ty, &layouts, &internal))
             .collect();
         // An omitted result means Void: a procedure with no return value.
         let result = operation
             .returns
             .as_ref()
-            .map(|ty| Ty::resolve(ty, &layouts))
+            .map(|ty| Ty::resolve(ty, &layouts, &internal))
             .unwrap_or(Some(Ty::Void));
         if params.is_none() || result.is_none() {
-            diagnostics.push(error("N100", format!("operation `{name}` requires supported native parameters and result: Text, Bytes, i8, i16, i32, i64, u16, u32, u64, usize, isize, u8, bool, Void, or a valid C record; Character, Word, floats and aggregates are unsupported"), span));
+            diagnostics.push(error("N100", format!("operation `{name}` requires supported native parameters and result: Text, Bytes, Buffer, MutBytes, i8, i16, i32, i64, u16, u32, u64, usize, isize, u8, bool, Void, Borrow<T>, or a valid C/internal record; Character, Word, floats and aggregates are unsupported"), span));
         }
         let void_param = params.as_ref().is_some_and(|p| p.contains(&Ty::Void));
         if void_param {
@@ -670,11 +721,17 @@ pub fn emit_native(ir: &Ir, target: NativeTarget) -> Result<NativeProgram, Vec<D
                     span,
                 ));
             }
-            let spans = params
-                .as_ref()
-                .is_some_and(|params| params.iter().any(|ty| ty.span()));
-            if spans || result.is_some_and(|ty| ty.span()) {
-                diagnostics.push(error("N100", format!("C {kind} `{symbol}` permits only integer scalars, bool, C records, and Void results; Text and Bytes are not C ABI safe"), span));
+            let blocked = params.as_ref().is_some_and(|params| {
+                params.iter().any(|ty| {
+                    ty.span()
+                        || matches!(ty, Ty::Buffer | Ty::MutBytes | Ty::Borrow | Ty::Internal(_))
+                })
+            });
+            let blocked_result = result.is_some_and(|ty| {
+                ty.span() || matches!(ty, Ty::Buffer | Ty::MutBytes | Ty::Borrow | Ty::Internal(_))
+            });
+            if blocked || blocked_result {
+                diagnostics.push(error("N100", format!("C {kind} `{symbol}` permits only integer scalars, bool, C records, and Void results; Text, Bytes, Buffer, MutBytes, borrows and internal records are not C ABI safe"), span));
             }
         }
         if let (Some(params), Some(result)) = (params, result) {
@@ -697,7 +754,10 @@ pub fn emit_native(ir: &Ir, target: NativeTarget) -> Result<NativeProgram, Vec<D
                 op.c_import.is_none()
                     && op.accepts.is_empty()
                     && (!op.body.is_empty() || op.responds_literal.is_some())
-                    && op.returns.as_ref().and_then(|ty| Ty::resolve(ty, &layouts))
+                    && op
+                        .returns
+                        .as_ref()
+                        .and_then(|ty| Ty::resolve(ty, &layouts, &internal))
                         == Some(Ty::Text)
             })
             .collect();
@@ -705,7 +765,11 @@ pub fn emit_native(ir: &Ir, target: NativeTarget) -> Result<NativeProgram, Vec<D
             op.c_import.is_none()
                 && op.accepts.is_empty()
                 && !op.body.is_empty()
-                && op.returns.as_ref().and_then(|ty| Ty::resolve(ty, &layouts)) == Some(Ty::I64)
+                && op
+                    .returns
+                    .as_ref()
+                    .and_then(|ty| Ty::resolve(ty, &layouts, &internal))
+                    == Some(Ty::I64)
         });
         let text_entry = text_candidates
             .iter()
@@ -749,7 +813,7 @@ pub fn emit_native(ir: &Ir, target: NativeTarget) -> Result<NativeProgram, Vec<D
             .get(&operation.name)
             .is_some_and(|signature| !signature.params.contains(&Ty::Void))
         {
-            match lower::function(operation, &signatures, &layouts, &mut literals) {
+            match lower::function(operation, &signatures, &layouts, &internal, &mut literals) {
                 Ok(code) => assembly.push_str(&code),
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
@@ -794,6 +858,7 @@ pub fn emit_native(ir: &Ir, target: NativeTarget) -> Result<NativeProgram, Vec<D
             operations.values().copied(),
             &signatures,
             &layouts,
+            &internal,
         ))
     } else {
         None
@@ -805,6 +870,7 @@ fn emit_header<'a>(
     operations: impl Iterator<Item = &'a OperationDecl>,
     signatures: &BTreeMap<String, Signature>,
     layouts: &BTreeMap<String, CRecordLayout>,
+    internal: &BTreeMap<String, crate::lower::InternalLayout>,
 ) -> String {
     let mut header = String::from("#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n#include <assert.h>\n\n/* Linux x86-64 SysV ABI. SAL Text and Character are not C ABI safe; Bytes spans are not C ABI safe either.\n * Checked integer arithmetic traps; no SAL runtime is linked. Records are by-value C structs.\n */\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
     for name in ordered_record_names(layouts) {
@@ -812,7 +878,7 @@ fn emit_header<'a>(
         let c_name = record_c_name(&name);
         let _ = writeln!(header, "typedef struct {{");
         for field in &layout.fields {
-            let ty = Ty::resolve(&field.ty, layouts).expect("validated record field");
+            let ty = Ty::resolve(&field.ty, layouts, internal).expect("validated record field");
             let _ = writeln!(header, "    {} {};", header_ty(layouts, ty), field.name);
         }
         let _ = writeln!(header, "}} {c_name};");

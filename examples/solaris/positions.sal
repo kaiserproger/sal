@@ -1,0 +1,179 @@
+# Solaris block-position packing ported to safe SAL.
+#
+# Source (read-only reference, never copied as bytes):
+# - crates/mc-protocol/src/packets/play.rs: pack_block_pos(x, y, z),
+#   unpack_block_pos(packed), sign_extend_26, sign_extend_12.
+# - crates/mc-world/src/chunk.rs: BlockPos/ChunkPos, world_coordinate_to_chunk
+#   (block.fdiv euclid 16 for the chunk, remainder for the local offset).
+#
+# Vanilla wire layout packed into one i64 (big-endian on the wire):
+#   x: 26-bit signed, bits 38..63
+#   z: 26-bit signed, bits 12..37
+#   y: 12-bit signed, bits 0..11
+# Rust masks each coordinate before shifting, so out-of-width inputs wrap
+# modulo the field width instead of failing. These SAL ports preserve that
+# exact behavior with the contract-fixed pure intrinsics (bit_and, bit_or,
+# shift_left, shift_right); no wrapping_add is needed because the masks
+# discard the shifted-out bits before they could trap checked arithmetic.
+#
+# Signed ranges: x/z in -33554432..33554431, y in -2048..2047.
+# (-1, -1, -1) packs to -1 (every field mask is all-ones, covering all
+# 64 bits), and pack(0, 0, 0) is 0.
+#
+# Chunk workflow uses std/math.sal floor helpers with the Solaris semantics:
+# MathDivFloor rounds toward negative infinity and MathModFloor takes the
+# divisor's sign, so block -17 maps to chunk -2 with local offset 15 while
+# truncated division would wrongly give chunk -1 and offset -1.
+use "std/math.sal".
+
+entity SolarisBlockPos:
+    layout "C".
+    has x of type i32.
+    has y of type i32.
+    has z of type i32.
+
+entity SolarisChunkCell:
+    layout "C".
+    has status of type i64.
+    has chunk of type i64.
+    has local of type i64.
+
+# mc-protocol pack_block_pos: mask each coordinate, then place the fields.
+# Pure: only bit intrinsics and checked conversions that cannot trap
+# (masks keep every intermediate inside its target range).
+operation SolarisPackBlockPos:
+    accepts x of type i32.
+    accepts y of type i32.
+    accepts z of type i32.
+    returns i64.
+    body:
+        let maskedX = bit_and(i64(x), i64(67108863)).
+        let maskedZ = bit_and(i64(z), i64(67108863)).
+        let maskedY = bit_and(i64(y), i64(4095)).
+        let high = shift_left(maskedX, usize(38)).
+        let middle = shift_left(maskedZ, usize(12)).
+        return bit_or(bit_or(high, middle), maskedY).
+
+# Sign extension for the 26-bit x/z fields (mirrors sign_extend_26:
+# bit 25 set means the field is negative, so the upper six bits fill in).
+operation SolarisSignExtend26:
+    accepts value of type i32.
+    returns i32.
+    body:
+        if bit_and(value, 33554432) != 0:
+            return bit_or(value, 0 - 67108864).
+        return value.
+
+# Sign extension for the 12-bit y field (mirrors sign_extend_12).
+operation SolarisSignExtend12:
+    accepts value of type i32.
+    returns i32.
+    body:
+        if bit_and(value, 2048) != 0:
+            return bit_or(value, 0 - 4096).
+        return value.
+
+# mc-protocol unpack_block_pos: extract each field, then sign-extend it.
+# The unsigned right shift of the arithmetic shift_right is harmless: the
+# mask discards every sign-extended bit above the field width.
+operation SolarisUnpackBlockPos:
+    accepts packed of type i64.
+    returns SolarisBlockPos.
+    body:
+        let xRaw = i32(bit_and(shift_right(packed, usize(38)), i64(67108863))).
+        let zRaw = i32(bit_and(shift_right(packed, usize(12)), i64(67108863))).
+        let yRaw = i32(bit_and(packed, i64(4095))).
+        return SolarisBlockPos(SolarisSignExtend26(xRaw), SolarisSignExtend12(yRaw), SolarisSignExtend26(zRaw)).
+
+# Negative-coordinate-safe block -> chunk cell for one axis (chunk width 16).
+# Status is 0 with chunk/local set; the constant divisor 16 can never fail,
+# but the math statuses propagate instead of being assumed.
+operation SolarisChunkCellOf:
+    accepts block of type i32.
+    returns SolarisChunkCell.
+    body:
+        let wide = i64(block).
+        let quotient = MathDivFloor(wide, 16).
+        if quotient.status != 0:
+            return SolarisChunkCell(quotient.status, 0, 0).
+        let rest = MathModFloor(wide, 16).
+        if rest.status != 0:
+            return SolarisChunkCell(rest.status, 0, 0).
+        return SolarisChunkCell(0, quotient.value, rest.value).
+
+# Pure proof library exercised by the standalone protocol.sal executable.
+# The distinct entry name avoids colliding with the importing Main.
+# Returns 0 when every check holds, else the first failing check number.
+# Pure algorithms only; no files, no channels, no UnsafeMemory.
+operation PositionsMain:
+    returns i64.
+    body:
+        let mut failure = 0.
+        if SolarisPackBlockPos(0, 0, 0) != 0:
+            set failure = 1.
+        if SolarisPackBlockPos(0 - 1, 0 - 1, 0 - 1) != 0 - 1:
+            if failure == 0:
+                set failure = 2.
+        if SolarisPackBlockPos(1, 2, 3) != 274877919234:
+            if failure == 0:
+                set failure = 3.
+        let back = SolarisUnpackBlockPos(SolarisPackBlockPos(1, 2, 3)).
+        if back.x != 1 || back.y != 2 || back.z != 3:
+            if failure == 0:
+                set failure = 4.
+        let backNeg = SolarisUnpackBlockPos(SolarisPackBlockPos(0 - 1, 0 - 1, 0 - 1)).
+        if backNeg.x != 0 - 1 || backNeg.y != 0 - 1 || backNeg.z != 0 - 1:
+            if failure == 0:
+                set failure = 5.
+        let wide = SolarisUnpackBlockPos(SolarisPackBlockPos(33554431, 2047, 33554431)).
+        if wide.x != 33554431 || wide.y != 2047 || wide.z != 33554431:
+            if failure == 0:
+                set failure = 6.
+        let deep = SolarisUnpackBlockPos(SolarisPackBlockPos(0 - 33554432, 0 - 2048, 0 - 33554432)).
+        if deep.x != 0 - 33554432 || deep.y != 0 - 2048 || deep.z != 0 - 33554432:
+            if failure == 0:
+                set failure = 7.
+        if SolarisPackBlockPos(67108864, 0, 0) != 0:
+            if failure == 0:
+                set failure = 8.
+        let wrappedY = SolarisUnpackBlockPos(SolarisPackBlockPos(0, 2048, 0)).
+        if wrappedY.x != 0 || wrappedY.y != 0 - 2048 || wrappedY.z != 0 || SolarisPackBlockPos(0, 4096, 0) != 0:
+            if failure == 0:
+                set failure = 9.
+        let maskedY = SolarisUnpackBlockPos(SolarisPackBlockPos(0, 0 - 2049, 0)).
+        if maskedY.x != 0 || maskedY.y != 2047 || maskedY.z != 0:
+            if failure == 0:
+                set failure = 10.
+        let maskedX = SolarisUnpackBlockPos(SolarisPackBlockPos(0 - 67108865, 0, 0)).
+        if maskedX.x != 0 - 1 || maskedX.y != 0 || maskedX.z != 0:
+            if failure == 0:
+                set failure = 11.
+        let cellNeg = SolarisChunkCellOf(0 - 17).
+        if cellNeg.status != 0 || cellNeg.chunk != 0 - 2 || cellNeg.local != 15:
+            if failure == 0:
+                set failure = 12.
+        let cellEdge = SolarisChunkCellOf(0 - 16).
+        if cellEdge.status != 0 || cellEdge.chunk != 0 - 1 || cellEdge.local != 0:
+            if failure == 0:
+                set failure = 13.
+        let cellOne = SolarisChunkCellOf(0 - 1).
+        if cellOne.status != 0 || cellOne.chunk != 0 - 1 || cellOne.local != 15:
+            if failure == 0:
+                set failure = 14.
+        let cellZero = SolarisChunkCellOf(0).
+        if cellZero.status != 0 || cellZero.chunk != 0 || cellZero.local != 0:
+            if failure == 0:
+                set failure = 15.
+        let cellFull = SolarisChunkCellOf(15).
+        if cellFull.status != 0 || cellFull.chunk != 0 || cellFull.local != 15:
+            if failure == 0:
+                set failure = 16.
+        let cellNext = SolarisChunkCellOf(16).
+        if cellNext.status != 0 || cellNext.chunk != 1 || cellNext.local != 0:
+            if failure == 0:
+                set failure = 17.
+        let cellAfter = SolarisChunkCellOf(17).
+        if cellAfter.status != 0 || cellAfter.chunk != 1 || cellAfter.local != 1:
+            if failure == 0:
+                set failure = 18.
+        return failure.

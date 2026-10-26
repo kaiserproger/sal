@@ -1,0 +1,42 @@
+# Allocator policy for compiler-checked Buffer owners. Only the compiler
+# projects this raw storage record into an opaque owner or releases it.
+entity SalBufferStorage:
+    layout "C".
+    has address of type usize.
+    has length of type usize.
+
+# Kernel status to address: a failed mmap/munmap cannot continue, so a
+# negative errno exits the process with status 70. A denied exit_group
+# cannot turn the failure into an owner either: the checked signed-to-
+# unsigned conversion still traps.
+operation SalBufferCheck:
+    accepts status of type i64.
+    returns usize.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if status < 0:
+            syscall(231, 70, 0, 0, 0, 0, 0).
+        return usize(status).
+
+operation SalBufferAllocate:
+    accepts length of type usize.
+    returns SalBufferStorage.
+    effects: SystemCall.
+    requires:
+        length != usize(0) otherwise SalBufferStorage(usize(0), usize(0)).
+    body:
+        let mut address = usize(0).
+        unsafe:
+            set address = SalBufferCheck(syscall(9, 0, length, 3, 34, -1, 0)).
+        return SalBufferStorage(address, length).
+
+# Raw release remains unsafe to ordinary callers. buffer_drop obtains the
+# arguments only from a live affine owner after all of its loans have ended.
+operation SalBufferRelease:
+    accepts address of type usize.
+    accepts length of type usize.
+    effects: SystemCall, UnsafeMemory.
+    body:
+        if length != 0:
+            unsafe:
+                SalBufferCheck(syscall(11, address, length, 0, 0, 0, 0)).

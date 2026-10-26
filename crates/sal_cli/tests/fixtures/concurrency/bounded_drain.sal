@@ -1,47 +1,39 @@
 use "std/concurrency.sal".
+
+# First failure wins: keeps an earlier failure, else reports `code` when the
+# check does not hold.
+operation Expect:
+    accepts failure of type i64.
+    accepts code of type i64.
+    accepts holds of type bool.
+    returns i64.
+    requires:
+        failure == 0 otherwise failure.
+        holds otherwise code.
+    body:
+        return 0.
+
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ch = channel(i64, usize(2)).
         let first = send(ch, 11).
-        if first.sent == false:
-            if failure == 0:
-                set failure = 1.
-        if first.value != 11:
-            if failure == 0:
-                set failure = 2.
+        set failure = Expect(failure, 1, first.sent).
+        set failure = Expect(failure, 2, first.value == 11).
         let second = send(ch, 22).
-        if second.sent == false:
-            if failure == 0:
-                set failure = 3.
-        if second.value != 22:
-            if failure == 0:
-                set failure = 4.
-        if close(ch) == false:
-            if failure == 0:
-                set failure = 5.
+        set failure = Expect(failure, 3, second.sent).
+        set failure = Expect(failure, 4, second.value == 22).
+        set failure = Expect(failure, 5, close(ch)).
         let drain_one = receive(ch).
-        if drain_one.open == false:
-            if failure == 0:
-                set failure = 6.
-        if drain_one.value != 11:
-            if failure == 0:
-                set failure = 7.
+        set failure = Expect(failure, 6, drain_one.open).
+        set failure = Expect(failure, 7, drain_one.value == 11).
         let drain_two = receive(ch).
-        if drain_two.open == false:
-            if failure == 0:
-                set failure = 8.
-        if drain_two.value != 22:
-            if failure == 0:
-                set failure = 9.
+        set failure = Expect(failure, 8, drain_two.open).
+        set failure = Expect(failure, 9, drain_two.value == 22).
         let closed = receive(ch).
-        if closed.open == true:
-            if failure == 0:
-                set failure = 10.
-        if closed.value != 0:
-            if failure == 0:
-                set failure = 11.
+        set failure = Expect(failure, 10, closed.open == false).
+        set failure = Expect(failure, 11, closed.value == 0).
         channel_drop(ch).
         return failure.

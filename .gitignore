@@ -1,5 +1,4 @@
 /target/
 /build/
 /.warehouse-state/
-**/__pycache__/
 /.omp/

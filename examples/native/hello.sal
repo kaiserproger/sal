@@ -1,0 +1,6 @@
+application Hello.
+
+operation Main:
+    returns Text.
+    body:
+        return "Hello, world!".

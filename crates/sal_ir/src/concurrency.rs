@@ -130,6 +130,30 @@ fn mentions_concurrency(ty: &TypeRef) -> bool {
     false
 }
 
+/// True when a type is (or mentions) a compiler-owned safe-memory handle:
+/// `Buffer`, `MutBytes`, or a `Borrow`/`Vector`/`Map`/`ValueResult` generic.
+/// Numeric intrinsics must never accept these as raw machine integers.
+fn mentions_memory_owner(ty: &TypeRef) -> bool {
+    let mut pending = vec![ty];
+    while let Some(ty) = pending.pop() {
+        match ty {
+            TypeRef::Named(name)
+                if matches!(name.as_str(), "Buffer" | "MutBytes" | "Bytes" | "Text") =>
+            {
+                return true;
+            }
+            TypeRef::Generic { name, args } => {
+                if matches!(name.as_str(), "Borrow" | "Vector" | "Map" | "ValueResult") {
+                    return true;
+                }
+                pending.extend(args.iter());
+            }
+            TypeRef::Named(_) => {}
+        }
+    }
+    false
+}
+
 fn fnv1a(text: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in text.bytes() {
@@ -319,6 +343,9 @@ fn body_mentions_canonical(body: &[Stmt]) -> bool {
             }
             Stmt::For { iter, body, .. } => {
                 exprs.push(iter);
+                stmts.extend(body.iter());
+            }
+            Stmt::Unsafe { body } => {
                 stmts.extend(body.iter());
             }
             Stmt::Break | Stmt::Continue => {}

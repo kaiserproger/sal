@@ -1,0 +1,513 @@
+# Solaris deterministic intent-merge + durable index store port (executable SAL).
+#
+# Ported Solaris algorithms (read-only reference ~/solaris):
+# - crates/mc-core/src/intent.rs: Intent{actor:EntityId,seq:u32},
+#   Intent::order_key()->(actor,seq), sort_intents stable actor then seq,
+#   Footprint{item_take,entity_reads/writes,block_write,inv}, footprints_disjoint,
+#   InvClaim{owner,slot}.
+# - crates/mc-core/src/tick.rs TickState::merge: sort, validate each footprint
+#   whole, single-winner pickup via merge_pickups, first-write-wins block cells
+#   via merge_block_writes, damage sums, loser rejects whole.
+# - crates/mc-core/src/merge_tests.rs: two_claimants_on_one_item_exactly_one_wins,
+#   two_attackers_both_apply_in_stable_order,
+#   break_vs_place_same_position_is_deterministic.
+# - crates/mc-world/src/native/checkpoint.rs encode/decode_envelope (version u32 BE,
+#   captured_tick u64 BE, length u32 BE, LIMIT 16MiB, truncated/version/length reject).
+# - crates/mc-world/src/native/state.rs write/insert_encoded (256 participants,
+#   64MiB, duplicate/zero-LSN/floor/stale reject, slot cannot change, slot taken,
+#   tombstone cannot respawn).
+#
+# Bounded SAL subset (NOT bit-compatible with the full native WAL):
+# - POD intents only (actor/seq/target/kind/amount i64); kinds 1 pickup
+#   single-winner, 2 damage sums, 3 block-write first-wins. No NBT/zlib/redb,
+#   no crypto/compression/plugin stack.
+# - Envelope version=1, tick I64 BE, length U32 BE, payload, CRC32C U32 BE
+#   (SalHashLibrary one-shot plus Init/Update/Finish split check).
+#   Torn/corrupt/version/overlong frames reject; never partial-publish.
+# - Index in Vector/Map (SalCollections locked names), bytes in Buffer/MutBytes
+#   (contract spellings), binary codec via SalBinaryLibrary, files via
+#   SalFileLibrary File* (SystemCall; Linux open flags 577=O_WRONLY|O_CREAT|O_TRUNC,
+#   0=O_RDONLY, mode 384), threads via std/concurrency channels/spawn/join.
+# - Standalone Main-bearing program for Main's solaris-test in its isolated cwd;
+#   scratch file "index_store.bin" is owned unique; only it is removed.
+use "std/bytes.sal".
+use "std/buffer.sal".
+use "std/binary.sal".
+use "std/collections.sal".
+use "std/hash.sal".
+use "std/fs.sal".
+use "std/concurrency.sal".
+
+entity IntentMsg:
+    layout "C".
+    has actor of type i64.
+    has seq of type i64.
+    has target of type i64.
+    has kind of type i64.
+    has amount of type i64.
+
+operation IntentWorkerOne:
+    accepts ch of type Channel<IntentMsg>.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        let s1 = send(ch, IntentMsg(1, 2, 7, 3, 0)).
+        if s1.sent == false:
+            set failure = 1.
+        let s2 = send(ch, IntentMsg(1, 0, 100, 1, 0)).
+        if s2.sent == false && failure == 0:
+            set failure = 2.
+        let s3 = send(ch, IntentMsg(1, 1, 50, 2, 3)).
+        if s3.sent == false && failure == 0:
+            set failure = 3.
+        channel_drop(ch).
+        return failure.
+
+operation IntentWorkerTwo:
+    accepts ch of type Channel<IntentMsg>.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        let s1 = send(ch, IntentMsg(2, 1, 50, 2, 3)).
+        if s1.sent == false:
+            set failure = 1.
+        let s2 = send(ch, IntentMsg(2, 2, 7, 3, 0)).
+        if s2.sent == false && failure == 0:
+            set failure = 2.
+        let s3 = send(ch, IntentMsg(2, 0, 100, 1, 0)).
+        if s3.sent == false && failure == 0:
+            set failure = 3.
+        channel_drop(ch).
+        return failure.
+
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        let pathBuf = buffer(usize(256)).
+        let pathScratch = borrow_mut(pathBuf, usize(0), usize(256)).
+        let ch = channel(IntentMsg, usize(8)).
+        let w1 = channel_clone(ch).
+        let w2 = channel_clone(ch).
+        let t1 = spawn(IntentWorkerOne, w1).
+        let t2 = spawn(IntentWorkerTwo, w2).
+        let intents = vector(IntentMsg, usize(8)).
+        let mut received = usize(0).
+        while received < usize(6):
+            let r = receive(ch).
+            if r.open == false:
+                if failure == 0:
+                    set failure = 3.
+                set received = received + usize(1).
+            else:
+                let pushed = vector_push(intents, r.value).
+                if pushed != 0:
+                    if failure == 0:
+                        set failure = 4.
+                set received = received + usize(1).
+        let code1 = join(t1).
+        if code1 != 0:
+            if failure == 0:
+                set failure = 1.
+        let code2 = join(t2).
+        if code2 != 0:
+            if failure == 0:
+                set failure = 2.
+        if close(ch) == false:
+            if failure == 0:
+                set failure = 5.
+        if vector_len(intents) != usize(6):
+            if failure == 0:
+                set failure = 6.
+        if vector_capacity(intents) < usize(6):
+            if failure == 0:
+                set failure = 7.
+        let count = vector_len(intents).
+        let mut i = usize(0).
+        while i < count:
+            let mut j = usize(0).
+            while j + usize(1) < count:
+                let a = vector_get(intents, j).
+                let b = vector_get(intents, j + usize(1)).
+                if a.found == false:
+                    if failure == 0:
+                        set failure = 8.
+                else:
+                    if b.found == false:
+                        if failure == 0:
+                            set failure = 9.
+                    else:
+                        if a.value.actor > b.value.actor:
+                            let sa = vector_set(intents, j, b.value).
+                            if sa != 0:
+                                if failure == 0:
+                                    set failure = 10.
+                            else:
+                                let sb = vector_set(intents, j + usize(1), a.value).
+                                if sb != 0:
+                                    if failure == 0:
+                                        set failure = 11.
+                        else:
+                            if a.value.actor == b.value.actor:
+                                if a.value.seq > b.value.seq:
+                                    let sa2 = vector_set(intents, j, b.value).
+                                    if sa2 != 0:
+                                        if failure == 0:
+                                            set failure = 12.
+                                    else:
+                                        let sb2 = vector_set(intents, j + usize(1), a.value).
+                                        if sb2 != 0:
+                                            if failure == 0:
+                                                set failure = 13.
+                set j = j + usize(1).
+            set i = i + usize(1).
+        let first = vector_get(intents, usize(0)).
+        if first.found == false:
+            if failure == 0:
+                set failure = 16.
+        else:
+            if first.value.actor != 1:
+                if failure == 0:
+                    set failure = 17.
+            else:
+                if first.value.seq != 0:
+                    if failure == 0:
+                        set failure = 18.
+        let last = vector_get(intents, usize(5)).
+        if last.found == false:
+            if failure == 0:
+                set failure = 19.
+        else:
+            if last.value.actor != 2:
+                if failure == 0:
+                    set failure = 20.
+            else:
+                if last.value.seq != 2:
+                    if failure == 0:
+                        set failure = 21.
+        let pickWinners = map(i64, i64, usize(8)).
+        let damageTotals = map(i64, i64, usize(8)).
+        let blockWinners = map(i64, i64, usize(8)).
+        let mut accepted = 0.
+        let mut idx = usize(0).
+        while idx < vector_len(intents):
+            let slot = vector_get(intents, idx).
+            if slot.found == false:
+                if failure == 0:
+                    set failure = 22.
+            else:
+                let msg = slot.value.
+                if msg.kind == 1:
+                    if map_contains(pickWinners, msg.target) == true:
+                        let loser = map_get(pickWinners, msg.target).
+                        if loser.found == false:
+                            if failure == 0:
+                                set failure = 23.
+                        else:
+                            if loser.value == msg.actor:
+                                if failure == 0:
+                                    set failure = 24.
+                    else:
+                        let ins = map_insert(pickWinners, msg.target, msg.actor).
+                        if ins != 0:
+                            if failure == 0:
+                                set failure = 25.
+                        else:
+                            set accepted = accepted + 1.
+                else:
+                    if msg.kind == 2:
+                        let cur = map_get(damageTotals, msg.target).
+                        if cur.found == false:
+                            let ins2 = map_insert(damageTotals, msg.target, msg.amount).
+                            if ins2 != 0:
+                                if failure == 0:
+                                    set failure = 26.
+                            else:
+                                set accepted = accepted + 1.
+                        else:
+                            let total = cur.value + msg.amount.
+                            let upd = map_insert(damageTotals, msg.target, total).
+                            if upd != 1:
+                                if failure == 0:
+                                    set failure = 27.
+                            else:
+                                set accepted = accepted + 1.
+                    else:
+                        if msg.kind == 3:
+                            if map_contains(blockWinners, msg.target) == true:
+                                let kept = map_get(blockWinners, msg.target).
+                                if kept.found == false:
+                                    if failure == 0:
+                                        set failure = 28.
+                            else:
+                                let ins3 = map_insert(blockWinners, msg.target, msg.actor).
+                                if ins3 != 0:
+                                    if failure == 0:
+                                        set failure = 29.
+                                else:
+                                    set accepted = accepted + 1.
+                        else:
+                            if failure == 0:
+                                set failure = 30.
+            set idx = idx + usize(1).
+        if accepted != 4:
+            if failure == 0:
+                set failure = 31.
+        let pick = map_get(pickWinners, 100).
+        if pick.found == false:
+            if failure == 0:
+                set failure = 32.
+        else:
+            if pick.value != 1:
+                if failure == 0:
+                    set failure = 33.
+        let dmg = map_get(damageTotals, 50).
+        if dmg.found == false:
+            if failure == 0:
+                set failure = 34.
+        else:
+            if dmg.value != 6:
+                if failure == 0:
+                    set failure = 35.
+        let blk = map_get(blockWinners, 7).
+        if blk.found == false:
+            if failure == 0:
+                set failure = 36.
+        else:
+            if blk.value != 1:
+                if failure == 0:
+                    set failure = 37.
+        if map_len(pickWinners) != usize(1):
+            if failure == 0:
+                set failure = 38.
+        if map_len(damageTotals) != usize(1):
+            if failure == 0:
+                set failure = 39.
+        if map_len(blockWinners) != usize(1):
+            if failure == 0:
+                set failure = 40.
+        let storeBuf = buffer(usize(256)).
+        let scratch = borrow_mut(storeBuf, usize(0), usize(256)).
+        if BinaryWriteU32Be(scratch, usize(0), 1) != 4:
+            if failure == 0:
+                set failure = 41.
+        if BinaryWriteI64Be(scratch, usize(4), 7) != 8:
+            if failure == 0:
+                set failure = 42.
+        if BinaryWriteU32Be(scratch, usize(12), 48) != 4:
+            if failure == 0:
+                set failure = 43.
+        if BinaryWriteI64Be(scratch, usize(16), 100) != 8:
+            if failure == 0:
+                set failure = 44.
+        if BinaryWriteI64Be(scratch, usize(24), pick.value) != 8:
+            if failure == 0:
+                set failure = 45.
+        if BinaryWriteI64Be(scratch, usize(32), 50) != 8:
+            if failure == 0:
+                set failure = 46.
+        if BinaryWriteI64Be(scratch, usize(40), dmg.value) != 8:
+            if failure == 0:
+                set failure = 47.
+        if BinaryWriteI64Be(scratch, usize(48), 7) != 8:
+            if failure == 0:
+                set failure = 48.
+        if BinaryWriteI64Be(scratch, usize(56), blk.value) != 8:
+            if failure == 0:
+                set failure = 49.
+        let crcWhole = HashCrc32C(slice(view(scratch), usize(0), usize(64))).
+        let crcInit = HashCrc32CInit().
+        let crcPart = HashCrc32CUpdate(crcInit, slice(view(scratch), usize(0), usize(32))).
+        let crcSplit = HashCrc32CUpdate(crcPart, slice(view(scratch), usize(32), usize(32))).
+        if HashCrc32CFinish(crcSplit) != crcWhole:
+            if failure == 0:
+                set failure = 50.
+        if BinaryWriteU32Be(scratch, usize(64), i64(crcWhole)) != 4:
+            if failure == 0:
+                set failure = 51.
+        let fd = FileOpen(bytes("index_store.bin"), pathScratch, 577, 384).
+        if fd < 0:
+            if failure == 0:
+                set failure = 52.
+        else:
+            let written = FileWriteAll(fd, slice(view(scratch), usize(0), usize(68))).
+            if written != 68:
+                if failure == 0:
+                    set failure = 53.
+            if FileSync(fd) != 0:
+                if failure == 0:
+                    set failure = 54.
+            if FileClose(fd) != 0:
+                if failure == 0:
+                    set failure = 55.
+        let readBuf = buffer(usize(256)).
+        let dest = borrow_mut(readBuf, usize(0), usize(256)).
+        let fdR = FileOpen(bytes("index_store.bin"), pathScratch, 0, 0).
+        if fdR < 0:
+            if failure == 0:
+                set failure = 56.
+        else:
+            let mut have = usize(0).
+            while have < usize(68):
+                let got = FileRead(fdR, slice_mut(dest, have, usize(68) - have)).
+                if got < 0:
+                    if failure == 0:
+                        set failure = 57.
+                    set have = usize(68).
+                else:
+                    if got == 0:
+                        if failure == 0:
+                            set failure = 58.
+                        set have = usize(68).
+                    else:
+                        set have = have + usize(got).
+            let image = slice(view(dest), usize(0), usize(68)).
+            let ver = BinaryReadU32Be(image, usize(0)).
+            if ver.status != 0:
+                if failure == 0:
+                    set failure = 59.
+            else:
+                if ver.value != 1:
+                    if failure == 0:
+                        set failure = 59.
+                else:
+                    if ver.consumed != usize(4):
+                        if failure == 0:
+                            set failure = 59.
+            let tick = BinaryReadI64Be(image, usize(4)).
+            if tick.status != 0:
+                if failure == 0:
+                    set failure = 60.
+            else:
+                if tick.value != 7:
+                    if failure == 0:
+                        set failure = 60.
+            let paylen = BinaryReadU32Be(image, usize(12)).
+            if paylen.status != 0:
+                if failure == 0:
+                    set failure = 61.
+            else:
+                if paylen.value != 48:
+                    if failure == 0:
+                        set failure = 61.
+            let pt = BinaryReadI64Be(image, usize(16)).
+            if pt.status != 0:
+                if failure == 0:
+                    set failure = 62.
+            else:
+                if pt.value != 100:
+                    if failure == 0:
+                        set failure = 62.
+            let pw = BinaryReadI64Be(image, usize(24)).
+            if pw.status != 0:
+                if failure == 0:
+                    set failure = 63.
+            else:
+                if pw.value != 1:
+                    if failure == 0:
+                        set failure = 63.
+            let dt = BinaryReadI64Be(image, usize(32)).
+            if dt.status != 0:
+                if failure == 0:
+                    set failure = 64.
+            else:
+                if dt.value != 50:
+                    if failure == 0:
+                        set failure = 64.
+            let dv = BinaryReadI64Be(image, usize(40)).
+            if dv.status != 0:
+                if failure == 0:
+                    set failure = 65.
+            else:
+                if dv.value != 6:
+                    if failure == 0:
+                        set failure = 65.
+            let bt = BinaryReadI64Be(image, usize(48)).
+            if bt.status != 0:
+                if failure == 0:
+                    set failure = 66.
+            else:
+                if bt.value != 7:
+                    if failure == 0:
+                        set failure = 66.
+            let bw = BinaryReadI64Be(image, usize(56)).
+            if bw.status != 0:
+                if failure == 0:
+                    set failure = 67.
+            else:
+                if bw.value != 1:
+                    if failure == 0:
+                        set failure = 67.
+            let stored = BinaryReadU32Be(image, usize(64)).
+            if stored.status != 0:
+                if failure == 0:
+                    set failure = 68.
+            else:
+                let checkCrc = HashCrc32C(slice(image, usize(0), usize(64))).
+                if i64(checkCrc) != stored.value:
+                    if failure == 0:
+                        set failure = 68.
+            let torn = slice(image, usize(0), usize(67)).
+            let tornRead = BinaryReadU32Be(torn, usize(64)).
+            if tornRead.status != -22:
+                if failure == 0:
+                    set failure = 70.
+            borrow_end(torn).
+            borrow_end(image).
+            if FileClose(fdR) != 0:
+                if failure == 0:
+                    set failure = 71.
+        let mutBuf = buffer(usize(256)).
+        let mutScratch = borrow_mut(mutBuf, usize(0), usize(256)).
+        if BytesCopy(mutScratch, slice(view(dest), usize(0), usize(68))) != 68:
+            if failure == 0:
+                set failure = 72.
+        if BinaryWriteI64Be(mutScratch, usize(24), 999) != 8:
+            if failure == 0:
+                set failure = 72.
+        let badImage = slice(view(mutScratch), usize(0), usize(68)).
+        let badStored = BinaryReadU32Be(badImage, usize(64)).
+        if badStored.status != 0:
+            if failure == 0:
+                set failure = 72.
+        else:
+            let badCheck = HashCrc32C(slice(badImage, usize(0), usize(64))).
+            if i64(badCheck) == badStored.value:
+                if failure == 0:
+                    set failure = 72.
+        borrow_end(badImage).
+        if BinaryWriteU32Be(mutScratch, usize(0), 2) != 4:
+            if failure == 0:
+                set failure = 73.
+        let verImage = BinaryReadU32Be(slice(view(mutScratch), usize(0), usize(68)), usize(0)).
+        if verImage.status != 0:
+            if failure == 0:
+                set failure = 74.
+        else:
+            if verImage.value != 2:
+                if failure == 0:
+                    set failure = 74.
+            else:
+                if verImage.value == 1:
+                    if failure == 0:
+                        set failure = 75.
+        borrow_end(mutScratch).
+        buffer_drop(mutBuf).
+        if FileRemove(bytes("index_store.bin"), pathScratch) != 0:
+            if failure == 0:
+                set failure = 76.
+        borrow_end(scratch).
+        buffer_drop(storeBuf).
+        borrow_end(dest).
+        buffer_drop(readBuf).
+        borrow_end(pathScratch).
+        buffer_drop(pathBuf).
+        channel_drop(ch).
+        vector_drop(intents).
+        map_drop(pickWinners).
+        map_drop(damageTotals).
+        map_drop(blockWinners).
+        return failure.

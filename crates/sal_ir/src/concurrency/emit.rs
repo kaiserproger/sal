@@ -221,6 +221,9 @@ impl<'a> Rewriter<'a> {
                     inner.remove(var);
                     self.collect_block_payloads(body, &mut inner);
                 }
+                Stmt::Unsafe { body } => {
+                    self.collect_block_payloads(body, locals);
+                }
                 Stmt::Break | Stmt::Continue => {}
             }
         }
@@ -321,6 +324,9 @@ impl<'a> Rewriter<'a> {
                 .collect(),
             invariants: Vec::new(),
             c_layout: true,
+            json: Default::default(),
+            iteration: None,
+            generated: true,
         }));
     }
     fn emit_op(
@@ -340,14 +346,44 @@ impl<'a> Rewriter<'a> {
                 .map(|(name, ty)| sal_syntax::ParamDecl { name, ty })
                 .collect(),
             returns,
-            effects: vec!["SystemCall".into(), "UnsafeMemory".into()],
+            effects: vec!["SystemCall".into()],
             requires: Vec::new(),
             ensures: Vec::new(),
+            ownership: Default::default(),
+            generated: true,
             responds_literal: None,
             c_export: None,
             c_import: None,
-            body,
+            body: vec![Stmt::Unsafe { body }],
         }));
+    }
+    // These runtime entries accept erased addresses, so they must remain unsafe
+    // to call directly. Only checked, affine source operations reach these
+    // reserved wrappers; their unsafe blocks do not grant effects to callers.
+    fn emit_handle_ops(&self, out: &mut Vec<Item>, span: &Span) {
+        for (name, runtime, returns) in [
+            ("SalConcChannelClone", "SalChannelClone", Some("usize")),
+            ("SalConcChannelDrop", "SalChannelDrop", None),
+            ("SalConcChannelClose", "SalChannelClose", Some("bool")),
+            ("SalConcThreadJoin", "SalThreadJoin", Some("i64")),
+        ] {
+            let call = Expr::Call {
+                name: runtime.into(),
+                args: vec![Expr::Var("handle".into())],
+            };
+            let body = match returns {
+                Some(_) => vec![Stmt::Return(call)],
+                None => vec![Stmt::ExprStmt(call)],
+            };
+            self.emit_op(
+                out,
+                name.into(),
+                vec![("handle".into(), TypeRef::Named("usize".into()))],
+                returns.map(|name| TypeRef::Named(name.into())),
+                span,
+                body,
+            );
+        }
     }
     fn exit_group(&self, code: i64) -> Stmt {
         Stmt::ExprStmt(Expr::Call {
@@ -845,6 +881,9 @@ impl<'a> Rewriter<'a> {
                     let mut inner = locals.clone();
                     inner.remove(var);
                     self.walk_stmts_shapes(body, &mut inner, shapes, counts);
+                }
+                Stmt::Unsafe { body } => {
+                    self.walk_stmts_shapes(body, locals, shapes, counts);
                 }
                 Stmt::Break | Stmt::Continue => {}
             }
@@ -1397,6 +1436,9 @@ impl<'a> Rewriter<'a> {
                         queue.push(iter);
                         stmts.extend(body.iter());
                     }
+                    Stmt::Unsafe { body } => {
+                        stmts.extend(body.iter());
+                    }
                     Stmt::Break | Stmt::Continue => {}
                 }
             }
@@ -1464,6 +1506,7 @@ impl<'a> Rewriter<'a> {
         let (shapes, counts) = self.wait_shapes(file);
         let spawns = self.collect_spawns(file);
         let mut out: Vec<Item> = Vec::new();
+        self.emit_handle_ops(&mut out, &span);
         // Emit generated records/constructors first (deterministic tag order).
         self.payloads
             .sort_by(|left, right| left.tag.cmp(&right.tag));
@@ -1635,6 +1678,10 @@ impl<'a> Rewriter<'a> {
                         iter,
                         body,
                     });
+                }
+                Stmt::Unsafe { body } => {
+                    let body = self.rewrite_block(body, scope, span);
+                    out.push(Stmt::Unsafe { body });
                 }
                 Stmt::Break | Stmt::Continue => out.push(stmt.clone()),
             }
@@ -1848,7 +1895,7 @@ impl<'a> Rewriter<'a> {
                 };
                 (
                     Expr::Call {
-                        name: "SalChannelClone".into(),
+                        name: "SalConcChannelClone".into(),
                         args: vec![ch],
                     },
                     ValTy::Handle(HandleKind::Channel, payload),
@@ -1858,7 +1905,7 @@ impl<'a> Rewriter<'a> {
                 let (ch, _) = self.rewrite_expr(&args[0], scope, span);
                 (
                     Expr::Call {
-                        name: "SalChannelDrop".into(),
+                        name: "SalConcChannelDrop".into(),
                         args: vec![ch],
                     },
                     ValTy::Value,
@@ -1868,7 +1915,7 @@ impl<'a> Rewriter<'a> {
                 let (ch, _) = self.rewrite_expr(&args[0], scope, span);
                 (
                     Expr::Call {
-                        name: "SalChannelClose".into(),
+                        name: "SalConcChannelClose".into(),
                         args: vec![ch],
                     },
                     ValTy::Value,
@@ -1924,7 +1971,7 @@ impl<'a> Rewriter<'a> {
                 let (thread, _) = self.rewrite_expr(&args[0], scope, span);
                 (
                     Expr::Call {
-                        name: "SalThreadJoin".into(),
+                        name: "SalConcThreadJoin".into(),
                         args: vec![thread],
                     },
                     ValTy::Value,

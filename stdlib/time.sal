@@ -1,0 +1,296 @@
+# SAL-only monotonic/wall clock and sleep layer for tick scheduling.
+#
+# All algorithms are SAL in this file. The only kernel crossings are
+# clock_gettime (number 228) and nanosleep (number 35) on Linux x86-64,
+# each confined to a narrow audited `unsafe:` block that grants
+# UnsafeMemory to those nested statements only. Public operations declare
+# `SystemCall` where they (transitively) trap into the kernel and never
+# declare UnsafeMemory; type checks stay on everywhere. No libc, no
+# scheduler, no polling: sleeps block in the kernel.
+#
+# TimeMono is CLOCK_MONOTONIC (clock 1): seconds since an unspecified
+# starting point that never jumps while the machine runs. Use it for
+# elapsed time, deadlines, remaining time and tick scheduling.
+# TimeWall is CLOCK_REALTIME (clock 0): civil wall time. It can jump
+# forward or backward (time sync, administrator changes). Never use it
+# for elapsed time or ordering; it is not monotonic and makes no
+# monotonic claim.
+# TimeSpan is a non-negative normalized span: seconds >= 0 and
+# 0 <= nanoseconds < 1000000000.
+#
+# Status codes: 0 is success. -22 rejects invalid seconds/nanoseconds.
+# -75 reports checked overflow before any trapping arithmetic runs. Other
+# negative values preserve the kernel -errno. -4 (EINTR) never escapes:
+# sleeps resume from the kernel remainder.
+
+entity TimeMono:
+    layout "C".
+    has seconds of type i64.
+    has nanoseconds of type i64.
+
+entity TimeWall:
+    layout "C".
+    has seconds of type i64.
+    has nanoseconds of type i64.
+
+entity TimeSpan:
+    layout "C".
+    has seconds of type i64.
+    has nanoseconds of type i64.
+
+entity TimeMonoRead:
+    layout "C".
+    has stamp of type TimeMono.
+    has status of type i64.
+
+entity TimeWallRead:
+    layout "C".
+    has stamp of type TimeWall.
+    has status of type i64.
+
+entity TimeSpanOut:
+    layout "C".
+    has span of type TimeSpan.
+    has status of type i64.
+
+entity TimeDeadline:
+    layout "C".
+    has point of type TimeMono.
+    has status of type i64.
+
+entity TimeRemain:
+    layout "C".
+    has remaining of type TimeSpan.
+    has expired of type bool.
+    has status of type i64.
+
+entity TimeElapsed:
+    layout "C".
+    has elapsed of type TimeSpan.
+    has status of type i64.
+
+# Normalized parts: seconds >= 0 and 0 <= nanoseconds < 1000000000.
+operation TimeValid:
+    accepts seconds of type i64.
+    accepts nanoseconds of type i64.
+    returns bool.
+    body:
+        return seconds >= 0 && nanoseconds >= 0 && nanoseconds < 1000000000.
+
+operation TimeZeroSpan:
+    returns TimeSpan.
+    body:
+        return TimeSpan(i64(0), i64(0)).
+
+operation TimeZeroMono:
+    returns TimeMono.
+    body:
+        return TimeMono(i64(0), i64(0)).
+
+operation TimeZeroWall:
+    returns TimeWall.
+    body:
+        return TimeWall(i64(0), i64(0)).
+
+# A clock sample plus the syscall result: the kernel errno propagates, and a
+# success must still be a normalized stamp (-22 otherwise).
+operation TimeMonoChecked:
+    accepts sample of type TimeMono.
+    accepts code of type i64.
+    returns TimeMonoRead.
+    requires:
+        code >= 0 otherwise TimeMonoRead(TimeZeroMono(), code).
+        TimeValid(sample.seconds, sample.nanoseconds) otherwise TimeMonoRead(TimeZeroMono(), -22).
+    body:
+        return TimeMonoRead(sample, 0).
+
+operation TimeWallChecked:
+    accepts sample of type TimeWall.
+    accepts code of type i64.
+    returns TimeWallRead.
+    requires:
+        code >= 0 otherwise TimeWallRead(TimeZeroWall(), code).
+        TimeValid(sample.seconds, sample.nanoseconds) otherwise TimeWallRead(TimeZeroWall(), -22).
+    body:
+        return TimeWallRead(sample, 0).
+
+# CLOCK_MONOTONIC sample. Kernel output is revalidated so a success
+# result is always a normalized stamp.
+operation TimeMonotonic:
+    returns TimeMonoRead.
+    effects: SystemCall.
+    body:
+        let sample = TimeMono(i64(0), i64(0)).
+        let mut code = 0.
+        unsafe:
+            set code = syscall(228, 1, address(sample), 0, 0, 0, 0).
+        return TimeMonoChecked(sample, code).
+
+# CLOCK_REALTIME sample. Wall time only: never elapsed or ordering.
+operation TimeRealtime:
+    returns TimeWallRead.
+    effects: SystemCall.
+    body:
+        let sample = TimeWall(i64(0), i64(0)).
+        let mut code = 0.
+        unsafe:
+            set code = syscall(228, 0, address(sample), 0, 0, 0, 0).
+        return TimeWallChecked(sample, code).
+
+# Validated span constructor. Unnormalized or negative parts are -22.
+operation TimeSpanMake:
+    accepts seconds of type i64.
+    accepts nanoseconds of type i64.
+    returns TimeSpanOut.
+    requires:
+        TimeValid(seconds, nanoseconds) otherwise TimeSpanOut(TimeZeroSpan(), -22).
+    body:
+        return TimeSpanOut(TimeSpan(seconds, nanoseconds), 0).
+
+# Sum of two normalized spans' parts: a nanosecond total of a second or more
+# carries into the seconds, and a carry past the largest i64 second is -75.
+operation TimeSpanJoin:
+    accepts sum of type i64.
+    accepts total of type i64.
+    returns TimeSpanOut.
+    requires:
+        total >= 1000000000 otherwise TimeSpanOut(TimeSpan(sum, total), 0).
+        sum != 9223372036854775807 otherwise TimeSpanOut(TimeZeroSpan(), -75).
+    body:
+        return TimeSpanOut(TimeSpan(sum + 1, total - 1000000000), 0).
+
+# Checked normalized addition. Overflow is -75; no trapping arithmetic.
+operation TimeSpanAdd:
+    accepts first of type TimeSpan.
+    accepts second of type TimeSpan.
+    returns TimeSpanOut.
+    requires:
+        TimeValid(first.seconds, first.nanoseconds) otherwise TimeSpanOut(TimeZeroSpan(), -22).
+        TimeValid(second.seconds, second.nanoseconds) otherwise TimeSpanOut(TimeZeroSpan(), -22).
+        first.seconds <= 9223372036854775807 - second.seconds otherwise TimeSpanOut(TimeZeroSpan(), -75).
+    body:
+        return TimeSpanJoin(first.seconds + second.seconds, first.nanoseconds + second.nanoseconds).
+
+# A span sum as a monotonic deadline; its failure status propagates.
+operation TimeDeadlineFrom:
+    accepts sum of type TimeSpanOut.
+    returns TimeDeadline.
+    requires:
+        sum.status == 0 otherwise TimeDeadline(TimeZeroMono(), sum.status).
+    body:
+        return TimeDeadline(TimeMono(sum.span.seconds, sum.span.nanoseconds), 0).
+
+# Monotonic deadline start + after. Validates both inputs; overflow is
+# -75. The result is a normalized TimeMono point for TimeRemaining and
+# TimeSleepUntil, suitable for tick scheduling.
+operation TimeDeadlineAfter:
+    accepts start of type TimeMono.
+    accepts after of type TimeSpan.
+    returns TimeDeadline.
+    body:
+        return TimeDeadlineFrom(TimeSpanAdd(TimeSpan(start.seconds, start.nanoseconds), after)).
+
+# later - earlier for normalized stamps with later >= earlier: a smaller
+# nanosecond part borrows one second.
+operation TimeDifference:
+    accepts later of type TimeMono.
+    accepts earlier of type TimeMono.
+    returns TimeSpan.
+    requires:
+        later.nanoseconds >= earlier.nanoseconds otherwise TimeSpan(later.seconds - earlier.seconds - 1, later.nanoseconds - earlier.nanoseconds + 1000000000).
+    body:
+        return TimeSpan(later.seconds - earlier.seconds, later.nanoseconds - earlier.nanoseconds).
+
+# Remaining time given one clock observation: a clock error propagates, and
+# a deadline at or before the observation is a zero span with expired true.
+operation TimeRemainAt:
+    accepts deadline of type TimeMono.
+    accepts observed of type TimeMonoRead.
+    returns TimeRemain.
+    requires:
+        observed.status >= 0 otherwise TimeRemain(TimeZeroSpan(), false, observed.status).
+        observed.stamp.seconds <= deadline.seconds otherwise TimeRemain(TimeZeroSpan(), true, 0).
+        observed.stamp.seconds < deadline.seconds || observed.stamp.nanoseconds < deadline.nanoseconds otherwise TimeRemain(TimeZeroSpan(), true, 0).
+    body:
+        return TimeRemain(TimeDifference(deadline, observed.stamp), false, 0).
+
+# Remaining monotonic time until a deadline. Expired deadlines report a
+# zero span with expired true. Samples the clock once.
+operation TimeRemaining:
+    accepts deadline of type TimeMono.
+    returns TimeRemain.
+    effects: SystemCall.
+    requires:
+        TimeValid(deadline.seconds, deadline.nanoseconds) otherwise TimeRemain(TimeZeroSpan(), false, -22).
+    body:
+        return TimeRemainAt(deadline, TimeMonotonic()).
+
+# Elapsed time given one clock observation: a clock error propagates, and an
+# observation before the start is -22 (the monotonic clock never runs back).
+operation TimeElapsedAt:
+    accepts start of type TimeMono.
+    accepts observed of type TimeMonoRead.
+    returns TimeElapsed.
+    requires:
+        observed.status >= 0 otherwise TimeElapsed(TimeZeroSpan(), observed.status).
+        observed.stamp.seconds >= start.seconds otherwise TimeElapsed(TimeZeroSpan(), -22).
+        observed.stamp.seconds > start.seconds || observed.stamp.nanoseconds >= start.nanoseconds otherwise TimeElapsed(TimeZeroSpan(), -22).
+    body:
+        return TimeElapsed(TimeDifference(observed.stamp, start), 0).
+
+# Monotonic elapsed time since a stamp. A future stamp is invalid (-22):
+# the monotonic clock never runs backward.
+operation TimeElapsedSince:
+    accepts start of type TimeMono.
+    returns TimeElapsed.
+    effects: SystemCall.
+    requires:
+        TimeValid(start.seconds, start.nanoseconds) otherwise TimeElapsed(TimeZeroSpan(), -22).
+    body:
+        return TimeElapsedAt(start, TimeMonotonic()).
+
+# Block in nanosleep for a validated span. EINTR resumes from the kernel
+# remainder; any other result (0 or preserved -errno) is returned.
+operation TimeSleep:
+    accepts span of type TimeSpan.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        TimeValid(span.seconds, span.nanoseconds) otherwise -22.
+    body:
+        let mut request = TimeSpan(span.seconds, span.nanoseconds).
+        let remainder = TimeSpan(i64(0), i64(0)).
+        let mut code = -4.
+        while code == -4:
+            unsafe:
+                set code = syscall(35, address(request), address(remainder), 0, 0, 0, 0).
+            set request = TimeSpan(remainder.seconds, remainder.nanoseconds).
+        return code.
+
+# One sleep toward a deadline from its remaining time: a clock error
+# propagates, and an expired deadline returns 0 without sleeping.
+operation TimeSleepFor:
+    accepts left of type TimeRemain.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        left.status >= 0 otherwise left.status.
+        left.expired == false otherwise 0.
+    body:
+        return TimeSleep(left.remaining).
+
+# Block until a monotonic deadline passes. Expired deadlines return 0
+# without sleeping. Each wait blocks in the kernel; there is no polling.
+operation TimeSleepUntil:
+    accepts deadline of type TimeMono.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        TimeValid(deadline.seconds, deadline.nanoseconds) otherwise -22.
+    body:
+        let mut left = TimeRemaining(deadline).
+        let mut code = TimeSleepFor(left).
+        while left.status == 0 && left.expired == false && code == 0:
+            set left = TimeRemaining(deadline).
+            set code = TimeSleepFor(left).
+        return code.

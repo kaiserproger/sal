@@ -1,40 +1,44 @@
 use "std/http.sal".
+use "std/net.sal".
 use "std/linux/net.sal".
 use "std/linux/memory.sal".
 
-operation WarehouseProbeFinish:
+# Exchange borrows caller storage; Main retains the socket and Buffer cleanup.
+operation WarehouseProbeExchange:
     accepts fd of type i64.
-    accepts arena of type usize.
-    accepts status of type i64.
+    accepts reply of type MutBytes.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    requires:
+        fd >= 0 otherwise 1.
+        len(reply) >= usize(12) otherwise 1.
+    effects: SystemCall.
     body:
-        if fd >= 0:
-            LinuxClose(fd).
-        LinuxUnmapMemory(arena, usize(4096)).
-        return status.
+        if LinuxSocketTimeouts(fd, i64(2)) < 0:
+            return 1.
+        let request = bytes("POST /stock HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"warehouse_id\":1}").
+        if LinuxWriteAll(fd, request) < 0:
+            return 1.
+        if LinuxReadExact(fd, reply) < 0:
+            return 1.
+        let raw = view(reply).
+        let prefix = slice(raw, usize(0), usize(12)).
+        let ok = prefix == bytes("HTTP/1.1 200").
+        borrow_end(prefix).
+        borrow_end(raw).
+        if !ok:
+            return 1.
+        return 0.
 
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mapped = LinuxMapMemory(usize(4096)).
-        if mapped < 0:
-            return 1.
-        let arena = usize(mapped).
-        let endpoint = LinuxIpv4Address(arena, u64(2130706433), i64(8080)).
-        if endpoint < 0:
-            return WarehouseProbeFinish(-1, arena, 1).
-        let fd = LinuxTcpConnect(arena).
-        if fd < 0:
-            return WarehouseProbeFinish(-1, arena, 1).
-        if LinuxSocketTimeouts(fd, i64(2)) < 0:
-            return WarehouseProbeFinish(fd, arena, 1).
-        let request = bytes("POST /stock HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"warehouse_id\":1}").
-        if LinuxWriteAll(fd, request) < 0:
-            return WarehouseProbeFinish(fd, arena, 1).
-        if LinuxReadExact(fd, arena, usize(12)) < 0:
-            return WarehouseProbeFinish(fd, arena, 1).
-        if bytes_at(arena, usize(12)) != bytes("HTTP/1.1 200"):
-            return WarehouseProbeFinish(fd, arena, 1).
-        return WarehouseProbeFinish(fd, arena, 0).
+        let arena = buffer(usize(4096)).
+        let fd = NetTcpConnect(u64(2130706433), i64(8080)).
+        let reply = borrow_mut(arena, usize(0), usize(12)).
+        let status = WarehouseProbeExchange(fd, reply).
+        borrow_end(reply).
+        if fd >= 0:
+            LinuxClose(fd).
+        buffer_drop(arena).
+        return status.

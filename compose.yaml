@@ -17,7 +17,7 @@ services:
       - unix_socket_permissions=0777
     volumes:
       - warehouse-data:/var/lib/postgresql/data
-      - ./.warehouse-state/socket:/run/postgresql
+      - warehouse-socket:/run/postgresql
       - ./apps/warehouse/sql:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-h", "/run/postgresql", "-U", "warehouse", "-d", "warehouse"]
@@ -28,14 +28,16 @@ services:
     restart: unless-stopped
 
   app:
-    build: .
+    build:
+      context: .
+      target: runtime
     depends_on:
       db:
         condition: service_healthy
     ports:
       - "${WAREHOUSE_BIND:-127.0.0.1}:${WAREHOUSE_PORT:-8080}:8080"
     volumes:
-      - ./.warehouse-state/socket:/run/postgresql:ro
+      - warehouse-socket:/run/postgresql:ro
     healthcheck:
       test: ["CMD", "/healthcheck"]
       interval: 5s
@@ -49,5 +51,23 @@ services:
     mem_limit: 256m
     restart: unless-stopped
 
+  qa:
+    profiles: ["qa"]
+    build:
+      context: .
+      target: qa
+    depends_on:
+      app:
+        condition: service_healthy
+    network_mode: "service:app"
+    volumes:
+      - warehouse-socket:/run/postgresql:ro
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 256m
+
 volumes:
   warehouse-data:
+  warehouse-socket:

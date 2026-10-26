@@ -18,5 +18,3 @@ module Secret:
 
 service ApiService:
   belongs to App.
-  requires:
-    Serve.

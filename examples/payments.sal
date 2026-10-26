@@ -7,14 +7,12 @@ entity Account:
   has id of type UUID.
   has owner of type String.
   has balance of type Money<USD>.
-  invariant Balance is never negative.
 
 entity Transfer:
   has id of type UUID.
   has source of type String.
   has destination of type String.
   has amount of type Money<USD>.
-  invariant Amount is positive.
 
 layer Domain:
   owns Account.
@@ -33,14 +31,6 @@ layer Infrastructure:
 
 service TransferService:
   belongs to Application.
-  requires:
-    Source account exists.
-    Sufficient funds available.
-  ensures:
-    Transfer is recorded.
-  execution must be atomic.
-  allowed effects:
-    DatabaseWrite.
 
 operation TransferFunds:
   accepts source of type String.

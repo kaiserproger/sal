@@ -128,15 +128,11 @@ impl Fixture {
         }
     }
 
-    fn build(&self, source: &str, anglish: bool) -> Output {
-        let name = if anglish { "probe.ang" } else { "probe.sal" };
-        let input = self.0.join(name);
+    fn build(&self, source: &str) -> Output {
+        let input = self.0.join("probe.sal");
         std::fs::write(&input, source).expect("write frontend source");
         let mut command = Command::new(env!("CARGO_BIN_EXE_sal"));
         command.arg("build-exe");
-        if anglish {
-            command.arg("--ang");
-        }
         // No backend override: exercise the default standalone native backend.
         self.run(command.arg(input).arg("--out").arg(self.0.join("out")))
     }
@@ -316,7 +312,7 @@ route Trailing:
     responds with "trailing".
 "#,
     );
-    success(&fixture.build(&source, false));
+    success(&fixture.build(&source));
     fixture.assert_standalone();
     let (mut server, address) = fixture.serve(reservation);
     for (path, body) in [
@@ -393,16 +389,16 @@ route Trailing:
 }
 
 #[test]
-fn anglish_tupoi_builds_and_serves_without_a_foreign_runtime() {
+fn canonical_tupoi_builds_and_serves_without_a_foreign_runtime() {
     let fixture = Fixture::new();
     let reservation = reservation();
-    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ang/tupoi.ang");
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/native/tupoi.sal");
     let source = std::fs::read_to_string(example).expect("read real Tupoi example");
     let source = source.replace(
         "8081",
         &reservation.local_addr().unwrap().port().to_string(),
     );
-    success(&fixture.build(&source, true));
+    success(&fixture.build(&source));
     fixture.assert_standalone();
     let (mut server, address) = fixture.serve(reservation);
     assert_response(
@@ -423,7 +419,7 @@ fn caller_entry_points_are_rejected_instead_of_replaced() {
             "{}route Hello:\n    handles GET /.\n    responds with Text.\noperation {name}:\n    returns i64.\n    body:\n        return 23.\n",
             server_source(8081)
         );
-        let output = fixture.build(&source, false);
+        let output = fixture.build(&source);
         assert!(
             !output.status.success(),
             "caller {name} was silently replaced"
@@ -451,7 +447,7 @@ fn original_imported_operations_are_still_checked() {
         "use \"caller.sal\".\n{}route Hello:\n    handles GET /.\n    responds with Text.\n",
         server_source(8081)
     );
-    let output = fixture.build(&source, false);
+    let output = fixture.build(&source);
     assert!(
         !output.status.success(),
         "original caller definitions were discarded"
@@ -478,7 +474,7 @@ fn lowering_does_not_hide_duplicate_or_cross_kind_names() {
             "{}route Hello:\n    handles GET /.\n    responds with Text.\n{conflicting}",
             server_source(8081)
         );
-        let output = fixture.build(&source, false);
+        let output = fixture.build(&source);
         assert!(
             !output.status.success(),
             "lowering hid an original declaration"

@@ -12,5 +12,3 @@ module Helper:
 
 service ApiService:
   belongs to App.
-  requires:
-    Serve.

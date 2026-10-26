@@ -1,0 +1,339 @@
+use "std/text.sal".
+use "std/buffer.sal".
+
+# Executable SAL fixture for stdlib/text.sal: valid ASCII and multibyte
+# decoding with observable scalar values and next offsets, boundary
+# positions, explicit slice-result status checks, byte/span search, ASCII
+# folding, and byte-exact malformed sequences built in a Buffer scratch
+# mapping. Returns 0 when every check holds, otherwise the first failing
+# check number. Asserts only observable results and positions, never source
+# text or wiring. No raw addresses, no UnsafeMemory: the scratch area is an
+# owned Buffer loaned as MutBytes and written with put; views are consumed
+# within their checking statement and the loan is ended before drop.
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        if TextValidate(bytes("")) == false:
+            if failure == 0:
+                set failure = 1.
+        if TextValidate(bytes("hello")) == false:
+            if failure == 0:
+                set failure = 2.
+        if TextEnd(bytes("hello"), usize(0)) != 5:
+            if failure == 0:
+                set failure = 3.
+        let stepAscii = TextNext(bytes("abc"), usize(0)).
+        if stepAscii.status != 0:
+            if failure == 0:
+                set failure = 4.
+        if stepAscii.scalar != 97:
+            if failure == 0:
+                set failure = 5.
+        if stepAscii.next != usize(1):
+            if failure == 0:
+                set failure = 6.
+        let stepEnd = TextNext(bytes("abc"), usize(3)).
+        if stepEnd.status != 1:
+            if failure == 0:
+                set failure = 7.
+        if stepEnd.scalar != 0:
+            if failure == 0:
+                set failure = 8.
+        if stepEnd.next != usize(3):
+            if failure == 0:
+                set failure = 9.
+        let stepPast = TextNext(bytes("abc"), usize(4)).
+        if stepPast.status != -22:
+            if failure == 0:
+                set failure = 10.
+        let words = bytes("aé😀").
+        if TextValidate(words) == false:
+            if failure == 0:
+                set failure = 11.
+        if TextEnd(words, usize(0)) != 7:
+            if failure == 0:
+                set failure = 12.
+        let stepTwo = TextNext(words, usize(1)).
+        if stepTwo.status != 0:
+            if failure == 0:
+                set failure = 13.
+        if stepTwo.scalar != 233:
+            if failure == 0:
+                set failure = 14.
+        if stepTwo.next != usize(3):
+            if failure == 0:
+                set failure = 15.
+        let stepFour = TextNext(words, usize(3)).
+        if stepFour.status != 0:
+            if failure == 0:
+                set failure = 16.
+        if stepFour.scalar != 128512:
+            if failure == 0:
+                set failure = 17.
+        if stepFour.next != usize(7):
+            if failure == 0:
+                set failure = 18.
+        if TextIsBoundary(words, usize(0)) == false:
+            if failure == 0:
+                set failure = 19.
+        if TextIsBoundary(words, usize(1)) == false:
+            if failure == 0:
+                set failure = 20.
+        if TextIsBoundary(words, usize(2)):
+            if failure == 0:
+                set failure = 21.
+        if TextIsBoundary(words, usize(3)) == false:
+            if failure == 0:
+                set failure = 22.
+        if TextIsBoundary(words, usize(4)):
+            if failure == 0:
+                set failure = 23.
+        if TextIsBoundary(words, usize(5)):
+            if failure == 0:
+                set failure = 24.
+        if TextIsBoundary(words, usize(6)):
+            if failure == 0:
+                set failure = 25.
+        if TextIsBoundary(words, usize(7)) == false:
+            if failure == 0:
+                set failure = 26.
+        if TextIsBoundary(words, usize(8)):
+            if failure == 0:
+                set failure = 27.
+        if TextEnd(words, usize(2)) != -22:
+            if failure == 0:
+                set failure = 28.
+        if TextEnd(words, usize(8)) != -22:
+            if failure == 0:
+                set failure = 29.
+        let mixed = bytes("aéx").
+        let sliceA = TextSlice(mixed, usize(0), usize(1)).
+        if sliceA.status != 0:
+            if failure == 0:
+                set failure = 30.
+        if sliceA.value != bytes("a"):
+            if failure == 0:
+                set failure = 31.
+        let sliceE = TextSlice(mixed, usize(1), usize(3)).
+        if sliceE.status != 0:
+            if failure == 0:
+                set failure = 32.
+        if sliceE.value != bytes("é"):
+            if failure == 0:
+                set failure = 33.
+        let sliceFull = TextSlice(mixed, usize(0), usize(4)).
+        if sliceFull.status != 0:
+            if failure == 0:
+                set failure = 34.
+        if sliceFull.value != mixed:
+            if failure == 0:
+                set failure = 35.
+        let sliceSplit = TextSlice(mixed, usize(0), usize(2)).
+        if sliceSplit.status != -22:
+            if failure == 0:
+                set failure = 36.
+        let sliceReversed = TextSlice(mixed, usize(2), usize(1)).
+        if sliceReversed.status != -22:
+            if failure == 0:
+                set failure = 37.
+        let slicePast = TextSlice(mixed, usize(0), usize(5)).
+        if slicePast.status != -22:
+            if failure == 0:
+                set failure = 38.
+        let sliceEmpty = TextSlice(mixed, usize(1), usize(1)).
+        if sliceEmpty.status != 0:
+            if failure == 0:
+                set failure = 39.
+        if sliceEmpty.value != bytes(""):
+            if failure == 0:
+                set failure = 40.
+        let command = bytes("say hi").
+        if TextFindByte(command, usize(0), u8(32)) != 3:
+            if failure == 0:
+                set failure = 41.
+        if TextFindByte(command, usize(4), u8(32)) != -1:
+            if failure == 0:
+                set failure = 42.
+        if TextFindByte(command, usize(7), u8(32)) != -1:
+            if failure == 0:
+                set failure = 43.
+        let repeats = bytes("ababa").
+        if TextFind(repeats, usize(0), bytes("aba")) != 0:
+            if failure == 0:
+                set failure = 44.
+        if TextFind(repeats, usize(1), bytes("aba")) != 2:
+            if failure == 0:
+                set failure = 45.
+        if TextFind(repeats, usize(0), bytes("zz")) != -1:
+            if failure == 0:
+                set failure = 46.
+        if TextFind(repeats, usize(2), bytes("")) != 2:
+            if failure == 0:
+                set failure = 47.
+        if TextFind(repeats, usize(6), bytes("a")) != -1:
+            if failure == 0:
+                set failure = 48.
+        if TextEqualsAsciiFold(bytes("Content-Length"), bytes("content-length")) == false:
+            if failure == 0:
+                set failure = 49.
+        if TextEqualsAsciiFold(bytes("GET"), bytes("getx")):
+            if failure == 0:
+                set failure = 50.
+        if TextEqualsAsciiFold(bytes("É"), bytes("é")):
+            if failure == 0:
+                set failure = 51.
+        if TextStartsWithAsciiFold(bytes("GET /index"), bytes("get")) == false:
+            if failure == 0:
+                set failure = 52.
+        if TextStartsWithAsciiFold(bytes("GE"), bytes("get")):
+            if failure == 0:
+                set failure = 53.
+        if TextStartsWithAsciiFold(bytes("POST"), bytes("")) == false:
+            if failure == 0:
+                set failure = 54.
+        if TextScalarWidth(65) != usize(1):
+            if failure == 0:
+                set failure = 55.
+        if TextScalarWidth(233) != usize(2):
+            if failure == 0:
+                set failure = 56.
+        if TextScalarWidth(20013) != usize(3):
+            if failure == 0:
+                set failure = 57.
+        if TextScalarWidth(128512) != usize(4):
+            if failure == 0:
+                set failure = 58.
+        if TextAsciiLowerByte(u8(65)) != u8(97):
+            if failure == 0:
+                set failure = 59.
+        if TextAsciiLowerByte(u8(33)) != u8(33):
+            if failure == 0:
+                set failure = 60.
+        let arena = buffer(usize(4096)).
+        let scratch = borrow_mut(arena, usize(0), usize(4)).
+        put(scratch, usize(0), u8(65)).
+        if TextValidate(view(slice_mut(scratch, usize(0), usize(1)))) == false:
+            if failure == 0:
+                set failure = 61.
+        put(scratch, usize(0), u8(192)).
+        put(scratch, usize(1), u8(128)).
+        if TextValidate(view(slice_mut(scratch, usize(0), usize(2)))):
+            if failure == 0:
+                set failure = 62.
+        let stepOverlong = TextNext(view(slice_mut(scratch, usize(0), usize(2))), usize(0)).
+        if stepOverlong.status != -22:
+            if failure == 0:
+                set failure = 63.
+        if stepOverlong.scalar != 0:
+            if failure == 0:
+                set failure = 64.
+        if stepOverlong.next != usize(0):
+            if failure == 0:
+                set failure = 65.
+        put(scratch, usize(0), u8(128)).
+        if TextEnd(view(slice_mut(scratch, usize(0), usize(1))), usize(0)) != -22:
+            if failure == 0:
+                set failure = 66.
+        put(scratch, usize(0), u8(237)).
+        put(scratch, usize(1), u8(160)).
+        put(scratch, usize(2), u8(128)).
+        if TextValidate(view(slice_mut(scratch, usize(0), usize(3)))):
+            if failure == 0:
+                set failure = 67.
+        put(scratch, usize(0), u8(226)).
+        put(scratch, usize(1), u8(130)).
+        if TextValidate(view(slice_mut(scratch, usize(0), usize(2)))):
+            if failure == 0:
+                set failure = 68.
+        put(scratch, usize(0), u8(240)).
+        put(scratch, usize(1), u8(159)).
+        put(scratch, usize(2), u8(152)).
+        if TextValidate(view(slice_mut(scratch, usize(0), usize(3)))):
+            if failure == 0:
+                set failure = 69.
+        put(scratch, usize(0), u8(245)).
+        put(scratch, usize(1), u8(128)).
+        put(scratch, usize(2), u8(128)).
+        put(scratch, usize(3), u8(128)).
+        if TextNext(view(slice_mut(scratch, usize(0), usize(4))), usize(0)).status != -22:
+            if failure == 0:
+                set failure = 70.
+        put(scratch, usize(0), u8(226)).
+        put(scratch, usize(1), u8(40)).
+        put(scratch, usize(2), u8(161)).
+        if TextNext(view(slice_mut(scratch, usize(0), usize(3))), usize(0)).status != -22:
+            if failure == 0:
+                set failure = 71.
+        put(scratch, usize(0), u8(244)).
+        put(scratch, usize(1), u8(144)).
+        put(scratch, usize(2), u8(128)).
+        put(scratch, usize(3), u8(128)).
+        if TextValidate(view(slice_mut(scratch, usize(0), usize(4)))):
+            if failure == 0:
+                set failure = 72.
+        put(scratch, usize(0), u8(193)).
+        put(scratch, usize(1), u8(191)).
+        if TextNext(view(slice_mut(scratch, usize(0), usize(2))), usize(0)).status != -22:
+            if failure == 0:
+                set failure = 73.
+        put(scratch, usize(0), u8(244)).
+        put(scratch, usize(1), u8(143)).
+        put(scratch, usize(2), u8(191)).
+        put(scratch, usize(3), u8(191)).
+        if TextValidate(view(slice_mut(scratch, usize(0), usize(4)))) == false:
+            if failure == 0:
+                set failure = 74.
+        let stepMax = TextNext(view(slice_mut(scratch, usize(0), usize(4))), usize(0)).
+        if stepMax.scalar != 1114111:
+            if failure == 0:
+                set failure = 75.
+        if stepMax.next != usize(4):
+            if failure == 0:
+                set failure = 76.
+        put(scratch, usize(0), u8(240)).
+        put(scratch, usize(1), u8(144)).
+        put(scratch, usize(2), u8(128)).
+        put(scratch, usize(3), u8(128)).
+        let stepMinFour = TextNext(view(slice_mut(scratch, usize(0), usize(4))), usize(0)).
+        if stepMinFour.scalar != 65536:
+            if failure == 0:
+                set failure = 77.
+        put(scratch, usize(0), u8(223)).
+        put(scratch, usize(1), u8(191)).
+        if TextNext(view(slice_mut(scratch, usize(0), usize(2))), usize(0)).scalar != 2047:
+            if failure == 0:
+                set failure = 78.
+        put(scratch, usize(0), u8(224)).
+        put(scratch, usize(1), u8(160)).
+        put(scratch, usize(2), u8(128)).
+        if TextNext(view(slice_mut(scratch, usize(0), usize(3))), usize(0)).scalar != 2048:
+            if failure == 0:
+                set failure = 79.
+        put(scratch, usize(0), u8(237)).
+        put(scratch, usize(1), u8(159)).
+        put(scratch, usize(2), u8(191)).
+        if TextNext(view(slice_mut(scratch, usize(0), usize(3))), usize(0)).scalar != 55295:
+            if failure == 0:
+                set failure = 80.
+        put(scratch, usize(0), u8(238)).
+        put(scratch, usize(1), u8(128)).
+        put(scratch, usize(2), u8(128)).
+        if TextNext(view(slice_mut(scratch, usize(0), usize(3))), usize(0)).scalar != 57344:
+            if failure == 0:
+                set failure = 81.
+        put(scratch, usize(0), u8(239)).
+        put(scratch, usize(1), u8(191)).
+        put(scratch, usize(2), u8(191)).
+        if TextNext(view(slice_mut(scratch, usize(0), usize(3))), usize(0)).scalar != 65535:
+            if failure == 0:
+                set failure = 82.
+        put(scratch, usize(0), u8(194)).
+        put(scratch, usize(1), u8(128)).
+        if TextNext(view(slice_mut(scratch, usize(0), usize(2))), usize(0)).scalar != 128:
+            if failure == 0:
+                set failure = 83.
+        borrow_end(scratch).
+        buffer_drop(arena).
+        return failure.

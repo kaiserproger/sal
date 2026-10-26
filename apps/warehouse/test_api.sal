@@ -1,0 +1,75 @@
+use "std/bytes.sal".
+use "std/linux/io.sal".
+use "tests/qa_runner.sal".
+use "tests/qa_scripts.sal".
+use "tests/qa_races.sal".
+
+# Native all-SAL functional QA of the warehouse API; every group below is one
+# behavioral scenario. It runs in the scratch QA container of the UNIQUE integration
+# Compose project, sharing the app's network namespace (127.0.0.1:8080) and
+# the /run/postgresql socket volume (user/db warehouse) with its own fresh
+# volumes. Fixtures go through the SAL PostgreSQL client; no psql, docker
+# exec or foreign runner.
+#
+# Main owns the only Buffer and drops it once at the end; groups receive the
+# `wire` loan (HTTP exchange and PostgreSQL scratch) and the `work` loan
+# (runtime-built payloads and report lines). Each group prints PASS or FAIL
+# with its first failing check; the exit status is the number of failed
+# groups (1 when the database or the app never became ready).
+
+operation QaReadiness:
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    accepts work of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let at = QaConnected(0, fd, work).
+        return QaReport(bytes("readiness"), QaAwaitApp(at, wire), work).
+
+operation QaAllPassed:
+    accepts failures of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        failures == 0 otherwise failures.
+    body:
+        let printed = LinuxWriteAll(1, bytes("ALL-QA-GROUPS-PASS metadata+atomic+warehouses+invalid+batch64+routing+parallel-single+parallel-opposite+parallel-warehouses\n")).
+        return QaVerdictFailures(0, printed).
+
+operation QaSuite:
+    accepts ready of type i64.
+    accepts fd of type i64.
+    accepts wire of type MutBytes.
+    accepts work of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        ready == 0 otherwise 1.
+    body:
+        let mut failures = QaGroupMetadata(fd, wire, work).
+        set failures = failures + QaGroupAtomic(fd, wire, work).
+        set failures = failures + QaGroupWarehouses(fd, wire, work).
+        set failures = failures + QaGroupInvalid(fd, wire, work).
+        set failures = failures + QaGroupBatch(fd, wire, work).
+        set failures = failures + QaGroupRouting(wire, work).
+        set failures = failures + QaGroupParallelSingle(fd, wire, work).
+        set failures = failures + QaGroupParallelOpposite(fd, wire, work).
+        set failures = failures + QaGroupParallelWarehouses(fd, wire, work).
+        return QaAllPassed(failures).
+
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let arena = buffer(usize(2490368)).
+        let wire = borrow_mut(arena, usize(0), QaWireBytes()).
+        let work = borrow_mut(arena, QaWireBytes(), usize(262144)).
+        let fd = QaPgConnect(wire).
+        let ready = QaReadiness(fd, wire, work).
+        let failures = QaSuite(ready, fd, wire, work).
+        QaClose(fd).
+        borrow_end(work).
+        borrow_end(wire).
+        buffer_drop(arena).
+        return failures.

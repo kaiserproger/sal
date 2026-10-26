@@ -1,0 +1,65 @@
+use "std/postgres.sal".
+
+# Keeps the first failing check number: a check that already failed stays
+# recorded, otherwise the new code is recorded exactly when `failed` holds.
+operation FirstFailure:
+    accepts current of type i64.
+    accepts failed of type bool.
+    accepts code of type i64.
+    returns i64.
+    requires:
+        current == 0 otherwise current.
+        failed == false otherwise code.
+    body:
+        return 0.
+
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let arena = buffer(usize(64)).
+        let output = borrow_mut(arena, usize(0), usize(64)).
+        let mut failure = 0.
+        let padded = BytesDecimalPadded(42, usize(5), output).
+        set failure = FirstFailure(failure, padded != 5 || slice(view(output), usize(0), usize(5)) != bytes("00042"), 1).
+        let negative = BytesDecimalPadded(-7, usize(3), output).
+        set failure = FirstFailure(failure, negative != 4 || slice(view(output), usize(0), usize(4)) != bytes("-007"), 2).
+        let minimum = -9223372036854775808.
+        let signed = BytesDecimal(minimum, output).
+        set failure = FirstFailure(failure, signed != 20 || slice(view(output), usize(0), usize(20)) != bytes("-9223372036854775808"), 3).
+        let framed = PgPutI64(42, usize(19), output).
+        set failure = FirstFailure(failure, framed != 23 || PgReadU32(view(output), usize(0)) != 19, 4).
+        set failure = FirstFailure(failure, slice(view(output), usize(4), usize(19)) != bytes("0000000000000000042"), 5).
+        let minimum_frame = PgPutI64(minimum, usize(0), output).
+        set failure = FirstFailure(failure, minimum_frame != 24 || PgReadU32(view(output), usize(0)) != 20, 6).
+        set failure = FirstFailure(failure, slice(view(output), usize(4), usize(20)) != bytes("-9223372036854775808"), 7).
+        put(output, usize(0), u8(77)).
+        let tiny = slice_mut(output, usize(0), usize(1)).
+        let short = BytesDecimalPadded(7, usize(2), tiny).
+        set failure = FirstFailure(failure, short != -28 || byte(view(tiny), usize(0)) != 77, 8).
+        let minus_one = 0 - 1.
+        let maximum_width = bits_as(usize, minus_one).
+        let overflow = BytesDecimalPadded(-7, maximum_width, tiny).
+        set failure = FirstFailure(failure, overflow != -28 || byte(view(tiny), usize(0)) != 77, 9).
+        let invalid_frame = PgPutI64(-7, maximum_width, tiny).
+        set failure = FirstFailure(failure, invalid_frame != -75 || byte(view(tiny), usize(0)) != 77, 10).
+        borrow_end(tiny).
+        let empty = slice_mut(output, usize(0), usize(0)).
+        let no_room = PgPutI64(0, usize(0), empty).
+        set failure = FirstFailure(failure, no_room != -28, 11).
+        borrow_end(empty).
+        let prior_error = BytesAppend(output, -75, bytes("x")).
+        set failure = FirstFailure(failure, prior_error != -75 || byte(output, usize(0)) != 77, 12).
+        let invalid_cursor = BytesAppend(output, 65, bytes("x")).
+        set failure = FirstFailure(failure, invalid_cursor != -28 || byte(output, usize(0)) != 77, 13).
+        let prefix = BytesAppend(output, 0, bytes("ab")).
+        let next = BytesDecimalAt(output, prefix, -7).
+        set failure = FirstFailure(failure, next != 4 || slice(view(output), usize(0), usize(4)) != bytes("ab-7"), 14).
+        put(output, usize(63), u8(77)).
+        let exhausted = BytesAppend(output, 63, bytes("xy")).
+        set failure = FirstFailure(failure, exhausted != -28 || byte(output, usize(63)) != 77, 15).
+        let at_end = BytesAppend(output, 64, bytes("")).
+        set failure = FirstFailure(failure, at_end != 64 || BytesDecimalAt(output, -75, 1) != -75, 16).
+        borrow_end(output).
+        buffer_drop(arena).
+        return failure.

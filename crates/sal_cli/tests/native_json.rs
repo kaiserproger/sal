@@ -16,9 +16,9 @@ impl Fixture {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(path.join("linux")).expect("fixture directory");
+        std::fs::create_dir_all(&path).expect("fixture directory");
         let library = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../stdlib");
-        for name in ["bytes.sal", "json.sal", "linux/memory.sal"] {
+        for name in ["bytes.sal", "text.sal", "json.sal"] {
             std::fs::copy(library.join(name), path.join(name)).expect("copy real SAL library");
         }
         Self(path)
@@ -26,9 +26,9 @@ impl Fixture {
 
     fn execute(&self, checks: &Checks) {
         let source = format!(
-            "use \"json.sal\".\nuse \"linux/memory.sal\".\n\
-             operation Main:\n    returns i64.\n    effects: SystemCall, UnsafeMemory.\n    body:\n\
-             {}        return 0.\n",
+            "use \"json.sal\".\n\
+             operation Main:\n    returns i64.\n    effects: SystemCall.\n    body:\n\
+             \x20       let mut failure = 0.\n{}        return failure.\n",
             checks.body
         );
         let source_path = self.0.join("case.sal");
@@ -92,6 +92,7 @@ fn success(output: &Output) {
 struct Checks {
     body: String,
     expressions: Vec<String>,
+    raws: usize,
 }
 impl Checks {
     fn expect(&mut self, expression: impl AsRef<str>, expected: impl std::fmt::Display) {
@@ -101,25 +102,40 @@ impl Checks {
         assert!(code < 256, "exit codes must remain distinct");
         writeln!(
             self.body,
-            "        if {expression} != {expected}:\n            return {code}."
+            "        if failure == 0 && {expression} != {expected}:\n            set failure = {code}."
         )
         .unwrap();
     }
     fn memory(&mut self) {
         self.body.push_str(concat!(
-            "        let mapping = LinuxMapMemory(usize(4096)).\n",
-            "        if mapping < 0:\n            return 255.\n",
-            "        let buffer = usize(mapping).\n",
-            "        let output = buffer + 1024.\n",
+            "        let store = buffer(usize(4096)).\n",
+            "        let buffer = borrow_mut(store, usize(0), usize(1024)).\n",
+            "        let output = borrow_mut(store, usize(1024), usize(3072)).\n",
         ));
     }
     fn raw(&mut self, value: &[u8]) {
         for (offset, value) in value.iter().enumerate() {
-            writeln!(self.body, "        store8(buffer + {offset}, u8({value})).").unwrap();
+            writeln!(
+                self.body,
+                "        put(buffer, usize({offset}), u8({value}))."
+            )
+            .unwrap();
         }
+        let tag = self.raws;
+        self.raws += 1;
+        writeln!(
+            self.body,
+            "        let rawInput{tag} = view(buffer).\n        let rawView{tag} = slice(rawInput{tag}, usize(0), usize({})).",
+            value.len()
+        )
+        .unwrap();
     }
     fn finish_memory(&mut self) {
-        self.expect("LinuxUnmapMemory(buffer, usize(4096))", 0);
+        self.body.push_str(concat!(
+            "        borrow_end(buffer).\n",
+            "        borrow_end(output).\n",
+            "        buffer_drop(store).\n",
+        ));
     }
 }
 fn text(value: &str) -> String {
@@ -279,6 +295,50 @@ fn explicit_depth_budget_and_default_64_are_enforced() {
 }
 
 #[test]
+fn shared_utf8_scanner_preserves_json_scalar_and_escape_boundaries() {
+    let mut checks = Checks::default();
+    for (input, start, expected) in [
+        ("", 0, -22),
+        ("a", 1, -22),
+        ("a", 2, -22),
+        ("a", 0, 97),
+        ("é", 0, 233),
+        ("雪", 0, 38634),
+        ("😀", 0, 128512),
+        ("é", 1, -22),
+    ] {
+        checks.expect(
+            format!("JsonUtf8Scalar({}, usize({start}))", bytes(input)),
+            expected,
+        );
+    }
+    for (input, expected) in [
+        ("\\\"", 34),
+        ("\\\\", 92),
+        ("\\/", 47),
+        ("\\b", 8),
+        ("\\f", 12),
+        ("\\n", 10),
+        ("\\r", 13),
+        ("\\t", 9),
+        ("\\x", -22),
+        ("\\uD7FF", 55295),
+        ("\\uE000", 57344),
+        ("\\uD800\\uDC00", 65536),
+        ("\\uDBFF\\uDFFF", 1114111),
+        ("\\uD800\\uDBFF", -22),
+        ("\\uD800\\uE000", -22),
+        ("\\uDC00", -22),
+    ] {
+        checks.expect(
+            format!("JsonEscapeScalar({}, usize(0))", bytes(input)),
+            expected,
+        );
+    }
+    Fixture::new().execute(&checks);
+}
+
+#[test]
 fn string_scanning_checks_escapes_utf8_and_surrogate_pairs() {
     let mut checks = Checks::default();
     for input in [
@@ -361,65 +421,72 @@ fn unsigned_integers_have_exact_grammar_and_overflow_errors() {
 fn decode_and_encode_exact_bytes_capacity_edges_and_no_terminator() {
     let mut checks = Checks::default();
     checks.memory();
+    // Fixed-position helpers: sentinel windows check no-terminator writes.
+    checks.body.push_str(concat!(
+        "        let sentinel = slice_mut(output, usize(128), usize(8)).\n",
+        "        put(sentinel, usize(0), u8(255)).\n",
+        "        borrow_end(sentinel).\n",
+    ));
     let encoded = "\"A\\u0000\\b\\f\\n\\r\\t\\\"\\\\\\/é\\u96ea\\ud83d\\ude00\"";
     let decoded = "A\0\u{8}\u{c}\n\r\t\"\\/é雪😀";
-    checks
-        .body
-        .push_str("        store8(output + 128, u8(255)).\n");
-    checks.expect(
-        format!(
-            "JsonDecodeString({}, usize(0), output, usize(128))",
-            bytes(encoded)
-        ),
-        decoded.len(),
-    );
-    checks.expect(
-        format!("bytes_at(output, usize({}))", decoded.len()),
-        bytes(decoded),
-    );
-    checks.body.push_str(&format!(
-        "        store8(output + {}, u8(255)).\n",
-        decoded.len()
+    checks.body.push_str(concat!(
+        "        let full = slice_mut(output, usize(0), usize(128)).\n",
+        "        let fullCount = JsonDecodeString(bytes(\"\\\"A\\\\u0000\\\\b\\\\f\\\\n\\\\r\\\\t\\\\\\\"\\\\\\\\\\\\/é\\\\u96ea\\\\ud83d\\\\ude00\\\"\"), usize(0), full).\n",
+        "        borrow_end(full).\n",
     ));
-    checks.expect(
-        format!(
-            "JsonDecodeString({}, usize(0), output, usize({}))",
-            bytes(encoded),
-            decoded.len()
-        ),
+    checks.expect("fullCount", decoded.len());
+    checks.body.push_str(concat!(
+        "        let gotView = view(output).\n",
+        "        let got = slice(gotView, usize(0), usize(fullCount)).\n",
+    ));
+    checks.expect("got", bytes(decoded));
+    checks.body.push_str(concat!(
+        "        borrow_end(gotView).\n",
+        "        borrow_end(got).\n",
+        "        let exactCap = slice_mut(output, usize(0), usize(17)).\n",
+        "        put(exactCap, usize(10), u8(255)).\n",
+        "        borrow_end(exactCap).\n",
+    ));
+    checks.body.push_str(&format!(
+        "        let exact = slice_mut(output, usize(0), usize({})).\n        let exactCount = JsonDecodeString({}, usize(0), exact).\n        borrow_end(exact).\n",
         decoded.len(),
+        bytes(encoded),
+    ));
+    checks.expect("exactCount", decoded.len());
+    checks.body.push_str(
+        "        let edgeView = view(output).\n        let edgeByte = slice(edgeView, usize(10), usize(1)).\n",
     );
-    checks.expect(format!("load8(output + {})", decoded.len()), "u8(255)");
-    checks.expect(
-        format!(
-            "JsonDecodeString({}, usize(0), output, usize({}))",
-            bytes(encoded),
-            decoded.len() - 1
-        ),
-        -28,
-    );
-    checks.expect(
-        format!(
-            "JsonDecodeString({}, usize(0), output, usize(0))",
-            bytes("\"\"")
-        ),
-        0,
-    );
-    checks.expect(
-        format!(
-            "JsonDecodeString({}, usize(0), output, usize(0))",
-            bytes("\"x\"")
-        ),
-        -28,
-    );
-    checks.expect(
-        format!(
-            "JsonDecodeString({}, usize(2), output, usize(1))",
-            bytes("xx\"A\"junk")
-        ),
-        1,
-    );
-    for input in [
+    // The poisoned byte at offset 10 must be overwritten by the UTF-8 lead byte of é.
+    checks.expect("edgeByte", "slice(bytes(\"é\"), usize(0), usize(1))");
+    checks.body.push_str(concat!(
+        "        borrow_end(edgeView).\n",
+        "        borrow_end(edgeByte).\n",
+    ));
+    checks.body.push_str(&format!(
+        "        let short = slice_mut(output, usize(0), usize({})).\n        let shortCount = JsonDecodeString({}, usize(0), short).\n        borrow_end(short).\n",
+        decoded.len() - 1,
+        bytes(encoded),
+    ));
+    checks.expect("shortCount", -28);
+    checks.body.push_str(concat!(
+        "        let empty = slice_mut(output, usize(0), usize(0)).\n",
+        "        let emptyCount = JsonDecodeString(bytes(\"\\\"\\\"\"), usize(0), empty).\n",
+        "        borrow_end(empty).\n",
+    ));
+    checks.expect("emptyCount", 0);
+    checks.body.push_str(concat!(
+        "        let missing = slice_mut(output, usize(0), usize(0)).\n",
+        "        let missingCount = JsonDecodeString(bytes(\"\\\"x\\\"\"), usize(0), missing).\n",
+        "        borrow_end(missing).\n",
+    ));
+    checks.expect("missingCount", -28);
+    checks.body.push_str(concat!(
+        "        let shifted = slice_mut(output, usize(0), usize(1)).\n",
+        "        let shiftedCount = JsonDecodeString(bytes(\"xx\\\"A\\\"junk\"), usize(2), shifted).\n",
+        "        borrow_end(shifted).\n",
+    ));
+    checks.expect("shiftedCount", 1);
+    for (index, input) in [
         "\"a\\x\"",
         "\"a",
         "\"\\uD800\"",
@@ -427,19 +494,22 @@ fn decode_and_encode_exact_bytes_capacity_edges_and_no_terminator() {
         "\"\n\"",
         "x",
         "",
-    ] {
-        checks.expect(
-            format!(
-                "JsonDecodeString({}, usize(0), output, usize(128))",
-                bytes(input)
-            ),
-            -22,
-        );
+    ]
+    .iter()
+    .enumerate()
+    {
+        checks.body.push_str(&format!(
+            "        let bad{index} = slice_mut(output, usize(0), usize(128)).\n        let badCount{index} = JsonDecodeString({}, usize(0), bad{index}).\n        borrow_end(bad{index}).\n",
+            bytes(input),
+        ));
+        checks.expect(format!("badCount{index}"), -22);
     }
-    checks.expect(
-        "JsonDecodeString(bytes(\"\"), usize(1), output, usize(128))",
-        -22,
-    );
+    checks.body.push_str(concat!(
+        "        let past = slice_mut(output, usize(0), usize(128)).\n",
+        "        let pastCount = JsonDecodeString(bytes(\"\"), usize(1), past).\n",
+        "        borrow_end(past).\n",
+    ));
+    checks.expect("pastCount", -22);
     let controls: String = (0..32).map(char::from).collect();
     let value = format!("{controls}\"\\/é雪😀");
     let mut expected = String::from("\"");
@@ -448,50 +518,55 @@ fn decode_and_encode_exact_bytes_capacity_edges_and_no_terminator() {
     }
     expected.push_str("\\\"\\\\/é雪😀\"");
     checks.body.push_str(&format!(
-        "        store8(output + {}, u8(255)).\n",
-        expected.len()
-    ));
-    checks.expect(
-        format!(
-            "JsonWriteString({}, output, usize({}))",
-            bytes(&value),
-            expected.len()
-        ),
+        "        let wide = slice_mut(output, usize(0), usize({})).\n        let wideCount = JsonWriteString({}, wide).\n        borrow_end(wide).\n",
         expected.len(),
+        bytes(&value),
+    ));
+    checks.expect("wideCount", expected.len());
+    checks.body.push_str(
+        "        let wideView = view(output).\n        let wideBytes = slice(wideView, usize(0), usize(wideCount)).\n",
     );
-    checks.expect(
-        format!("bytes_at(output, usize({}))", expected.len()),
-        bytes(&expected),
-    );
-    checks.expect(format!("load8(output + {})", expected.len()), "u8(255)");
-    checks.expect(
-        format!(
-            "JsonWriteString({}, output, usize({}))",
-            bytes(&value),
-            expected.len() - 1
-        ),
-        -28,
-    );
-    for capacity in [0, 1] {
-        checks.expect(
-            format!("JsonWriteString(bytes(\"\"), output, usize({capacity}))"),
-            -28,
-        );
+    checks.expect("wideBytes", bytes(&expected));
+    checks.body.push_str(concat!(
+        "        borrow_end(wideView).\n",
+        "        borrow_end(wideBytes).\n",
+    ));
+    checks.body.push_str(&format!(
+        "        let narrow = slice_mut(output, usize(0), usize({})).\n        let narrowCount = JsonWriteString({}, narrow).\n        borrow_end(narrow).\n",
+        expected.len() - 1,
+        bytes(&value),
+    ));
+    checks.expect("narrowCount", -28);
+    for (index, capacity) in [0usize, 1usize].iter().enumerate() {
+        checks.body.push_str(&format!(
+            "        let cap{index} = slice_mut(output, usize(0), usize({capacity})).\n        let capCount{index} = JsonWriteString(bytes(\"\"), cap{index}).\n        borrow_end(cap{index}).\n",
+        ));
+        checks.expect(format!("capCount{index}"), -28);
     }
-    checks.expect("JsonWriteString(bytes(\"\"), output, usize(2))", 2);
-    checks.expect("bytes_at(output, usize(2))", bytes("\"\""));
-    for (value, capacity) in [("x", 2), ("\0", 6), ("\"", 3), ("😀", 5)] {
-        checks
-            .body
-            .push_str(&format!("        store8(output + {capacity}, u8(255)).\n"));
-        checks.expect(
-            format!(
-                "JsonWriteString({}, output, usize({capacity}))",
-                bytes(value)
-            ),
-            -28,
-        );
-        checks.expect(format!("load8(output + {capacity})"), "u8(255)");
+    checks.body.push_str(concat!(
+        "        let pair = slice_mut(output, usize(0), usize(2)).\n",
+        "        let pairCount = JsonWriteString(bytes(\"\"), pair).\n",
+        "        borrow_end(pair).\n",
+    ));
+    checks.expect("pairCount", 2);
+    checks.body.push_str(concat!(
+        "        let pairView = view(output).\n",
+        "        let pairBytes = slice(pairView, usize(0), usize(pairCount)).\n",
+    ));
+    checks.expect("pairBytes", bytes("\"\""));
+    checks.body.push_str(concat!(
+        "        borrow_end(pairView).\n",
+        "        borrow_end(pairBytes).\n",
+    ));
+    for (index, (value, capacity)) in [("x", 2), ("\0", 6), ("\"", 3), ("😀", 5)]
+        .iter()
+        .enumerate()
+    {
+        checks.body.push_str(&format!(
+            "        let edgeWin{index} = slice_mut(output, usize(0), usize({capacity})).\n        let edgeCount{index} = JsonWriteString({}, edgeWin{index}).\n        borrow_end(edgeWin{index}).\n",
+            bytes(value),
+        ));
+        checks.expect(format!("edgeCount{index}"), -28);
     }
     checks.finish_memory();
     Fixture::new().execute(&checks);
@@ -523,18 +598,26 @@ fn malformed_raw_utf8_is_rejected_by_all_string_paths() {
         quoted.extend_from_slice(invalid);
         quoted.push(b'"');
         checks.raw(&quoted);
-        let input = format!("bytes_at(buffer, usize({}))", quoted.len());
+        let suffix = checks.raws - 1;
+        let input = format!("rawView{suffix}");
+        let base = format!("rawInput{suffix}");
         checks.expect(format!("JsonStringEnd({input}, usize(0))"), -22);
         checks.expect(format!("JsonValidate({input})"), "false");
-        checks.expect(
-            format!("JsonDecodeString({input}, usize(0), output, usize(128))"),
-            -22,
-        );
-        let raw = format!("bytes_at(buffer + 1, usize({}))", invalid.len());
-        checks.expect(format!("JsonWriteString({raw}, output, usize(128))"), -22);
+        checks.body.push_str(&format!(
+            "        let badWin{suffix} = slice_mut(output, usize(0), usize(128)).\n        let badCount{suffix} = JsonDecodeString({input}, usize(0), badWin{suffix}).\n        borrow_end(badWin{suffix}).\n",
+        ));
+        checks.expect(format!("badCount{suffix}"), -22);
+        // Invalid scalar write path: each raw byte fails through JsonWriteString.
+        checks.body.push_str(&format!(
+            "        let rawWin{suffix} = slice_mut(output, usize(0), usize(128)).\n        let rawSingle{suffix} = slice({base}, usize(1), usize(1)).\n        let rawCount{suffix} = JsonWriteString(rawSingle{suffix}, rawWin{suffix}).\n        borrow_end(rawWin{suffix}).\n        borrow_end(rawSingle{suffix}).\n",
+        ));
+        checks.expect(format!("rawCount{suffix}"), -22);
+        checks.body.push_str(&format!(
+            "        borrow_end({base}).\n        borrow_end({input}).\n",
+        ));
     }
     // The exact legal boundaries adjacent to overlongs/surrogates/out-of-range values.
-    for valid in [
+    for (index, valid) in [
         "\u{7f}",
         "\u{80}",
         "\u{7ff}",
@@ -544,27 +627,35 @@ fn malformed_raw_utf8_is_rejected_by_all_string_paths() {
         "\u{ffff}",
         "\u{10000}",
         "\u{10ffff}",
-    ] {
+    ]
+    .iter()
+    .enumerate()
+    {
         let quoted = format!("\"{valid}\"");
-        checks.expect(
-            format!(
-                "JsonDecodeString({}, usize(0), output, usize(4))",
-                bytes(&quoted)
-            ),
-            valid.len(),
-        );
-        checks.expect(
-            format!("bytes_at(output, usize({}))", valid.len()),
-            bytes(valid),
-        );
-        checks.expect(
-            format!("JsonWriteString({}, output, usize(8))", bytes(valid)),
-            quoted.len(),
-        );
-        checks.expect(
-            format!("bytes_at(output, usize({}))", quoted.len()),
+        checks.body.push_str(&format!(
+            "        let edge{index} = slice_mut(output, usize(0), usize(4)).\n        let edgeCount{index} = JsonDecodeString({}, usize(0), edge{index}).\n        borrow_end(edge{index}).\n",
             bytes(&quoted),
-        );
+        ));
+        checks.expect(format!("edgeCount{index}"), valid.len());
+        checks.body.push_str(&format!(
+            "        let edgeView{index} = view(output).\n        let edgeBytes{index} = slice(edgeView{index}, usize(0), usize(edgeCount{index})).\n",
+        ));
+        checks.expect(format!("edgeBytes{index}"), bytes(valid));
+        checks.body.push_str(&format!(
+            "        borrow_end(edgeView{index}).\n        borrow_end(edgeBytes{index}).\n",
+        ));
+        checks.body.push_str(&format!(
+            "        let word{index} = slice_mut(output, usize(0), usize(8)).\n        let wordCount{index} = JsonWriteString({}, word{index}).\n        borrow_end(word{index}).\n",
+            bytes(valid),
+        ));
+        checks.expect(format!("wordCount{index}"), quoted.len());
+        checks.body.push_str(&format!(
+            "        let wordView{index} = view(output).\n        let wordBytes{index} = slice(wordView{index}, usize(0), usize(wordCount{index})).\n",
+        ));
+        checks.expect(format!("wordBytes{index}"), bytes(&quoted));
+        checks.body.push_str(&format!(
+            "        borrow_end(wordView{index}).\n        borrow_end(wordBytes{index}).\n",
+        ));
     }
     checks.finish_memory();
     Fixture::new().execute(&checks);

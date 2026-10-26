@@ -1,0 +1,286 @@
+use "std/buffer.sal".
+use "std/bytes.sal".
+use "std/concurrency.sal".
+use "std/net.sal".
+use "std/linux/io.sal".
+
+# Keeps the first failing check number: a check that already failed stays
+# recorded, otherwise the new code is recorded exactly when `failed` holds.
+operation FirstFailure:
+    accepts current of type i64.
+    accepts failed of type bool.
+    accepts code of type i64.
+    returns i64.
+    requires:
+        current == 0 otherwise current.
+        failed == false otherwise code.
+    body:
+        return 0.
+
+# Exchange helpers borrow a caller-owned arena. The owning wrappers release
+# their one Buffer and descriptor once, regardless of the reported check.
+operation ServerExchange:
+    accepts client of type i64.
+    accepts arena of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        len(arena) >= usize(2) otherwise 21.
+    body:
+        let probe = slice_mut(arena, usize(0), usize(2)).
+        let seen = LinuxReadInto(client, probe).
+        borrow_end(probe).
+        let frame = view(arena).
+        let payload = slice(frame, usize(0), usize(2)).
+        let same = payload == bytes("PQ").
+        let echoed = LinuxWriteAll(client, payload).
+        borrow_end(payload).
+        borrow_end(frame).
+        let mut failure = FirstFailure(0, seen != 2, 22).
+        set failure = FirstFailure(failure, same == false, 23).
+        return FirstFailure(failure, echoed != 2, 24).
+
+operation ServerWorker:
+    accepts listener of type i64.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let arena = buffer(usize(8192)).
+        let mut failure = 21.
+        let client = NetTcpAccept(listener).
+        if client >= 0:
+            let scratch = borrow_mut(arena, usize(0), usize(8192)).
+            set failure = ServerExchange(client, scratch).
+            borrow_end(scratch).
+            LinuxClose(client).
+        buffer_drop(arena).
+        return failure.
+
+# The 2-byte request, sent only while no earlier check failed.
+operation ClientSend:
+    accepts failure of type i64.
+    accepts fd of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        failure == 0 otherwise failure.
+    body:
+        return FirstFailure(0, LinuxWriteAll(fd, bytes("PQ")) != 2, 33).
+
+# The 2-byte echo, read only while no earlier check failed (a failed request
+# must not block on a reply that never comes).
+operation ClientReply:
+    accepts failure of type i64.
+    accepts fd of type i64.
+    accepts arena of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        failure == 0 otherwise failure.
+    body:
+        let reply = slice_mut(arena, usize(0), usize(2)).
+        let received = LinuxReadInto(fd, reply).
+        borrow_end(reply).
+        let echoed = view(arena).
+        let payload = slice(echoed, usize(0), usize(2)).
+        let same = payload == bytes("PQ").
+        borrow_end(payload).
+        borrow_end(echoed).
+        return FirstFailure(FirstFailure(0, received != 2, 34), same == false, 35).
+
+operation ClientExchange:
+    accepts fd of type i64.
+    accepts arena of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        len(arena) >= usize(2) otherwise 34.
+    body:
+        let mut failure = FirstFailure(0, NetPollOne(fd, 5000) < 0, 32).
+        set failure = ClientSend(failure, fd).
+        set failure = ClientReply(failure, fd, arena).
+        let late = NetPollOne(fd, 0).
+        return FirstFailure(failure, late != 0 && late != 1, 36).
+
+operation ClientDriver:
+    accepts port of type i64.
+    returns i64.
+    effects: SystemCall.
+    body:
+        let fd = NetTcpConnect(u64(2130706433), port).
+        if fd < 0:
+            return 31.
+        let arena = buffer(usize(2048)).
+        let scratch = borrow_mut(arena, usize(0), usize(2048)).
+        let failure = ClientExchange(fd, scratch).
+        borrow_end(scratch).
+        LinuxClose(fd).
+        buffer_drop(arena).
+        return failure.
+
+# One datagram to the peer, sent only while no earlier check failed (a failed
+# send must not leave the next receive blocking forever).
+operation UdpSend:
+    accepts failure of type i64.
+    accepts from of type i64.
+    accepts peer of type i64.
+    accepts payload of type Bytes.
+    accepts sent of type i64.
+    accepts code of type i64.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        failure == 0 otherwise failure.
+    body:
+        return FirstFailure(0, NetUdpSend(from, u64(2130706433), peer, payload) != sent, code).
+
+# Receive into the first `window` bytes of the arena, only while no earlier
+# check failed; otherwise a datagram that fails every later check.
+operation UdpReceive:
+    accepts failure of type i64.
+    accepts socket of type i64.
+    accepts arena of type MutBytes.
+    accepts window of type usize.
+    returns NetDatagram.
+    effects: SystemCall.
+    requires:
+        failure == 0 otherwise NetDatagram(-22, usize(0), u64(0), 0).
+    body:
+        let slot = slice_mut(arena, usize(0), window).
+        let arrived = NetUdpReceive(socket, slot).
+        borrow_end(slot).
+        return arrived.
+
+operation DatagramChecks:
+    accepts first of type i64.
+    accepts second of type i64.
+    accepts peer of type i64.
+    accepts arena of type MutBytes.
+    returns i64.
+    effects: SystemCall.
+    requires:
+        len(arena) >= usize(3) otherwise 44.
+    body:
+        let mut failure = UdpSend(0, second, peer, bytes("ABC"), 3, 44).
+        let arrived = UdpReceive(failure, first, arena, usize(3)).
+        set failure = FirstFailure(failure, arrived.status != 3, 45).
+        set failure = FirstFailure(failure, arrived.address != u64(2130706433), 46).
+        let source = NetLocalPort(second).
+        set failure = FirstFailure(failure, source < 1 || source > 65535, 47).
+        set failure = FirstFailure(failure, arrived.port != source, 48).
+        set failure = UdpSend(failure, second, peer, bytes("ABC"), 3, 49).
+        let clipped = UdpReceive(failure, first, arena, usize(2)).
+        set failure = FirstFailure(failure, clipped.status != -28, 50).
+        set failure = UdpSend(failure, second, peer, bytes(""), 0, 51).
+        let zeroArrived = UdpReceive(failure, first, arena, usize(0)).
+        set failure = FirstFailure(failure, zeroArrived.status != 0 || zeroArrived.length != usize(0), 52).
+        set failure = FirstFailure(failure, zeroArrived.address != u64(2130706433), 53).
+        set failure = FirstFailure(failure, zeroArrived.port != source, 54).
+        set failure = UdpSend(failure, second, peer, bytes(""), 0, 55).
+        let zeroIntoZeroGot = UdpReceive(failure, first, arena, usize(0)).
+        set failure = FirstFailure(failure, zeroIntoZeroGot.status != 0, 56).
+        set failure = UdpSend(failure, second, peer, bytes("ABC"), 3, 57).
+        let zeroClippedGot = UdpReceive(failure, first, arena, usize(0)).
+        set failure = FirstFailure(failure, zeroClippedGot.status != -28, 58).
+        let timely = NetPollOne(first, 0).
+        return FirstFailure(failure, timely != 0 && timely != 1, 59).
+
+operation DatagramRoundtrip:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let first = NetUdpBind(u64(2130706433), 0).
+        if first < 0:
+            return 41.
+        let peer = NetLocalPort(first).
+        if peer < 1 || peer > 65535:
+            LinuxClose(first).
+            return 42.
+        let second = NetUdpBind(u64(2130706433), 0).
+        if second < 0:
+            LinuxClose(first).
+            return 43.
+        let arena = buffer(usize(2048)).
+        let scratch = borrow_mut(arena, usize(0), usize(2048)).
+        let failure = DatagramChecks(first, second, peer, scratch).
+        borrow_end(scratch).
+        LinuxClose(second).
+        LinuxClose(first).
+        buffer_drop(arena).
+        return failure.
+
+operation BoundaryChecks:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        set failure = FirstFailure(failure, NetSockaddr(u64(4294967296), 80).status != -22, 1).
+        set failure = FirstFailure(failure, NetSockaddr(u64(2130706433), -1).status != -22, 2).
+        set failure = FirstFailure(failure, NetSockaddr(u64(2130706433), 65536).status != -22, 3).
+        let wire = NetSockaddr(u64(2130706433), 0).
+        set failure = FirstFailure(failure, wire.status != 0, 4).
+        set failure = FirstFailure(failure, wire.endpoint.family != u16(2), 5).
+        set failure = FirstFailure(failure, NetTcpConnect(u64(2130706433), 0) != -22, 6).
+        set failure = FirstFailure(failure, NetTcpConnect(u64(2130706433), 65536) != -22, 7).
+        set failure = FirstFailure(failure, NetTcpConnect(u64(4294967296), 80) != -22, 8).
+        set failure = FirstFailure(failure, NetTcpListen(u64(2130706433), 0, 0) != -22, 9).
+        set failure = FirstFailure(failure, NetTcpAccept(-1) != -9 && NetTcpAccept(-1) != -22, 10).
+        set failure = FirstFailure(failure, NetUdpSend(-1, u64(2130706433), 80, bytes("x")) != -9 && NetUdpSend(-1, u64(2130706433), 80, bytes("x")) != -22, 11).
+        set failure = FirstFailure(failure, NetShutdown(-1, 2) != -9 && NetShutdown(-1, 2) != -22, 12).
+        set failure = FirstFailure(failure, NetShutdown(-5, 9) != -22, 13).
+        set failure = FirstFailure(failure, NetPollOne(-1, 0) != -9 && NetPollOne(-1, 0) != -22, 14).
+        set failure = FirstFailure(failure, NetPollOne(1, 2147483648) != -22, 15).
+        set failure = FirstFailure(failure, NetLocalPort(-1) != -9 && NetLocalPort(-1) != -22, 16).
+        return failure.
+
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let boundary = BoundaryChecks().
+        if boundary != 0:
+            return boundary.
+        LinuxClose(0).
+        let zeroListener = NetTcpListen(u64(2130706433), 0, 16).
+        if zeroListener != 0:
+            if zeroListener > 0:
+                LinuxClose(zeroListener).
+            return 60.
+        if NetLocalPort(zeroListener) < 1:
+            LinuxClose(zeroListener).
+            return 61.
+        LinuxClose(zeroListener).
+        let datagrams = DatagramRoundtrip().
+        if datagrams != 0:
+            return datagrams.
+        let listener = NetTcpListen(u64(2130706433), 0, 16).
+        if listener < 0:
+            return 62.
+        let actual = NetLocalPort(listener).
+        if actual < 1 || actual > 65535:
+            LinuxClose(listener).
+            return 63.
+        let worker = spawn(ServerWorker, listener).
+        let outcome = ClientDriver(actual).
+        let stopped = NetShutdown(listener, 2).
+        let status = join(worker).
+        LinuxClose(listener).
+        let mut failure = outcome.
+        if stopped != 0:
+            set failure = 67.
+        if status != 0:
+            set failure = status.
+        if failure != 0:
+            return failure.
+        let idle = NetTcpListen(u64(2130706433), 0, 1).
+        if idle < 0:
+            return 64.
+        let quiet = NetPollOne(idle, 10).
+        if quiet != 0 && quiet != 1:
+            LinuxClose(idle).
+            return 65.
+        if NetShutdown(idle, 2) != 0:
+            LinuxClose(idle).
+            return 66.
+        LinuxClose(idle).
+        return 0.

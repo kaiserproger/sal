@@ -1,0 +1,575 @@
+# Solaris wire framing + BlockPos packet ported to safe SAL.
+#
+# Source (read-only reference, never copied as bytes):
+# - crates/mc-protocol/src/codec.rs: ReadMc::read_varint/read_varlong,
+#   WriteMc::write_varint/write_varlong (two's-complement little-endian
+#   base-128, VarInt at most 5 bytes, VarLong at most 10), read_i64/write_i64
+#   big-endian, plus the length-prefixed framing shape the packet layer uses.
+# - crates/mc-protocol/src/packets/play.rs: pack_block_pos/unpack_block_pos
+#   (see positions.sal for the field layout).
+#
+# Composition: VarInt/VarLong and big-endian codecs come from the real
+# std/binary.sal library (BinaryVarIntRead/Write, BinaryVarLongRead/Write,
+# BinaryReadI64Be/BinaryWriteI64Be, BinaryVarIntLength/BinaryVarLongLength);
+# packing/unpacking and the negative-coordinate chunk workflow come from
+# positions.sal (SolarisPackBlockPos, SolarisUnpackBlockPos,
+# SolarisChunkCellOf over std/math.sal floor helpers). No local codec copies,
+# no UnsafeMemory, no raw addresses, no foreign callbacks: all state lives
+# in the caller's Buffer, borrowed as MutBytes and written with put; reads go
+# through Bytes views. Effects are pure throughout except Main's SystemCall
+# for Buffer allocation.
+#
+# Packet layout composed here (framing mirrors mc-protocol: VarInt byte
+# length, then body): VarInt packet id ++ 8-byte big-endian packed BlockPos.
+# The id values below are illustrative framing inputs, not a claimed vanilla
+# packet number; the position payload is the genuine pack_block_pos form.
+#
+# Error vocabulary: 0 success; -28 output capacity (preflighted, so a failed
+# write leaves the span untouched); -61 short body or negative declared
+# length; every other malformed input surfaces the binary library's own -22
+# (truncation, continuation on the 5th/10th byte, 5th-byte payload above 15,
+# 10th-byte payload above 1). Bounded non-minimal encodings decode like the
+# Solaris reference (0x80 0x00 reads 0 consuming 2).
+use "positions.sal".
+use "std/binary.sal".
+
+entity SolarisPacket:
+    layout "C".
+    has status of type i64.
+    has id of type i32.
+    has x of type i32.
+    has y of type i32.
+    has z of type i32.
+    has next of type usize.
+
+# Encode one framed block-position record: VarInt length ++ VarInt id ++
+# BE64 packed position. Returns the end offset, or -22/-28 with nothing
+# published when an offset is out of range or the whole frame does not fit.
+operation SolarisEncodeBlockPacket:
+    accepts span of type MutBytes.
+    accepts offset of type usize.
+    accepts id of type i32.
+    accepts x of type i32.
+    accepts y of type i32.
+    accepts z of type i32.
+    returns i64.
+    body:
+        let bodyLength = BinaryVarIntLength(i64(id)) + 8.
+        let frameLength = BinaryVarIntLength(bodyLength) + bodyLength.
+        if offset > len(span):
+            return -22.
+        if len(span) - offset < usize(frameLength):
+            return -28.
+        let first = BinaryVarIntWrite(span, offset, bodyLength).
+        if first < 0:
+            return first.
+        let second = BinaryVarIntWrite(span, offset + usize(first), i64(id)).
+        if second < 0:
+            return second.
+        let third = BinaryWriteI64Be(span, offset + usize(first) + usize(second), SolarisPackBlockPos(x, y, z)).
+        if third < 0:
+            return third.
+        return i64(offset + usize(first) + usize(second) + usize(third)).
+
+# Decode one framed block-position record. The declared length must equal
+# exactly the id bytes plus 8 position bytes; any overrun, shortfall, codec
+# error, or negative length fails with that status and next echoing offset.
+operation SolarisDecodeBlockPacket:
+    accepts data of type Bytes.
+    accepts offset of type usize.
+    returns SolarisPacket.
+    body:
+        let length = BinaryVarIntRead(data, offset).
+        if length.status != 0:
+            return SolarisPacket(length.status, 0, 0, 0, 0, offset).
+        if length.value < 0:
+            return SolarisPacket(-61, 0, 0, 0, 0, offset).
+        if offset + length.consumed > len(data):
+            return SolarisPacket(-61, 0, 0, 0, 0, offset).
+        let total = usize(length.value).
+        let bodyStart = offset + length.consumed.
+        if len(data) - bodyStart < total:
+            return SolarisPacket(-61, 0, 0, 0, 0, offset).
+        if total < usize(9):
+            return SolarisPacket(-61, 0, 0, 0, 0, offset).
+        let id = BinaryVarIntRead(data, bodyStart).
+        if id.status != 0:
+            return SolarisPacket(id.status, 0, 0, 0, 0, offset).
+        if id.consumed + usize(8) != total:
+            return SolarisPacket(-61, 0, 0, 0, 0, offset).
+        let position = BinaryReadI64Be(data, bodyStart + id.consumed).
+        if position.status != 0:
+            return SolarisPacket(position.status, 0, 0, 0, 0, offset).
+        let unpacked = SolarisUnpackBlockPos(position.value).
+        return SolarisPacket(0, i32(id.value), unpacked.x, unpacked.y, unpacked.z, bodyStart + id.consumed + usize(8)).
+
+# Executable parity proof for positions.sal composed with std/binary.sal.
+# Returns 0 when every check holds, else the first failing check number.
+# Every success byte crosses a caller-owned Buffer; assertions compare exact
+# external vectors, signed boundaries, negative coordinates, and all three
+# error classes. No UnsafeMemory, no raw addresses, no mocks.
+operation Main:
+    returns i64.
+    effects: SystemCall.
+    body:
+        let mut failure = 0.
+        if PositionsMain() != 0:
+            if failure == 0:
+                set failure = 1000.
+        let arena = buffer(usize(64)).
+        let scratch = borrow_mut(arena, usize(0), usize(64)).
+        if BinaryVarIntWrite(scratch, usize(0), 0) != 1:
+            if failure == 0:
+                set failure = 1.
+        if byte(view(scratch), usize(0)) != u8(0):
+            if failure == 0:
+                set failure = 2.
+        if BinaryVarIntWrite(scratch, usize(0), 127) != 1:
+            if failure == 0:
+                set failure = 3.
+        if byte(view(scratch), usize(0)) != u8(127):
+            if failure == 0:
+                set failure = 4.
+        if BinaryVarIntWrite(scratch, usize(0), 128) != 2:
+            if failure == 0:
+                set failure = 5.
+        if byte(view(scratch), usize(0)) != u8(128):
+            if failure == 0:
+                set failure = 6.
+        if byte(view(scratch), usize(1)) != u8(1):
+            if failure == 0:
+                set failure = 7.
+        if BinaryVarIntWrite(scratch, usize(0), 300) != 2:
+            if failure == 0:
+                set failure = 8.
+        if byte(view(scratch), usize(0)) != u8(172):
+            if failure == 0:
+                set failure = 9.
+        if byte(view(scratch), usize(1)) != u8(2):
+            if failure == 0:
+                set failure = 10.
+        if BinaryVarIntWrite(scratch, usize(0), 0 - 1) != 5:
+            if failure == 0:
+                set failure = 11.
+        if byte(view(scratch), usize(0)) != u8(255):
+            if failure == 0:
+                set failure = 12.
+        if byte(view(scratch), usize(1)) != u8(255):
+            if failure == 0:
+                set failure = 13.
+        if byte(view(scratch), usize(2)) != u8(255):
+            if failure == 0:
+                set failure = 14.
+        if byte(view(scratch), usize(3)) != u8(255):
+            if failure == 0:
+                set failure = 15.
+        if byte(view(scratch), usize(4)) != u8(15):
+            if failure == 0:
+                set failure = 16.
+        let floor32 = 0 - 2147483648.
+        if BinaryVarIntWrite(scratch, usize(0), floor32) != 5:
+            if failure == 0:
+                set failure = 17.
+        if byte(view(scratch), usize(0)) != u8(128):
+            if failure == 0:
+                set failure = 18.
+        if byte(view(scratch), usize(1)) != u8(128):
+            if failure == 0:
+                set failure = 19.
+        if byte(view(scratch), usize(2)) != u8(128):
+            if failure == 0:
+                set failure = 20.
+        if byte(view(scratch), usize(3)) != u8(128):
+            if failure == 0:
+                set failure = 21.
+        if byte(view(scratch), usize(4)) != u8(8):
+            if failure == 0:
+                set failure = 22.
+        if BinaryVarIntWrite(scratch, usize(0), 2147483647) != 5:
+            if failure == 0:
+                set failure = 23.
+        if byte(view(scratch), usize(0)) != u8(255):
+            if failure == 0:
+                set failure = 24.
+        if byte(view(scratch), usize(4)) != u8(7):
+            if failure == 0:
+                set failure = 25.
+        if BinaryVarIntWrite(scratch, usize(0), 2147483648) != -22:
+            if failure == 0:
+                set failure = 26.
+        if BinaryVarIntWrite(scratch, usize(0), 0 - 2147483649) != -22:
+            if failure == 0:
+                set failure = 27.
+        if BinaryVarIntLength(0) != 1:
+            if failure == 0:
+                set failure = 28.
+        if BinaryVarIntLength(128) != 2:
+            if failure == 0:
+                set failure = 29.
+        if BinaryVarIntLength(0 - 1) != 5:
+            if failure == 0:
+                set failure = 30.
+        if BinaryVarIntLength(2147483648) != -22:
+            if failure == 0:
+                set failure = 31.
+        BinaryVarIntWrite(scratch, usize(0), 0 - 1).
+        let backNeg = BinaryVarIntRead(view(slice_mut(scratch, usize(0), usize(5))), usize(0)).
+        if backNeg.status != 0 || backNeg.value != 0 - 1 || backNeg.consumed != usize(5):
+            if failure == 0:
+                set failure = 32.
+        BinaryVarIntWrite(scratch, usize(0), 300).
+        let back300 = BinaryVarIntRead(view(slice_mut(scratch, usize(0), usize(2))), usize(0)).
+        if back300.status != 0 || back300.value != 300 || back300.consumed != usize(2):
+            if failure == 0:
+                set failure = 33.
+        BinaryVarIntWrite(scratch, usize(0), floor32).
+        let backMin = BinaryVarIntRead(view(slice_mut(scratch, usize(0), usize(5))), usize(0)).
+        if backMin.status != 0 || backMin.value != floor32 || backMin.consumed != usize(5):
+            if failure == 0:
+                set failure = 34.
+        BinaryVarIntWrite(scratch, usize(0), 2147483647).
+        let backMax = BinaryVarIntRead(view(slice_mut(scratch, usize(0), usize(5))), usize(0)).
+        if backMax.status != 0 || backMax.value != 2147483647 || backMax.consumed != usize(5):
+            if failure == 0:
+                set failure = 35.
+        if BinaryVarIntRead(bytes(""), usize(0)).status != -22:
+            if failure == 0:
+                set failure = 36.
+        put(scratch, usize(0), u8(128)).
+        if BinaryVarIntRead(view(slice_mut(scratch, usize(0), usize(1))), usize(0)).status != -22:
+            if failure == 0:
+                set failure = 37.
+        put(scratch, usize(0), u8(255)).
+        put(scratch, usize(1), u8(255)).
+        put(scratch, usize(2), u8(255)).
+        put(scratch, usize(3), u8(255)).
+        put(scratch, usize(4), u8(255)).
+        if BinaryVarIntRead(view(slice_mut(scratch, usize(0), usize(5))), usize(0)).status != -22:
+            if failure == 0:
+                set failure = 38.
+        put(scratch, usize(4), u8(127)).
+        if BinaryVarIntRead(view(slice_mut(scratch, usize(0), usize(5))), usize(0)).status != -22:
+            if failure == 0:
+                set failure = 39.
+        put(scratch, usize(0), u8(128)).
+        put(scratch, usize(1), u8(0)).
+        let overlong = BinaryVarIntRead(view(slice_mut(scratch, usize(0), usize(2))), usize(0)).
+        if overlong.status != 0 || overlong.value != 0 || overlong.consumed != usize(2):
+            if failure == 0:
+                set failure = 40.
+        if BinaryVarLongWrite(scratch, usize(0), 0) != 1:
+            if failure == 0:
+                set failure = 41.
+        if byte(view(scratch), usize(0)) != u8(0):
+            if failure == 0:
+                set failure = 42.
+        if BinaryVarLongWrite(scratch, usize(0), 128) != 2:
+            if failure == 0:
+                set failure = 43.
+        if byte(view(scratch), usize(0)) != u8(128):
+            if failure == 0:
+                set failure = 44.
+        if byte(view(scratch), usize(1)) != u8(1):
+            if failure == 0:
+                set failure = 45.
+        let floor64 = 0 - 9223372036854775807 - 1.
+        if BinaryVarLongWrite(scratch, usize(0), 0 - 1) != 10:
+            if failure == 0:
+                set failure = 46.
+        if byte(view(scratch), usize(0)) != u8(255):
+            if failure == 0:
+                set failure = 47.
+        if byte(view(scratch), usize(8)) != u8(255):
+            if failure == 0:
+                set failure = 48.
+        if byte(view(scratch), usize(9)) != u8(1):
+            if failure == 0:
+                set failure = 49.
+        if BinaryVarLongWrite(scratch, usize(0), floor64) != 10:
+            if failure == 0:
+                set failure = 50.
+        if byte(view(scratch), usize(0)) != u8(128):
+            if failure == 0:
+                set failure = 51.
+        if byte(view(scratch), usize(8)) != u8(128):
+            if failure == 0:
+                set failure = 52.
+        if byte(view(scratch), usize(9)) != u8(1):
+            if failure == 0:
+                set failure = 53.
+        if BinaryVarLongWrite(scratch, usize(0), 9223372036854775807) != 9:
+            if failure == 0:
+                set failure = 54.
+        if byte(view(scratch), usize(0)) != u8(255):
+            if failure == 0:
+                set failure = 55.
+        if byte(view(scratch), usize(7)) != u8(255):
+            if failure == 0:
+                set failure = 56.
+        if byte(view(scratch), usize(8)) != u8(127):
+            if failure == 0:
+                set failure = 57.
+        if BinaryVarLongLength(0) != 1:
+            if failure == 0:
+                set failure = 58.
+        if BinaryVarLongLength(0 - 1) != 10:
+            if failure == 0:
+                set failure = 59.
+        BinaryVarLongWrite(scratch, usize(0), 0 - 1).
+        let backLongNeg = BinaryVarLongRead(view(slice_mut(scratch, usize(0), usize(10))), usize(0)).
+        if backLongNeg.status != 0 || backLongNeg.value != 0 - 1 || backLongNeg.consumed != usize(10):
+            if failure == 0:
+                set failure = 60.
+        BinaryVarLongWrite(scratch, usize(0), floor64).
+        let backLongMin = BinaryVarLongRead(view(slice_mut(scratch, usize(0), usize(10))), usize(0)).
+        if backLongMin.status != 0 || backLongMin.value != floor64 || backLongMin.consumed != usize(10):
+            if failure == 0:
+                set failure = 61.
+        BinaryVarLongWrite(scratch, usize(0), 9223372036854775807).
+        let backLongMax = BinaryVarLongRead(view(slice_mut(scratch, usize(0), usize(9))), usize(0)).
+        if backLongMax.status != 0 || backLongMax.value != 9223372036854775807 || backLongMax.consumed != usize(9):
+            if failure == 0:
+                set failure = 62.
+        put(scratch, usize(0), u8(255)).
+        if BinaryVarLongRead(view(slice_mut(scratch, usize(0), usize(1))), usize(0)).status != -22:
+            if failure == 0:
+                set failure = 63.
+        put(scratch, usize(0), u8(255)).
+        put(scratch, usize(1), u8(255)).
+        put(scratch, usize(2), u8(255)).
+        put(scratch, usize(3), u8(255)).
+        put(scratch, usize(4), u8(255)).
+        put(scratch, usize(5), u8(255)).
+        put(scratch, usize(6), u8(255)).
+        put(scratch, usize(7), u8(255)).
+        put(scratch, usize(8), u8(255)).
+        put(scratch, usize(9), u8(255)).
+        if BinaryVarLongRead(view(slice_mut(scratch, usize(0), usize(10))), usize(0)).status != -22:
+            if failure == 0:
+                set failure = 64.
+        put(scratch, usize(9), u8(127)).
+        if BinaryVarLongRead(view(slice_mut(scratch, usize(0), usize(10))), usize(0)).status != -22:
+            if failure == 0:
+                set failure = 65.
+        if SolarisPackBlockPos(0, 0, 0) != 0:
+            if failure == 0:
+                set failure = 66.
+        if SolarisPackBlockPos(1, 2, 3) != 274877919234:
+            if failure == 0:
+                set failure = 67.
+        if SolarisPackBlockPos(0 - 1, 0 - 1, 0 - 1) != 0 - 1:
+            if failure == 0:
+                set failure = 68.
+        if BinaryWriteI64Be(scratch, usize(0), SolarisPackBlockPos(1, 2, 3)) != 8:
+            if failure == 0:
+                set failure = 69.
+        if byte(view(scratch), usize(0)) != u8(0):
+            if failure == 0:
+                set failure = 70.
+        if byte(view(scratch), usize(1)) != u8(0):
+            if failure == 0:
+                set failure = 71.
+        if byte(view(scratch), usize(2)) != u8(0):
+            if failure == 0:
+                set failure = 72.
+        if byte(view(scratch), usize(3)) != u8(64):
+            if failure == 0:
+                set failure = 73.
+        if byte(view(scratch), usize(4)) != u8(0):
+            if failure == 0:
+                set failure = 74.
+        if byte(view(scratch), usize(5)) != u8(0):
+            if failure == 0:
+                set failure = 75.
+        if byte(view(scratch), usize(6)) != u8(48):
+            if failure == 0:
+                set failure = 76.
+        if byte(view(scratch), usize(7)) != u8(2):
+            if failure == 0:
+                set failure = 77.
+        let backPacked = BinaryReadI64Be(view(slice_mut(scratch, usize(0), usize(8))), usize(0)).
+        if backPacked.status != 0 || backPacked.value != SolarisPackBlockPos(1, 2, 3) || backPacked.consumed != usize(8):
+            if failure == 0:
+                set failure = 78.
+        BinaryWriteI64Be(scratch, usize(0), SolarisPackBlockPos(0 - 1, 0 - 1, 0 - 1)).
+        let backNegPacked = BinaryReadI64Be(view(slice_mut(scratch, usize(0), usize(8))), usize(0)).
+        if backNegPacked.status != 0 || backNegPacked.value != 0 - 1:
+            if failure == 0:
+                set failure = 79.
+        if BinaryReadI64Be(view(slice_mut(scratch, usize(0), usize(7))), usize(0)).status != -22:
+            if failure == 0:
+                set failure = 80.
+        if SolarisEncodeBlockPacket(scratch, usize(0), 1, 1, 2, 3) != 10:
+            if failure == 0:
+                set failure = 81.
+        if byte(view(scratch), usize(0)) != u8(9):
+            if failure == 0:
+                set failure = 82.
+        if byte(view(scratch), usize(1)) != u8(1):
+            if failure == 0:
+                set failure = 83.
+        if byte(view(scratch), usize(2)) != u8(0):
+            if failure == 0:
+                set failure = 84.
+        if byte(view(scratch), usize(5)) != u8(64):
+            if failure == 0:
+                set failure = 85.
+        if byte(view(scratch), usize(8)) != u8(48):
+            if failure == 0:
+                set failure = 86.
+        if byte(view(scratch), usize(9)) != u8(2):
+            if failure == 0:
+                set failure = 87.
+        let decoded = SolarisDecodeBlockPacket(view(slice_mut(scratch, usize(0), usize(10))), usize(0)).
+        if decoded.status != 0:
+            if failure == 0:
+                set failure = 88.
+        if decoded.id != 1 || decoded.x != 1 || decoded.y != 2 || decoded.z != 3:
+            if failure == 0:
+                set failure = 89.
+        if decoded.next != usize(10):
+            if failure == 0:
+                set failure = 90.
+        if SolarisEncodeBlockPacket(scratch, usize(0), 2, 0 - 1, 0 - 1, 0 - 1) != 10:
+            if failure == 0:
+                set failure = 91.
+        if byte(view(scratch), usize(0)) != u8(9):
+            if failure == 0:
+                set failure = 92.
+        if byte(view(scratch), usize(1)) != u8(2):
+            if failure == 0:
+                set failure = 93.
+        if byte(view(scratch), usize(2)) != u8(255):
+            if failure == 0:
+                set failure = 94.
+        if byte(view(scratch), usize(9)) != u8(255):
+            if failure == 0:
+                set failure = 95.
+        let decodedNeg = SolarisDecodeBlockPacket(view(slice_mut(scratch, usize(0), usize(10))), usize(0)).
+        if decodedNeg.status != 0 || decodedNeg.id != 2:
+            if failure == 0:
+                set failure = 96.
+        if decodedNeg.x != 0 - 1 || decodedNeg.y != 0 - 1 || decodedNeg.z != 0 - 1:
+            if failure == 0:
+                set failure = 97.
+        if decodedNeg.next != usize(10):
+            if failure == 0:
+                set failure = 98.
+        if SolarisEncodeBlockPacket(scratch, usize(0), 0, 33554431, 2047, 33554431) != 10:
+            if failure == 0:
+                set failure = 99.
+        let decodedWide = SolarisDecodeBlockPacket(view(slice_mut(scratch, usize(0), usize(10))), usize(0)).
+        if decodedWide.status != 0 || decodedWide.id != 0:
+            if failure == 0:
+                set failure = 100.
+        if decodedWide.x != 33554431 || decodedWide.y != 2047 || decodedWide.z != 33554431:
+            if failure == 0:
+                set failure = 101.
+        if SolarisEncodeBlockPacket(scratch, usize(0), 300, 0 - 33554432, 0 - 2048, 0 - 33554432) != 11:
+            if failure == 0:
+                set failure = 102.
+        if byte(view(scratch), usize(0)) != u8(10):
+            if failure == 0:
+                set failure = 103.
+        if byte(view(scratch), usize(1)) != u8(172):
+            if failure == 0:
+                set failure = 104.
+        if byte(view(scratch), usize(2)) != u8(2):
+            if failure == 0:
+                set failure = 105.
+        let decodedDeep = SolarisDecodeBlockPacket(view(slice_mut(scratch, usize(0), usize(11))), usize(0)).
+        if decodedDeep.status != 0 || decodedDeep.id != 300:
+            if failure == 0:
+                set failure = 106.
+        if decodedDeep.x != 0 - 33554432 || decodedDeep.y != 0 - 2048 || decodedDeep.z != 0 - 33554432:
+            if failure == 0:
+                set failure = 107.
+        if decodedDeep.next != usize(11):
+            if failure == 0:
+                set failure = 108.
+        if SolarisPackBlockPos(67108864, 0, 0) != 0:
+            if failure == 0:
+                set failure = 109.
+        let wrappedY = SolarisUnpackBlockPos(SolarisPackBlockPos(0, 2048, 0)).
+        if wrappedY.x != 0 || wrappedY.y != 0 - 2048 || wrappedY.z != 0 || SolarisPackBlockPos(0, 4096, 0) != 0:
+            if failure == 0:
+                set failure = 110.
+        let maskedY = SolarisUnpackBlockPos(SolarisPackBlockPos(0, 0 - 2049, 0)).
+        if maskedY.x != 0 || maskedY.y != 2047 || maskedY.z != 0:
+            if failure == 0:
+                set failure = 111.
+        let maskedX = SolarisUnpackBlockPos(SolarisPackBlockPos(0 - 67108865, 0, 0)).
+        if maskedX.x != 0 - 1 || maskedX.y != 0 || maskedX.z != 0:
+            if failure == 0:
+                set failure = 112.
+        let cellNeg = SolarisChunkCellOf(0 - 17).
+        if cellNeg.status != 0 || cellNeg.chunk != 0 - 2 || cellNeg.local != 15:
+            if failure == 0:
+                set failure = 113.
+        let cellEdge = SolarisChunkCellOf(0 - 16).
+        if cellEdge.status != 0 || cellEdge.chunk != 0 - 1 || cellEdge.local != 0:
+            if failure == 0:
+                set failure = 114.
+        let cellOne = SolarisChunkCellOf(0 - 1).
+        if cellOne.status != 0 || cellOne.chunk != 0 - 1 || cellOne.local != 15:
+            if failure == 0:
+                set failure = 115.
+        let cellZero = SolarisChunkCellOf(0).
+        if cellZero.status != 0 || cellZero.chunk != 0 || cellZero.local != 0:
+            if failure == 0:
+                set failure = 116.
+        let cellFull = SolarisChunkCellOf(15).
+        if cellFull.status != 0 || cellFull.chunk != 0 || cellFull.local != 15:
+            if failure == 0:
+                set failure = 117.
+        let cellNext = SolarisChunkCellOf(16).
+        if cellNext.status != 0 || cellNext.chunk != 1 || cellNext.local != 0:
+            if failure == 0:
+                set failure = 118.
+        let cellAfter = SolarisChunkCellOf(17).
+        if cellAfter.status != 0 || cellAfter.chunk != 1 || cellAfter.local != 1:
+            if failure == 0:
+                set failure = 119.
+        borrow_end(scratch).
+        buffer_drop(arena).
+        let smallArena = buffer(usize(9)).
+        let narrow = borrow_mut(smallArena, usize(0), usize(9)).
+        if SolarisEncodeBlockPacket(narrow, usize(0), 1, 1, 2, 3) != -28:
+            if failure == 0:
+                set failure = 120.
+        borrow_end(narrow).
+        buffer_drop(smallArena).
+        let frameArena = buffer(usize(11)).
+        let frame = borrow_mut(frameArena, usize(0), usize(10)).
+        if SolarisEncodeBlockPacket(frame, usize(0), 1, 1, 2, 3) != 10:
+            if failure == 0:
+                set failure = 121.
+        let shortPacket = SolarisDecodeBlockPacket(slice(view(frame), usize(0), usize(9)), usize(0)).
+        borrow_end(frame).
+        buffer_drop(frameArena).
+        if shortPacket.status != -61:
+            if failure == 0:
+                set failure = 122.
+        let tailArena = buffer(usize(5)).
+        let tail = borrow_mut(tailArena, usize(0), usize(5)).
+        put(tail, usize(0), u8(255)).
+        put(tail, usize(1), u8(255)).
+        put(tail, usize(2), u8(255)).
+        put(tail, usize(3), u8(255)).
+        put(tail, usize(4), u8(15)).
+        let negativeLength = SolarisDecodeBlockPacket(view(tail), usize(0)).
+        put(tail, usize(0), u8(0)).
+        put(tail, usize(1), u8(128)).
+        put(tail, usize(2), u8(128)).
+        put(tail, usize(3), u8(128)).
+        put(tail, usize(4), u8(128)).
+        let emptyBody = SolarisDecodeBlockPacket(view(tail), usize(0)).
+        borrow_end(tail).
+        buffer_drop(tailArena).
+        if negativeLength.status != -61:
+            if failure == 0:
+                set failure = 123.
+        if emptyBody.status != -61:
+            if failure == 0:
+                set failure = 124.
+        return failure.

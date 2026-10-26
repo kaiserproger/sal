@@ -145,25 +145,37 @@ fn reader(capacity: usize) -> Fixture {
         r#"use "http.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mapped = syscall(9, 0, 65536, 3, 34, -1, 0).
-        if mapped < 0:
-            return 90.
-        let buffer = usize(mapped).
-        let scratch = buffer + 32768.
-        let result = HttpReadRequest(0, buffer, usize({capacity})).
-        let digits = BytesDecimal(result, scratch, usize(64)).
-        LinuxWriteAll(1, bytes_at(scratch, usize(digits))).
+        let store = buffer(usize(65536)).
+        let arena = borrow_mut(store, usize(0), usize(65536)).
+        let window = slice_mut(arena, usize(0), usize({capacity})).
+        let result = HttpReadRequest(0, window).
+        borrow_end(window).
+        let numbers = slice_mut(arena, usize(32768), usize(64)).
+        let digits = BytesDecimal(result, numbers).
+        borrow_end(numbers).
+        let digitsView = view(arena).
+        let digitsSlice = slice(digitsView, usize(32768), usize(digits)).
+        LinuxWriteAll(1, digitsSlice).
+        borrow_end(digitsSlice).
+        borrow_end(digitsView).
         LinuxWriteAll(1, bytes("\n")).
         if result >= 0:
-            let request = bytes_at(buffer, usize(result)).
+            let bodyView = view(arena).
+            let request = slice(bodyView, usize(0), usize(result)).
             LinuxWriteAll(1, HttpMethod(request)).
             LinuxWriteAll(1, bytes("\n")).
             LinuxWriteAll(1, HttpPath(request)).
             LinuxWriteAll(1, bytes("\n")).
-            let offset = usize(HttpBodyOffset(request)).
-            LinuxWriteAll(1, slice(request, offset, len(request) - offset)).
+            let bodyOff = usize(HttpBodyOffset(request)).
+            let bodySlice = slice(request, bodyOff, len(request) - bodyOff).
+            LinuxWriteAll(1, bodySlice).
+            borrow_end(bodySlice).
+            borrow_end(request).
+            borrow_end(bodyView).
+        borrow_end(arena).
+        buffer_drop(store).
         return 0.
 "#
     ))
@@ -338,31 +350,35 @@ fn header_and_total_capacity_boundaries_are_distinct() {
 fn pure_helpers_handle_short_malformed_slices_and_query_paths() {
     let fixture = Fixture::build(
         r#"use "http.sal".
+# Short and malformed slices reject without trapping: derived headers never
+# outlive the probe result, and HttpMethod/HttpPath guard invalid lines in
+# their requires headers while HttpBodyOffset scans for CRLFCRLF.
 operation Main:
     returns i64.
     body:
+        let mut failure = 0.
         let valid = bytes("GET /a?query HTTP/1.1\r\n\r\n").
         let mut count = usize(0).
         while count < 23:
             let part = slice(valid, usize(0), count).
-            if len(HttpMethod(part)) != 0:
-                return 1.
-            if len(HttpPath(part)) != 0:
-                return 2.
-            if HttpBodyOffset(part) != -400:
-                return 3.
+            if failure == 0 && len(HttpMethod(part)) != 0:
+                set failure = 1.
+            if failure == 0 && len(HttpPath(part)) != 0:
+                set failure = 2.
+            if failure == 0 && HttpBodyOffset(part) != -400:
+                set failure = 3.
             set count = count + 1.
-        if HttpMethod(valid) != bytes("GET"):
-            return 4.
-        if HttpPath(valid) != bytes("/a"):
-            return 5.
-        if HttpBodyOffset(valid) != i64(len(valid)):
-            return 6.
-        if len(HttpMethod(bytes("GET / HTTP/9.9\r\n"))) != 0:
-            return 7.
-        if len(HttpPath(bytes("GET x HTTP/1.1\r\n"))) != 0:
-            return 8.
-        return 0.
+        if failure == 0 && HttpMethod(valid) != bytes("GET"):
+            set failure = 4.
+        if failure == 0 && HttpPath(valid) != bytes("/a"):
+            set failure = 5.
+        if failure == 0 && HttpBodyOffset(valid) != i64(len(valid)):
+            set failure = 6.
+        if failure == 0 && len(HttpMethod(bytes("GET / HTTP/9.9\r\n"))) != 0:
+            set failure = 7.
+        if failure == 0 && len(HttpPath(bytes("GET x HTTP/1.1\r\n"))) != 0:
+            set failure = 8.
+        return failure.
 "#,
     );
     assert_eq!(fixture.run(b""), b"");
@@ -373,15 +389,19 @@ fn response_probe(status: i64, body: &str, capacity: usize, expected: i64) -> Fi
         r#"use "http.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mapped = syscall(9, 0, 4096, 3, 34, -1, 0).
-        if mapped < 0:
-            return 90.
-        let result = HttpWriteResponse(1, {status}, bytes("{body}"), usize(mapped), usize({capacity})).
+        let mut failure = 0.
+        let store = buffer(usize(4096)).
+        let scratch = borrow_mut(store, usize(0), usize(4096)).
+        let window = slice_mut(scratch, usize(0), usize({capacity})).
+        let result = HttpWriteResponse(1, {status}, bytes("{body}"), window).
+        borrow_end(window).
         if result != {expected}:
-            return 91.
-        return 0.
+            set failure = 91.
+        borrow_end(scratch).
+        buffer_drop(store).
+        return failure.
 "#
     ))
 }
@@ -449,17 +469,44 @@ fn io_errors_propagate_without_http_remapping() {
         r#"use "http.sal".
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
-        let mapped = syscall(9, 0, 4096, 3, 34, -1, 0).
-        if mapped < 0:
-            return 90.
-        if HttpReadRequest(-1, usize(mapped), usize(4096)) != -9:
-            return 1.
-        if HttpWriteResponse(-1, 200, bytes("{}"), usize(mapped), usize(4096)) != -9:
-            return 2.
-        return 0.
+        let mut failure = 0.
+        let store = buffer(usize(4096)).
+        let arena = borrow_mut(store, usize(0), usize(4096)).
+        let window = slice_mut(arena, usize(0), usize(4096)).
+        let readStatus = HttpReadRequest(-1, window).
+        borrow_end(window).
+        if failure == 0 && readStatus != -9:
+            set failure = 1.
+        let emit = slice_mut(arena, usize(0), usize(4096)).
+        let writeStatus = HttpWriteResponse(-1, 200, bytes("{}"), emit).
+        borrow_end(emit).
+        borrow_end(arena).
+        buffer_drop(store).
+        if failure == 0 && writeStatus != -9:
+            set failure = 2.
+        return failure.
 "#,
     );
     assert_eq!(fixture.run(b""), b"");
+}
+
+#[test]
+fn token_contract_matches_exact_http_ascii_classes() {
+    use std::fmt::Write as _;
+
+    let mut source =
+        String::from("use \"http.sal\".\noperation Main:\n    returns i64.\n    body:\n");
+    for value in u8::MIN..=u8::MAX {
+        let expected = value.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&value);
+        writeln!(
+            source,
+            "        SalContractAssert(HttpToken(u8({value})) == {expected})."
+        )
+        .unwrap();
+    }
+    source.push_str("        return 0.\n");
+    let fixture = Fixture::build(&source);
+    assert!(fixture.run(b"").is_empty());
 }

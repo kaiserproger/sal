@@ -1,32 +1,41 @@
 use "std/concurrency.sal".
+
+# First failure wins: keeps an earlier failure, else reports `code` when the
+# check does not hold.
+operation Expect:
+    accepts failure of type i64.
+    accepts code of type i64.
+    accepts holds of type bool.
+    returns i64.
+    requires:
+        failure == 0 otherwise failure.
+        holds otherwise code.
+    body:
+        return 0.
+
 operation EchoWorker:
     accepts ch of type Channel<i64>.
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let got = receive(ch).
         channel_drop(ch).
         if got.open == false:
             return -1.
         return got.value + 1.
+
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let ch = channel(i64, usize(0)).
         let worker_ch = channel_clone(ch).
         let thread = spawn(EchoWorker, worker_ch).
         let sent = send(ch, 41).
-        if sent.sent == false:
-            if failure == 0:
-                set failure = 1.
-        if sent.value != 41:
-            if failure == 0:
-                set failure = 2.
+        set failure = Expect(failure, 1, sent.sent).
+        set failure = Expect(failure, 2, sent.value == 41).
         let code = join(thread).
         channel_drop(ch).
-        if code != 42:
-            if failure == 0:
-                set failure = 3.
+        set failure = Expect(failure, 3, code == 42).
         return failure.

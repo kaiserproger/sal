@@ -1,72 +1,50 @@
 use "std/concurrency.sal".
+
+# First failure wins: keeps an earlier failure, else reports `code` when the
+# check does not hold.
+operation Expect:
+    accepts failure of type i64.
+    accepts code of type i64.
+    accepts holds of type bool.
+    returns i64.
+    requires:
+        failure == 0 otherwise failure.
+        holds otherwise code.
+    body:
+        return 0.
+
 operation Main:
     returns i64.
-    effects: SystemCall, UnsafeMemory.
+    effects: SystemCall.
     body:
         let mut failure = 0.
         let left = channel(i64, usize(1)).
         let right = channel(i64, usize(1)).
         let one = send(left, 11).
-        if one.sent == false:
-            if failure == 0:
-                set failure = 1.
+        set failure = Expect(failure, 1, one.sent).
         let two = send(right, 22).
-        if two.sent == false:
-            if failure == 0:
-                set failure = 2.
+        set failure = Expect(failure, 2, two.sent).
         let winner = wait_for(receive(left), receive(right)).
-        if winner.status != 0:
-            if failure == 0:
-                set failure = 3.
+        set failure = Expect(failure, 3, winner.status == 0).
         if winner.index == 0:
-            if winner.arm0.selected == false:
-                if failure == 0:
-                    set failure = 4.
-            if winner.arm0.open == false:
-                if failure == 0:
-                    set failure = 5.
-            if winner.arm0.value != 11:
-                if failure == 0:
-                    set failure = 6.
-            if winner.arm1.selected == true:
-                if failure == 0:
-                    set failure = 7.
-            if winner.arm1.value != 0:
-                if failure == 0:
-                    set failure = 8.
+            set failure = Expect(failure, 4, winner.arm0.selected).
+            set failure = Expect(failure, 5, winner.arm0.open).
+            set failure = Expect(failure, 6, winner.arm0.value == 11).
+            set failure = Expect(failure, 7, winner.arm1.selected == false).
+            set failure = Expect(failure, 8, winner.arm1.value == 0).
             let other = receive(right).
-            if other.open == false:
-                if failure == 0:
-                    set failure = 9.
-            if other.value != 22:
-                if failure == 0:
-                    set failure = 10.
+            set failure = Expect(failure, 9, other.open).
+            set failure = Expect(failure, 10, other.value == 22).
         else:
-            if winner.index != 1:
-                if failure == 0:
-                    set failure = 11.
-            if winner.arm1.selected == false:
-                if failure == 0:
-                    set failure = 12.
-            if winner.arm1.open == false:
-                if failure == 0:
-                    set failure = 13.
-            if winner.arm1.value != 22:
-                if failure == 0:
-                    set failure = 14.
-            if winner.arm0.selected == true:
-                if failure == 0:
-                    set failure = 15.
-            if winner.arm0.value != 0:
-                if failure == 0:
-                    set failure = 16.
+            set failure = Expect(failure, 11, winner.index == 1).
+            set failure = Expect(failure, 12, winner.arm1.selected).
+            set failure = Expect(failure, 13, winner.arm1.open).
+            set failure = Expect(failure, 14, winner.arm1.value == 22).
+            set failure = Expect(failure, 15, winner.arm0.selected == false).
+            set failure = Expect(failure, 16, winner.arm0.value == 0).
             let other = receive(left).
-            if other.open == false:
-                if failure == 0:
-                    set failure = 17.
-            if other.value != 11:
-                if failure == 0:
-                    set failure = 18.
+            set failure = Expect(failure, 17, other.open).
+            set failure = Expect(failure, 18, other.value == 11).
         channel_drop(left).
         channel_drop(right).
         return failure.

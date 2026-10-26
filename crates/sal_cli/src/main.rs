@@ -1,11 +1,11 @@
-//! SAL CLI: deterministic checking, Anglish translation, native artifacts.
+//! SAL CLI: deterministic checking and native artifacts.
 //!
 //! CONTRACT (implemented):
 //! - `sal check <file.sal> [--strict]`: parse, registry, type/body/architecture/
 //!   effect checks. Print each diagnostic via
 //!   sal_syntax::format_diagnostic + source. Summary `N error(s), M warning(s)`.
 //!   Exit 1 if any Error, or any Warning with --strict; else print `ok` line.
-//! - `sal emit-rust <file.sal> --out <dir>`: on check errors exit 1 without
+//! - `sal emit-rust <file.sal> --out <dir> [--strict]`: on check errors exit 1 without
 //!   writing; else write EmittedFiles under <dir>, print each path.
 //! - `sal verify <file.sal> --rust <dir> [--strict]`: check + scan <dir>
 //!   recursively for `.rs` files; per file extract `sal:module NAME` marker
@@ -17,15 +17,12 @@
 //!   under the scanned path is VERIFY001 (error); `.rs` files present but zero
 //!   markers is VERIFY002 (error). Unknown marker modules delegate to sal_ir
 //!   ARCH201; the CLI never swallows them. Print, same exit policy as check.
-//! - `sal run-ang <file.ang> [--port-over N] [--strict]`: translate to SAL on
-//!   stdout; diagnostics on stderr; fail on errors or strict warnings.
-//! - `sal build-exe <file.sal|--ang file.ang> --out <dir> [--strict]` defaults
+//! - `sal build-exe <file.sal> --out <dir> [--strict]` defaults
 //!   to Linux x86-64 native assembly plus as/ld. Unsupported native behavior
 //!   fails closed. `--backend rust-std` explicitly selects the legacy emitter.
-//! - `sal build-lib <file.sal|--ang file.ang> --out <dir> [--strict]` produces
+//! - `sal build-lib <file.sal> --out <dir> [--strict]` produces
 //!   native archive and C header from checked scalar C exports.
 
-mod anglish;
 mod native_build;
 mod server_frontend;
 mod sources;
@@ -34,11 +31,11 @@ use sal_backend_rust::emit_rust;
 use sal_ir::{
     build, check_architecture, check_effects, check_types, verify_rust_imports, RustFile,
 };
-use sal_syntax::{format_diagnostic, Diagnostic, Severity, Span};
+use sal_syntax::{Diagnostic, Severity, Span};
 use std::path::{Path, PathBuf};
 
 fn usage() -> &'static str {
-    "usage:\n  sal check <file.sal> [--strict]\n  sal emit-rust <file.sal> --out <dir> [--strict]\n  sal verify <file.sal> --rust <dir> [--strict]\n  sal run-ang <file.ang> [--port-over N] [--model-command PROGRAM [--model-arg ARG]...] [--strict]\n  sal build-exe <file.sal|--ang file.ang> --out <dir> [--link <object-or-archive>]... [--model-command PROGRAM [--model-arg ARG]...] [--backend native|rust-std] [--strict]\n  sal build-lib <file.sal|--ang file.ang> --out <dir> [--model-command PROGRAM [--model-arg ARG]...] [--strict]"
+    "usage:\n  sal check <file.sal> [--strict]\n  sal emit-rust <file.sal> --out <dir> [--strict]\n  sal verify <file.sal> --rust <dir> [--strict]\n  sal build-exe <file.sal> --out <dir> [--link <object-or-archive>]... [--backend native|rust-std] [--strict]\n  sal build-lib <file.sal> --out <dir> [--strict]"
 }
 
 fn bad_args(msg: String) -> ! {
@@ -251,161 +248,6 @@ fn cmd_emit(rest: &[String]) {
         println!("{}", dest.display());
     }
 }
-fn parse_run_en_args(rest: &[String]) -> (String, Option<String>, bool, anglish::Model) {
-    let mut file: Option<String> = None;
-    let mut port_over: Option<String> = None;
-    let mut strict = false;
-    let mut model = anglish::Model::default();
-    let mut i = 0usize;
-    while i < rest.len() {
-        let a: &str = match rest.get(i) {
-            Some(v) => v.as_str(),
-            None => break,
-        };
-        if a == "--strict" {
-            strict = true;
-        } else if a == "--model-command" {
-            let value = rest
-                .get(i + 1)
-                .unwrap_or_else(|| bad_args("--model-command needs an executable".into()));
-            model.program(value.clone());
-            i += 1;
-        } else if a == "--model-arg" {
-            let value = rest
-                .get(i + 1)
-                .unwrap_or_else(|| bad_args("--model-arg needs an argument".into()));
-            model.argument(value.clone());
-            i += 1;
-        } else if a == "--port-over" {
-            let v = match rest.get(i + 1) {
-                Some(v) => v.as_str().to_string(),
-                None => bad_args("flag --port-over needs a value".to_string()),
-            };
-            port_over = Some(parse_port(v));
-            i += 1;
-        } else if let Some(v) = a.strip_prefix("--port-over=") {
-            if v.is_empty() {
-                bad_args("flag --port-over needs a non-empty value".to_string());
-            }
-            port_over = Some(parse_port(v.to_string()));
-        } else if a.starts_with('-') {
-            bad_args(format!("unexpected flag '{}' for run-ang", a));
-        } else if file.is_none() {
-            file = Some(a.to_string());
-        } else {
-            bad_args("too many positional arguments for run-ang".to_string());
-        }
-        i += 1;
-    }
-    model.validate();
-    match file {
-        Some(f) => (f, port_over, strict, model),
-        None => bad_args("missing <file.ang>".to_string()),
-    }
-}
-
-fn parse_port(v: String) -> String {
-    match v.parse::<u32>() {
-        Ok(n) if (1..=65535).contains(&n) => n.to_string(),
-        _ => bad_args(format!(
-            "invalid port '{}' for --port-over (want 1..=65535)",
-            v
-        )),
-    }
-}
-
-/// Replace the port digits on the single `listens on port` line.
-fn apply_port_over(level_b: &str, port: &str) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for line in level_b.lines() {
-        if line.contains("listens on port") {
-            lines.push(replace_port_digits(line, port));
-        } else {
-            lines.push(line.to_string());
-        }
-    }
-    let mut out = lines.join("\n");
-    if level_b.ends_with('\n') {
-        out.push('\n');
-    }
-    out
-}
-
-fn replace_port_digits(line: &str, port: &str) -> String {
-    let marker = "listens on port";
-    let search_from = match line.find(marker) {
-        Some(idx) => idx + marker.len(),
-        None => return line.to_string(),
-    };
-    let bytes = line.as_bytes();
-    let mut i = search_from;
-    while i < line.len() && !bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i >= line.len() {
-        return line.to_string();
-    }
-    let mut end = i;
-    while end < line.len() && bytes[end].is_ascii_digit() {
-        end += 1;
-    }
-    format!("{}{}{}", &line[..i], port, &line[end..])
-}
-
-fn cmd_run_en(rest: &[String]) {
-    let (file, port_over, strict, model) = parse_run_en_args(rest);
-    let en_source = read_source(&file);
-    let (mut level_b, sem_diags) = model.translate(&en_source).unwrap_or_else(|error| {
-        eprintln!("sal: {error}");
-        std::process::exit(1);
-    });
-    if let Some(port) = port_over {
-        let count = level_b
-            .lines()
-            .filter(|l| l.contains("listens on port"))
-            .count();
-        if count != 1 {
-            let d = Diagnostic {
-                code: "E9004",
-                severity: Severity::Error,
-                message: format!(
-                    "--port-over {} needs exactly one `listens on port` line, found {}",
-                    port, count
-                ),
-                span: Span::single(1, 1),
-                suggestion: None,
-            };
-            eprintln!("{}", format_diagnostic(&d, &level_b));
-            std::process::exit(1);
-        }
-        level_b = apply_port_over(&level_b, &port);
-    }
-    // stdout is compilable SAL, so omp and shell pipelines can consume it.
-    for diagnostic in &sem_diags {
-        eprintln!("{}", format_diagnostic(diagnostic, &en_source));
-    }
-    if has_failures(&sem_diags, strict) {
-        std::process::exit(1);
-    }
-    let source = sources::Sources::from_text(Path::new(&file), level_b);
-    let (_, diagnostics) = run_checks(&source);
-    for diagnostic in &diagnostics {
-        eprintln!("{}", source.format(diagnostic));
-    }
-    if has_failures(&diagnostics, strict) {
-        std::process::exit(1);
-    }
-    if model.enabled() {
-        eprintln!(
-            "sal: model proposal passed structural checks; preservation of intent is not proved"
-        );
-    }
-    let level_b = source.root_text();
-    print!("{}", level_b);
-    if !level_b.ends_with('\n') {
-        println!();
-    }
-}
 
 fn binary_stem(path: &str) -> String {
     match Path::new(path).file_stem().and_then(|s| s.to_str()) {
@@ -602,7 +444,6 @@ fn main() {
         "check" => cmd_check(rest),
         "emit-rust" => cmd_emit(rest),
         "verify" => cmd_verify(rest),
-        "run-ang" => cmd_run_en(rest),
         "build-exe" => native_build::build(rest, false),
         "build-lib" => native_build::build(rest, true),
         "-h" | "--help" | "help" => println!("{}", usage()),

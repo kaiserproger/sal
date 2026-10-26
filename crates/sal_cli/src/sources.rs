@@ -27,8 +27,7 @@ impl Sources {
         Self::from_text(Path::new(path), crate::read_source(path))
     }
 
-    /// Also supports generated SAL, whose dependencies are relative to the
-    /// Anglish input file rather than the compiler's working directory.
+    /// Resolve imports relative to the containing SAL source file.
     pub(crate) fn from_text(path: &Path, text: String) -> Self {
         let root = path.canonicalize().unwrap_or_else(|_| path.to_owned());
         let mut sources = Self {
@@ -40,6 +39,7 @@ impl Sources {
         };
         let imports = sources.add(&root, Cow::Owned(text));
         sources.expand(root, imports);
+        sources.ensure_runtimes();
         sources
     }
 
@@ -47,6 +47,37 @@ impl Sources {
         let path = PathBuf::from(format!("<generated:{}>", self.originals.len()));
         let imports = self.add(&path, Cow::Owned(text));
         self.expand(path, imports);
+        self.ensure_runtimes();
+    }
+
+    fn ensure_runtimes(&mut self) {
+        let runtimes = [
+            (
+                "std/json_model.sal",
+                sal_ir::declarations::requires_json_runtime as fn(&SalFile) -> bool,
+            ),
+            (
+                "std/text.sal",
+                sal_ir::memory::requires_text_runtime as fn(&SalFile) -> bool,
+            ),
+            (
+                "std/buffer.sal",
+                sal_ir::memory::requires_buffer_runtime as fn(&SalFile) -> bool,
+            ),
+            (
+                "std/collections.sal",
+                sal_ir::collections::requires_collections_runtime as fn(&SalFile) -> bool,
+            ),
+        ];
+        for (module, required) in runtimes {
+            let path = Path::new(module);
+            if self.loaded.contains(path) || !required(&self.file) {
+                continue;
+            }
+            let text = standard_text(path).expect("embedded language runtime");
+            let imports = self.add(path, Cow::Borrowed(text));
+            self.expand(path.to_owned(), imports);
+        }
     }
 
     fn expand(&mut self, root: PathBuf, imports: Vec<(PathBuf, Span)>) {
@@ -121,10 +152,6 @@ impl Sources {
                 pending.push(Work::Enter { path, requested_at });
             }
         }
-    }
-
-    pub(crate) fn root_text(&self) -> &str {
-        &self.originals[0].text
     }
 
     fn problem(&mut self, message: String, span: Span) {
@@ -226,10 +253,22 @@ fn standard_text(path: &Path) -> Option<&'static str> {
         "std/bytes.sal" => include_str!("../../../stdlib/bytes.sal"),
         "std/http.sal" => include_str!("../../../stdlib/http.sal"),
         "std/json.sal" => include_str!("../../../stdlib/json.sal"),
+        "std/json_model.sal" => include_str!("../../../stdlib/json_model.sal"),
+        "std/text_list.sal" => include_str!("../../../stdlib/text_list.sal"),
         "std/routing.sal" => include_str!("../../../stdlib/routing.sal"),
         "std/server.sal" => include_str!("../../../stdlib/server.sal"),
         "std/postgres.sal" => include_str!("../../../stdlib/postgres.sal"),
         "std/concurrency.sal" => include_str!("../../../stdlib/concurrency.sal"),
+        "std/buffer.sal" => include_str!("../../../stdlib/buffer.sal"),
+        "std/text.sal" => include_str!("../../../stdlib/text.sal"),
+        "std/math.sal" => include_str!("../../../stdlib/math.sal"),
+        "std/time.sal" => include_str!("../../../stdlib/time.sal"),
+        "std/binary.sal" => include_str!("../../../stdlib/binary.sal"),
+        "std/hash.sal" => include_str!("../../../stdlib/hash.sal"),
+        "std/fs.sal" => include_str!("../../../stdlib/fs.sal"),
+        "std/net.sal" => include_str!("../../../stdlib/net.sal"),
+        "std/http_client.sal" => include_str!("../../../stdlib/http_client.sal"),
+        "std/collections.sal" => include_str!("../../../stdlib/collections.sal"),
         "std/linux/io.sal" => include_str!("../../../stdlib/linux/io.sal"),
         "std/linux/net.sal" => include_str!("../../../stdlib/linux/net.sal"),
         "std/linux/memory.sal" => include_str!("../../../stdlib/linux/memory.sal"),

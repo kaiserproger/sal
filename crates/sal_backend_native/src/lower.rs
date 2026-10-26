@@ -9,9 +9,13 @@ use super::{error, Signature, Ty};
 mod abi;
 mod builtins;
 mod concurrency;
+mod memory;
 mod numeric;
+mod numeric_intrinsics;
 mod records;
 
+pub(super) use memory::InternalLayout;
+pub(super) use memory::{internal_layouts, memory_builtin_name};
 const REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
 use abi::Place;
 
@@ -74,6 +78,12 @@ pub(super) fn preflight(ir: &sal_ir::Ir) -> Result<(), Diagnostic> {
                                 .map(|statement| (Node::Statement(statement), next)),
                         );
                     }
+                    Stmt::Unsafe { body } => {
+                        pending.extend(
+                            body.iter()
+                                .map(|statement| (Node::Statement(statement), next)),
+                        );
+                    }
                     Stmt::Break | Stmt::Continue => {}
                 },
                 Node::Expression(expression) => match expression {
@@ -112,6 +122,7 @@ struct Function<'a> {
     operation: &'a OperationDecl,
     signatures: &'a BTreeMap<String, Signature>,
     layouts: &'a BTreeMap<String, CRecordLayout>,
+    internal: &'a BTreeMap<String, InternalLayout>,
     literals: &'a mut Vec<String>,
     scopes: Vec<BTreeMap<String, Local>>,
     code: String,
@@ -123,12 +134,14 @@ struct Function<'a> {
     hidden_result: Option<usize>,
     invalid_frame: bool,
     loops: Vec<(String, String)>,
+    unsafe_depth: usize,
 }
 
 pub(super) fn function(
     operation: &OperationDecl,
     signatures: &BTreeMap<String, Signature>,
     layouts: &BTreeMap<String, CRecordLayout>,
+    internal: &BTreeMap<String, InternalLayout>,
     literals: &mut Vec<String>,
 ) -> Result<String, Diagnostic> {
     let signature = &signatures[&operation.name];
@@ -136,6 +149,7 @@ pub(super) fn function(
         operation,
         signatures,
         layouts,
+        internal,
         literals,
         scopes: vec![BTreeMap::new()],
         code: String::new(),
@@ -147,23 +161,26 @@ pub(super) fn function(
         hidden_result: None,
         invalid_frame: false,
         loops: Vec::new(),
+        unsafe_depth: 0,
     };
     // No instruction may use an unencodable frame/field displacement.
     if layouts
         .values()
         .any(|layout| layout.size > i32::MAX as usize - 32)
+        || internal
+            .values()
+            .any(|layout| layout.size > i32::MAX as usize - 32)
     {
         return Err(function.error("N109", "C record exceeds native frame addressing limits"));
     }
-    let (places, _) = abi::arguments(layouts, &signature.params, signature.result)
+    let (places, _) = abi::arguments(layouts, internal, &signature.params, signature.result)
         .ok_or_else(|| function.error("N109", "native argument frame exceeds addressing limits"))?;
     // Preserve incoming registers before copies/normalization use scratch
     // registers. The same classifier is used at every call site.
     let mut raw = [0; 6];
     let mut used = [false; 6];
-    if abi::memory_result(layouts, signature.result) {
-        used[0] = true;
-    }
+    let hidden_result = abi::memory_result(layouts, internal, signature.result);
+    used[0] = hidden_result;
     for place in &places {
         if let Place::Registers { first, words } = *place {
             used[first..first + words].fill(true);
@@ -174,12 +191,14 @@ pub(super) fn function(
         let _ = writeln!(function.code, "    movq {reg}, -{slot}(%rbp)");
         raw[index] = slot;
     }
-    if abi::memory_result(layouts, signature.result) {
+    if hidden_result {
         function.hidden_result = Some(raw[0]);
     }
     for ((parameter, &ty), place) in operation.accepts.iter().zip(&signature.params).zip(places) {
         let slot = match place {
-            Place::Registers { first, .. } if !matches!(ty, Ty::Record(_)) => raw[first],
+            Place::Registers { first, .. } if !matches!(ty, Ty::Record(_) | Ty::Internal(_)) => {
+                raw[first]
+            }
             _ => function.allocate(ty),
         };
         let local = Local {
@@ -188,7 +207,7 @@ pub(super) fn function(
             mutable: false,
         };
         match place {
-            Place::Registers { first, words } if matches!(ty, Ty::Record(_)) => {
+            Place::Registers { first, words } if matches!(ty, Ty::Record(_) | Ty::Internal(_)) => {
                 for word in 0..words {
                     let _ = writeln!(
                         function.code,
@@ -205,13 +224,13 @@ pub(super) fn function(
             }
             // Raw register spills already are the wide scalar/span locals.
             Place::Registers { .. } => {}
-            Place::Stack { offset } if matches!(ty, Ty::Record(_)) => {
+            Place::Stack { offset } if matches!(ty, Ty::Record(_) | Ty::Internal(_)) => {
                 let _ = writeln!(function.code, "    leaq {}(%rbp), %rax", offset + 16);
                 function.store(local);
             }
             Place::Stack { offset } => {
                 let _ = writeln!(function.code, "    movq {}(%rbp), %rax", offset + 16);
-                if ty.span() {
+                if ty.pair() {
                     let _ = writeln!(function.code, "    movq {}(%rbp), %rdx", offset + 24);
                 } else {
                     function.normalize(ty);
@@ -272,8 +291,12 @@ impl Function<'_> {
         error(code, message, &self.operation.span)
     }
 
+    fn unsafe_context(&self) -> bool {
+        self.unsafe_depth > 0
+    }
+
     fn allocate(&mut self, ty: Ty) -> usize {
-        let size = abi::bytes(self.layouts, ty);
+        let size = abi::bytes(self.layouts, self.internal, ty);
         let Some(end) = self
             .next_slot
             .checked_add(size)
@@ -282,7 +305,7 @@ impl Function<'_> {
             self.invalid_frame = true;
             return 8;
         };
-        let slot = if matches!(ty, Ty::Record(_)) {
+        let slot = if matches!(ty, Ty::Record(_) | Ty::Internal(_)) {
             end
         } else {
             self.next_slot + 8
@@ -306,23 +329,29 @@ impl Function<'_> {
     }
 
     fn store(&mut self, local: Local) {
-        if matches!(local.ty, Ty::Record(_)) {
+        if matches!(local.ty, Ty::Record(_) | Ty::Internal(_)) {
             self.copy_record_to(local.ty, &format!("-{}(%rbp)", local.slot));
             return;
         }
         let _ = writeln!(self.code, "    movq %rax, -{}(%rbp)", local.slot);
-        if local.ty.span() {
+        if local.ty.pair() {
             let _ = writeln!(self.code, "    movq %rdx, -{}(%rbp)", local.slot + 8);
         }
     }
 
     fn load(&mut self, local: Local) {
-        if matches!(local.ty, Ty::Record(_)) {
+        if matches!(local.ty, Ty::Record(_) | Ty::Internal(_)) {
             let _ = writeln!(self.code, "    leaq -{}(%rbp), %rax", local.slot);
             return;
         }
+        if local.ty == Ty::Borrow {
+            // A Borrow is the address of the original owner slot: every use
+            // re-aliases the original metadata, never a by-value copy.
+            let _ = writeln!(self.code, "    movq -{}(%rbp), %rax", local.slot);
+            return;
+        }
         let _ = writeln!(self.code, "    movq -{}(%rbp), %rax", local.slot);
-        if local.ty.span() {
+        if local.ty.pair() {
             let _ = writeln!(self.code, "    movq -{}(%rbp), %rdx", local.slot + 8);
         }
     }
@@ -382,7 +411,7 @@ impl Function<'_> {
                         self.code.push_str(
                             "    testq %rax, %rax\n    setne %al\n    movzbl %al, %eax\n",
                         );
-                    } else if matches!(ty, Ty::Record(_)) {
+                    } else if matches!(ty, Ty::Record(_) | Ty::Internal(_)) {
                         self.return_record(ty);
                     }
                     let _ = writeln!(self.code, "    jmp .Lsal_return_{}", self.index);
@@ -404,6 +433,12 @@ impl Function<'_> {
                     self.expression(expr, None)?;
                     false
                 }
+                Stmt::Unsafe { body } => {
+                    self.unsafe_depth += 1;
+                    let returns = self.block(body, true)?;
+                    self.unsafe_depth -= 1;
+                    returns
+                }
                 Stmt::While { cond, body } => {
                     let head = self.label();
                     let end = self.label();
@@ -415,7 +450,9 @@ impl Function<'_> {
                     self.block(body, true)?;
                     self.loops.pop();
                     let _ = writeln!(self.code, "    jmp {head}\n{end}:");
-                    false
+                    // A break-free `while true` never falls through, so it
+                    // diverges for return-path analysis (same rule as sal_ir).
+                    *cond == Expr::Bool(true) && !breaks_out(body)
                 }
                 Stmt::Break | Stmt::Continue => {
                     let Some((head, end)) = self.loops.last() else {
@@ -451,15 +488,24 @@ impl Function<'_> {
             Expr::Bool(_) | Expr::Not(_) => Some(Ty::Bool),
             Expr::Int(_) | Expr::Float(_) | Expr::Index { .. } => None,
             Expr::Field { base, field } => {
-                let ty = self.hint(base)?;
-                let field = self
-                    .record_layout(ty)?
-                    .fields
-                    .iter()
-                    .find(|f| f.name == *field)?;
-                self.resolve(&field.ty)
+                let base_ty = self.hint(base)?;
+                if let Some(layout) = self.record_layout(base_ty) {
+                    if let Some(found) = layout.fields.iter().find(|f| f.name == *field) {
+                        return self.resolve(&found.ty);
+                    }
+                }
+                if let Some(layout) = self.internal_layout(base_ty) {
+                    if let Some(found) = layout.fields.iter().find(|f| f.name == *field) {
+                        return self.resolve(&found.ty);
+                    }
+                }
+                None
             }
             Expr::Var(name) => self.lookup(name).map(|local| local.ty),
+            Expr::Call { name, args } if Self::numeric_intrinsic_name(name) => {
+                self.numeric_intrinsic_hint(name, args)
+            }
+            Expr::Call { name, args } if memory_builtin_name(name) => self.memory_hint(name, args),
             Expr::Call { name, .. } if Self::builtin_result(name).is_some() => {
                 Self::builtin_result(name)
             }
@@ -468,6 +514,11 @@ impl Function<'_> {
                 .keys()
                 .position(|record| record == name)
                 .map(Ty::Record),
+            Expr::Call { name, .. } if self.internal.contains_key(name) => self
+                .internal
+                .keys()
+                .position(|record| record == name)
+                .map(Ty::Internal),
             Expr::Call { name, .. } => self.signatures.get(name).map(|sig| sig.result),
             Expr::BinOp {
                 op:
@@ -541,6 +592,15 @@ impl Function<'_> {
             Expr::Call { name, args } if self.layouts.contains_key(name) => {
                 self.construct(name, args)
             }
+            Expr::Call { name, args } if self.internal.contains_key(name) => {
+                self.construct_internal(name, args)
+            }
+            Expr::Call { name, args } if Self::numeric_intrinsic_name(name) => {
+                self.numeric_intrinsic(name, args, expected)
+            }
+            Expr::Call { name, args } if memory_builtin_name(name) => {
+                self.memory_builtin(name, args)
+            }
             Expr::Call { name, args } if Self::builtin_result(name).is_some() => {
                 self.builtin(name, args)
             }
@@ -587,18 +647,23 @@ impl Function<'_> {
             self.store(local);
             spills.push(local);
         }
-        let result_slot = if matches!(signature.result, Ty::Record(_)) {
+        let result_slot = if matches!(signature.result, Ty::Record(_) | Ty::Internal(_)) {
             Some(self.allocate(signature.result))
         } else {
             None
         };
-        let (places, stack) = abi::arguments(self.layouts, &signature.params, signature.result)
-            .ok_or_else(|| {
-                self.error(
-                    "N109",
-                    "native call argument area exceeds addressing limits",
-                )
-            })?;
+        let (places, stack) = abi::arguments(
+            self.layouts,
+            self.internal,
+            &signature.params,
+            signature.result,
+        )
+        .ok_or_else(|| {
+            self.error(
+                "N109",
+                "native call argument area exceeds addressing limits",
+            )
+        })?;
         if stack != 0 {
             let _ = writeln!(self.code, "    subq ${stack}, %rsp");
         }
@@ -611,8 +676,14 @@ impl Function<'_> {
         }
         for (local, place) in spills.iter().zip(&places) {
             if let Place::Registers { first, words } = *place {
+                if local.ty == Ty::Borrow {
+                    // Borrows ride as one address word; the callee slot
+                    // aliases the original owner metadata, never a copy.
+                    let _ = writeln!(self.code, "    movq -{}(%rbp), {}", local.slot, REGS[first]);
+                    continue;
+                }
                 for word in 0..words {
-                    let displacement = if matches!(local.ty, Ty::Record(_)) {
+                    let displacement = if matches!(local.ty, Ty::Record(_) | Ty::Internal(_)) {
                         -(local.slot as i64) + (word * 8) as i64
                     } else {
                         -((local.slot + word * 8) as i64)
@@ -625,7 +696,7 @@ impl Function<'_> {
                 }
             }
         }
-        if abi::memory_result(self.layouts, signature.result) {
+        if abi::memory_result(self.layouts, self.internal, signature.result) {
             let _ = writeln!(
                 self.code,
                 "    leaq -{}(%rbp), %rdi",
@@ -641,14 +712,22 @@ impl Function<'_> {
             let _ = writeln!(self.code, "    addq ${stack}, %rsp");
         }
         if let Some(slot) = result_slot {
-            if !abi::memory_result(self.layouts, signature.result) {
+            if !abi::memory_result(self.layouts, self.internal, signature.result) {
                 let _ = writeln!(self.code, "    movq %rax, -{slot}(%rbp)");
-                if self.record_layout(signature.result).expect("record").size > 8 {
+                let second = self
+                    .record_layout(signature.result)
+                    .map(|layout| layout.size)
+                    .or_else(|| {
+                        self.internal_layout(signature.result)
+                            .map(|layout| layout.size)
+                    })
+                    .unwrap_or(8);
+                if second > 8 || signature.result.pair() {
                     let _ = writeln!(self.code, "    movq %rdx, {}(%rbp)", -(slot as i64) + 8);
                 }
             }
             let _ = writeln!(self.code, "    leaq -{slot}(%rbp), %rax");
-        } else if !signature.result.span() {
+        } else if !signature.result.pair() {
             self.normalize(signature.result);
         }
         Ok(signature.result)
@@ -661,4 +740,15 @@ impl Function<'_> {
         let done = self.label();
         let _ = writeln!(self.code, "    cmpq -{}(%rbp), %rdx\n    jne {mismatch}\n    testq %rdx, %rdx\n    je {equal}\n    movq -{}(%rbp), %r8\n    xorq %rcx, %rcx\n{loop_}:\n    movzbl (%r8,%rcx), %r9d\n    cmpb (%rax,%rcx), %r9b\n    jne {mismatch}\n    incq %rcx\n    cmpq %rdx, %rcx\n    jne {loop_}\n{equal}:\n    movl $1, %eax\n    jmp {done}\n{mismatch}:\n    xorl %eax, %eax\n{done}:", saved.slot + 8, saved.slot);
     }
+}
+
+/// Whether a `break` in `body` exits the loop that directly owns `body`;
+/// breaks inside nested loops target those loops instead.
+fn breaks_out(body: &[Stmt]) -> bool {
+    body.iter().any(|statement| match statement {
+        Stmt::Break => true,
+        Stmt::If { then, else_, .. } => breaks_out(then) || breaks_out(else_),
+        Stmt::Unsafe { body } => breaks_out(body),
+        _ => false,
+    })
 }

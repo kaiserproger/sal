@@ -8,7 +8,15 @@ RUN cargo build --release --locked -j 2 -p sal_cli \
     && target/release/sal build-exe apps/warehouse/main.sal --out /out/app --strict \
     && target/release/sal build-exe apps/warehouse/healthcheck.sal --out /out/probe --strict
 
-FROM scratch
+FROM builder AS qa-builder
+RUN target/release/sal build-exe apps/warehouse/test_api.sal --out /out/qa --strict
+
+FROM scratch AS qa
+COPY --from=qa-builder /out/qa/test_api /test_api
+USER 65532:65532
+ENTRYPOINT ["/test_api"]
+
+FROM scratch AS runtime
 COPY --from=builder /out/app/main /warehouse
 COPY --from=builder /out/probe/healthcheck /healthcheck
 USER 65532:65532

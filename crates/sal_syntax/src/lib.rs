@@ -6,19 +6,25 @@
 //!   `application NAME.` | `use "PATH".` | `entity NAME:` | `enum NAME:` | `layer NAME:`
 //!   | `service NAME:` | `operation NAME:` | `module NAME:`
 //! - `entity` body: `has FIELD of type TYPE.` | `invariant TEXT.`
+//!   | `encoding JSON.` | `defaults NAME to EXPR.` | `iterates TYPE using NAME.`
+//!   | `requires:` sub-block of `EXPR [otherwise EXPR].` contract lines.
 //! - `enum` body: `VARIANT.`
 //! - `layer` body: `owns NAME.` | `may depend on NAME.`
 //!   | `must not depend on NAME.` | `must not depend on NAME directly.`
 //! - `service` body: `belongs to NAME.` | `implements NAME.`
-//!   | `requires:` | `ensures:` | `ensures on success:`
+//!   | `requires:` | `ensures:` | `ensures on success:` (service contracts
+//!   stay prose strings, unchanged by the typed operation/entity surface).
 //!   | `execution must be atomic.` | `allowed effects:` | `forbidden effects:`
 //!   Sub-blocks under `requires:`/`ensures:`/`allowed effects:`/`forbidden effects:`
 //!   hold one `ITEM.` per line at deeper indent (trailing `.` stripped on store).
 //! - `operation` body: `accepts NAME of type TYPE.` | `returns TYPE.`
+//!   | `returns TYPE from A, B.` | `borrows NAME.` | `consumes NAME.`
 //!   | `effects: A, B.` | `exports "C" as "symbol".`
-//!   | `requires:` / `ensures:` sub-blocks as above.
+//!   | `requires:` sub-block of `EXPR [otherwise EXPR].` contract lines.
+//!   | `ensures:` sub-block of `EXPR.` lines (service contracts stay prose).
 //!   | `body:` containing lets (`let NAME = EXPR.` / `let mut NAME = EXPR.`),
-//!   assignments (`set NAME = EXPR.`), returns, expressions, if/else, for, and while.
+//!   assignments (`set NAME = EXPR.`), returns, expressions, if/else, for, while,
+//!   and `unsafe:` blocks (`unsafe:` + indented body emits `Stmt::Unsafe { body }`).
 //!   Expressions include literals, names, calls, fields, indexes, parenthesized
 //!   groups, `+`, `-`, `*`, `/`, `%`, `<`, `<=`, `>`, `>=`, `==`, `!=`.
 //!   Reserved intrinsic names stay ordinary calls here; reservation is semantic.
@@ -93,6 +99,39 @@ pub struct FieldDecl {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContractClause {
+    pub condition: Expr,
+    pub otherwise: Option<Expr>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OwnershipDecl {
+    pub borrows: Vec<String>,
+    pub consumes: Vec<String>,
+    pub return_from: Vec<String>,
+    pub lowered: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct JsonSchemaDecl {
+    pub enabled: bool,
+    pub defaults: Vec<FieldDefault>,
+    pub requires: Vec<ContractClause>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldDefault {
+    pub name: String,
+    pub value: Expr,
+}
+
+#[derive(Debug, Clone)]
+pub struct IterationDecl {
+    pub item: TypeRef,
+    pub next: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct EntityDecl {
     pub name: String,
@@ -100,6 +139,9 @@ pub struct EntityDecl {
     pub fields: Vec<FieldDecl>,
     pub invariants: Vec<String>,
     pub c_layout: bool,
+    pub json: JsonSchemaDecl,
+    pub iteration: Option<IterationDecl>,
+    pub generated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +220,9 @@ pub enum Stmt {
         cond: Expr,
         body: Vec<Stmt>,
     },
+    Unsafe {
+        body: Vec<Stmt>,
+    },
     Break,
     Continue,
     ExprStmt(Expr),
@@ -234,8 +279,10 @@ pub struct OperationDecl {
     pub accepts: Vec<ParamDecl>,
     pub returns: Option<TypeRef>,
     pub effects: Vec<String>,
-    pub requires: Vec<String>,
-    pub ensures: Vec<String>,
+    pub requires: Vec<ContractClause>,
+    pub ensures: Vec<Expr>,
+    pub ownership: OwnershipDecl,
+    pub generated: bool,
     pub responds_literal: Option<String>,
     pub c_export: Option<String>,
     pub c_import: Option<String>,
@@ -337,6 +384,13 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
             && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     }
 
+    // Erased owners and compiler bridges are not a source-level factory API.
+    fn reserved_generated_name(name: &str) -> bool {
+        ["SalDecl", "SalColl", "SalConc"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    }
+
     fn discard_type(ty: TypeRef) {
         let mut pending = match ty {
             TypeRef::Named(_) => return,
@@ -386,7 +440,11 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
             {
                 offset += 1;
             }
-            let name = text.get(start..offset)?.to_owned();
+            let name = text.get(start..offset)?;
+            if reserved_generated_name(name) {
+                return None;
+            }
+            let name = name.to_owned();
             skip_space(bytes, &mut offset);
             if bytes.get(offset) == Some(&b'<') {
                 parents.0.push((name, Vec::new()));
@@ -447,6 +505,36 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
             }
         }
     }
+    fn discard_stmt(stmt: Stmt) {
+        let mut pending = vec![stmt];
+        while let Some(stmt) = pending.pop() {
+            match stmt {
+                Stmt::Let { expr, .. }
+                | Stmt::Assign { expr, .. }
+                | Stmt::Return(expr)
+                | Stmt::ExprStmt(expr) => discard_expr(expr),
+                Stmt::If {
+                    cond, then, else_, ..
+                } => {
+                    discard_expr(cond);
+                    pending.extend(then);
+                    pending.extend(else_);
+                }
+                Stmt::For { iter, body, .. } => {
+                    discard_expr(iter);
+                    pending.extend(body);
+                }
+                Stmt::While { cond, body } => {
+                    discard_expr(cond);
+                    pending.extend(body);
+                }
+                Stmt::Unsafe { body } => {
+                    pending.extend(body);
+                }
+                Stmt::Break | Stmt::Continue => {}
+            }
+        }
+    }
 
     fn expr_name<'a>(text: &'a str, offset: &mut usize) -> Option<&'a str> {
         let bytes = text.as_bytes();
@@ -462,6 +550,7 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
             *offset += 1;
         }
         text.get(start..*offset)
+            .filter(|name| !reserved_generated_name(name))
     }
 
     fn expr_space(text: &str, offset: &mut usize) {
@@ -904,6 +993,9 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
                 fields: Vec::new(),
                 invariants: Vec::new(),
                 c_layout: false,
+                json: Default::default(),
+                iteration: None,
+                generated: false,
             }),
             "enum" => Item::Enum(EnumDecl {
                 name,
@@ -934,6 +1026,8 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
                 effects: Vec::new(),
                 requires: Vec::new(),
                 ensures: Vec::new(),
+                ownership: Default::default(),
+                generated: false,
                 responds_literal: None,
                 c_export: None,
                 c_import: None,
@@ -988,8 +1082,219 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
         Ok((name, ty))
     }
 
+    /// Structured header-directive dispatch: each declaration kind maps its
+    /// one-line headers to a directive enum once, and `statement` matches the
+    /// enum. New headers add a variant plus one match arm, never another
+    /// free-floating prefix `if` chain.
+    enum EntityDirective<'a> {
+        Has(&'a str),
+        Invariant(&'a str),
+        Layout,
+        Encoding(&'a str),
+        Defaults(&'a str),
+        Iterates(&'a str),
+    }
+
+    type DirectiveBuilder<'a> = fn(&'a str) -> EntityDirective<'a>;
+
+    fn entity_directive<'a>(text: &'a str) -> Option<EntityDirective<'a>> {
+        let prefixed: [(&str, DirectiveBuilder<'a>); 5] = [
+            ("has ", EntityDirective::Has),
+            ("invariant ", EntityDirective::Invariant),
+            ("encoding ", EntityDirective::Encoding),
+            ("defaults ", EntityDirective::Defaults),
+            ("iterates ", EntityDirective::Iterates),
+        ];
+        if text.starts_with("layout") {
+            return Some(EntityDirective::Layout);
+        }
+        prefixed
+            .into_iter()
+            .find_map(|(prefix, build)| text.strip_prefix(prefix).map(build))
+    }
+
+    enum OpDirective<'a> {
+        Accepts(&'a str),
+        Returns(&'a str),
+        Borrows(&'a str),
+        Consumes(&'a str),
+        Effects(&'a str),
+        RespondsWith(&'a str),
+        Linkage(&'a str),
+    }
+
+    fn op_directive(text: &str) -> Option<OpDirective<'_>> {
+        if let Some(rest) = text.strip_prefix("effects:") {
+            return Some(OpDirective::Effects(rest));
+        }
+        if text.starts_with("exports") || text.starts_with("imports") {
+            return Some(OpDirective::Linkage(text));
+        }
+        let (keyword, rest) = text.split_once(' ').unwrap_or((text, ""));
+        match keyword {
+            "accepts" => Some(OpDirective::Accepts(rest)),
+            "returns" => Some(OpDirective::Returns(rest)),
+            "borrows" => Some(OpDirective::Borrows(rest)),
+            "consumes" => Some(OpDirective::Consumes(rest)),
+            "responds" => rest.strip_prefix("with ").map(OpDirective::RespondsWith),
+            _ => None,
+        }
+    }
+
+    /// Split `defaults NAME to EXPR` remainder into the field name and the
+    /// raw value text. The value may itself mention `to`; only the first
+    /// whitespace-delimited `to` after the name is the separator.
+    fn split_defaults(rest: &str) -> Result<(String, &str), ParseError> {
+        let expected = "expected `defaults NAME to EXPR`";
+        let trimmed = rest.trim();
+        let boundary = trimmed
+            .find(char::is_whitespace)
+            .ok_or(("E0004", expected))?;
+        let name = named(trimmed[..boundary].trim())?;
+        let after = trimmed[boundary..].trim_start();
+        let tail = after
+            .strip_prefix("to")
+            .filter(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
+            .ok_or(("E0004", expected))?;
+        let value = tail.trim_start();
+        if value.is_empty() {
+            return Err(("E0004", expected));
+        }
+        Ok((name, value))
+    }
+
+    /// Split `iterates TYPE using NAME` remainder at the rightmost
+    /// whitespace-delimited `using`, so a `using` nested inside generic
+    /// arguments cannot steal the separator.
+    fn split_iterates(rest: &str) -> Result<(&str, &str), ParseError> {
+        let expected = "expected `iterates TYPE using NAME`";
+        let bytes = rest.as_bytes();
+        let mut candidate: Option<usize> = None;
+        let mut index = 0;
+        while index + "using".len() <= bytes.len() {
+            if bytes[index..].starts_with(b"using") {
+                let left_ok = index == 0 || bytes[index - 1].is_ascii_whitespace();
+                let end = index + "using".len();
+                let right_ok = end == bytes.len() || bytes[end].is_ascii_whitespace();
+                if left_ok && right_ok {
+                    candidate = Some(index);
+                }
+                index += 1;
+            } else {
+                index += 1;
+            }
+        }
+        let start = candidate.ok_or(("E0004", expected))?;
+        let ty_text = rest[..start].trim();
+        let next_text = rest[start + "using".len()..].trim();
+        if ty_text.is_empty() || next_text.is_empty() {
+            return Err(("E0004", expected));
+        }
+        Ok((ty_text, next_text))
+    }
+
+    /// Split `TYPE [from A, B]` remainder at the first whitespace-delimited
+    /// `from`. Returns the type text plus the optional provenance list text.
+    fn split_returns_from(rest: &str) -> Result<(&str, Option<&str>), ParseError> {
+        let bytes = rest.as_bytes();
+        let mut index = 0;
+        while index + "from".len() <= bytes.len() {
+            if bytes[index..].starts_with(b"from") {
+                let left_ok = index == 0 || bytes[index - 1].is_ascii_whitespace();
+                let end = index + "from".len();
+                let right_ok = end == bytes.len() || bytes[end].is_ascii_whitespace();
+                if left_ok && right_ok {
+                    let ty_text = rest[..index].trim();
+                    let names = rest[end..].trim();
+                    if names.is_empty() {
+                        return Err(("E0004", "expected `returns TYPE from A, B`"));
+                    }
+                    return Ok((ty_text, Some(names)));
+                }
+                index += 1;
+            } else {
+                index += 1;
+            }
+        }
+        Ok((rest.trim(), None))
+    }
+
+    /// Byte offsets of every whitespace-delimited `otherwise` outside string
+    /// literals, left to right. Callers try splits rightmost-first so a Var
+    /// literally named `otherwise` still parses as an ordinary expression.
+    fn otherwise_splits(text: &str) -> Vec<usize> {
+        let bytes = text.as_bytes();
+        let mut positions = Vec::new();
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                index += 1;
+                continue;
+            }
+            if byte == b'"' {
+                in_string = true;
+                index += 1;
+                continue;
+            }
+            if bytes[index..].starts_with(b"otherwise") {
+                let end = index + "otherwise".len();
+                let left_ok = index == 0 || bytes[index - 1].is_ascii_whitespace();
+                let right_ok = end == bytes.len() || bytes[end].is_ascii_whitespace();
+                if left_ok && right_ok {
+                    positions.push(index);
+                }
+                index += 1;
+                continue;
+            }
+            index += 1;
+        }
+        positions
+    }
+
+    /// Parse one contract line `EXPR [otherwise EXPR]` into typed AST.
+    /// Unsupported prose fails so the caller reports E0004 and recovers the
+    /// sibling lines; it is never stored or silently ignored.
+    fn parse_contract_clause(text: &str) -> Result<ContractClause, ParseError> {
+        for start in otherwise_splits(text).into_iter().rev() {
+            let condition_text = text[..start].trim();
+            let otherwise_text = text[start + "otherwise".len()..].trim();
+            if condition_text.is_empty() || otherwise_text.is_empty() {
+                continue;
+            }
+            let Some(condition) = parse_expr(condition_text) else {
+                continue;
+            };
+            if let Some(otherwise) = parse_expr(otherwise_text) {
+                return Ok(ContractClause {
+                    condition,
+                    otherwise: Some(otherwise),
+                });
+            }
+            discard_expr(condition);
+        }
+        match parse_expr(text.trim()) {
+            Some(condition) => Ok(ContractClause {
+                condition,
+                otherwise: None,
+            }),
+            None => Err(("E0004", "malformed contract expression")),
+        }
+    }
+
     enum Subblock<'a> {
         Text(&'a mut Vec<String>),
+        Requires(&'a mut Vec<ContractClause>),
+        Ensures(&'a mut Vec<Expr>),
         Body(&'a mut Vec<Stmt>),
     }
 
@@ -1002,9 +1307,13 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
                 "forbidden effects" => Some(Subblock::Text(&mut service.forbidden_effects)),
                 _ => None,
             },
+            Item::Entity(entity) => match label {
+                "requires" => Some(Subblock::Requires(&mut entity.json.requires)),
+                _ => None,
+            },
             Item::Operation(operation) => match label {
-                "requires" => Some(Subblock::Text(&mut operation.requires)),
-                "ensures" => Some(Subblock::Text(&mut operation.ensures)),
+                "requires" => Some(Subblock::Requires(&mut operation.requires)),
+                "ensures" => Some(Subblock::Ensures(&mut operation.ensures)),
                 "body" => Some(Subblock::Body(&mut operation.body)),
                 _ => None,
             },
@@ -1018,7 +1327,7 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
             .split(|ch: char| ch.is_whitespace() || ch == ':' || ch == '.')
             .next()
             .unwrap_or("");
-        if matches!(keyword, "if" | "for" | "while") {
+        if matches!(keyword, "if" | "for" | "while" | "unsafe") {
             let stem = line
                 .text
                 .strip_suffix(':')
@@ -1052,6 +1361,12 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
                         iter: parse_expr(iter.trim()).ok_or(("E0004", "malformed expression"))?,
                         body: Vec::new(),
                     }
+                }
+                "unsafe" => {
+                    if !rest.is_empty() {
+                        return Err(("E0001", "unsafe block takes no condition"));
+                    }
+                    Stmt::Unsafe { body: Vec::new() }
                 }
                 _ => return Err(("E0001", "unknown body statement")),
             };
@@ -1153,6 +1468,16 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
                 self.stmts.push(stmt);
             }
         }
+        impl Drop for Frame {
+            fn drop(&mut self) {
+                for stmt in self.stmts.drain(..) {
+                    discard_stmt(stmt);
+                }
+                if let Some(owner) = self.owner.take() {
+                    discard_stmt(owner);
+                }
+            }
+        }
         fn close(frames: &mut Vec<Frame>) {
             let Some(mut frame) = frames.pop() else {
                 return;
@@ -1163,12 +1488,14 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
             match &mut owner {
                 Stmt::If { then, else_, .. } => {
                     if frame.is_else {
-                        *else_ = frame.stmts;
+                        *else_ = std::mem::take(&mut frame.stmts);
                     } else {
-                        *then = frame.stmts;
+                        *then = std::mem::take(&mut frame.stmts);
                     }
                 }
-                Stmt::For { body, .. } | Stmt::While { body, .. } => *body = frame.stmts,
+                Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::Unsafe { body } => {
+                    *body = std::mem::take(&mut frame.stmts);
+                }
                 _ => {}
             }
             if let Some(parent) = frames.last_mut() {
@@ -1253,7 +1580,9 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
         while frames.len() > 1 {
             close(&mut frames);
         }
-        frames.pop().map_or_else(Vec::new, |frame| frame.stmts)
+        frames
+            .pop()
+            .map_or_else(Vec::new, |mut frame| std::mem::take(&mut frame.stmts))
     }
 
     fn statement(item: &mut Item, line: &Line<'_>) -> Result<Option<&'static str>, ParseError> {
@@ -1281,20 +1610,17 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
                 };
             }
         }
-        let prefixes: &[&str] = match item {
-            Item::Entity(_) => &["has ", "invariant ", "layout"],
-            Item::Enum(_) => &[""],
-            Item::Layer(_) => &["owns ", "may depend on ", "must not depend on "],
-            Item::Service(_) => &["belongs to ", "implements ", "execution must be atomic"],
-            Item::Operation(_) => &[
-                "accepts ",
-                "returns",
-                "effects:",
-                "responds with ",
-                "exports",
-                "imports",
-            ],
-            Item::Module(_) => &[
+        let known_header = match item {
+            Item::Entity(_) => entity_directive(stem).is_some(),
+            Item::Operation(_) => op_directive(stem).is_some(),
+            Item::Enum(_) => !stem.is_empty(),
+            Item::Layer(_) => ["owns ", "may depend on ", "must not depend on "]
+                .iter()
+                .any(|prefix| stem.starts_with(prefix)),
+            Item::Service(_) => ["belongs to ", "implements ", "execution must be atomic"]
+                .iter()
+                .any(|prefix| stem.starts_with(prefix)),
+            Item::Module(_) => [
                 "belongs to ",
                 "owns ",
                 "may read ",
@@ -1302,12 +1628,18 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
                 "cannot modify ",
                 "forbids ",
                 "implements ",
-            ],
-            Item::Server(_) => &["listens on port ", "speaks "],
-            Item::Route(_) => &["handles ", "responds with "],
-            Item::Application { .. } | Item::Use { .. } => &[],
+            ]
+            .iter()
+            .any(|prefix| stem.starts_with(prefix)),
+            Item::Server(_) => ["listens on port ", "speaks "]
+                .iter()
+                .any(|prefix| stem.starts_with(prefix)),
+            Item::Route(_) => ["handles ", "responds with "]
+                .iter()
+                .any(|prefix| stem.starts_with(prefix)),
+            Item::Application { .. } | Item::Use { .. } => false,
         };
-        if !prefixes.iter().any(|prefix| stem.starts_with(prefix)) {
+        if !known_header {
             return Err(("E0001", "unknown statement in declaration body"));
         }
         let Some(text) = line.text.strip_suffix('.') else {
@@ -1315,20 +1647,22 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
         };
         let text = text.trim_end();
         match item {
-            Item::Entity(entity) => {
-                if let Some(rest) = text.strip_prefix("has ") {
+            Item::Entity(entity) => match entity_directive(text) {
+                Some(EntityDirective::Has(rest)) => {
                     let (name, ty) = typed(rest)?;
                     entity.fields.push(FieldDecl {
                         name,
                         ty,
                         span: line.span(),
                     });
-                } else if let Some(rest) = text.strip_prefix("invariant ") {
+                }
+                Some(EntityDirective::Invariant(rest)) => {
                     if rest.trim().is_empty() {
                         return Err(("E0001", "invariant text must not be empty"));
                     }
                     entity.invariants.push(rest.trim().to_owned());
-                } else if text.starts_with("layout") {
+                }
+                Some(EntityDirective::Layout) => {
                     if text != "layout \"C\"" {
                         return Err(("E0004", "expected `layout \"C\"`"));
                     }
@@ -1336,10 +1670,33 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
                         return Err(("E0004", "duplicate layout clause"));
                     }
                     entity.c_layout = true;
-                } else {
-                    return Err(("E0001", "unknown entity statement"));
                 }
-            }
+                Some(EntityDirective::Encoding(rest)) => {
+                    if rest.trim() != "JSON" {
+                        return Err(("E0004", "expected `encoding JSON`"));
+                    }
+                    if entity.json.enabled {
+                        return Err(("E0004", "duplicate encoding clause"));
+                    }
+                    entity.json.enabled = true;
+                }
+                Some(EntityDirective::Defaults(rest)) => {
+                    let (name, value_text) = split_defaults(rest)?;
+                    let value =
+                        parse_expr(value_text.trim()).ok_or(("E0004", "malformed expression"))?;
+                    entity.json.defaults.push(FieldDefault { name, value });
+                }
+                Some(EntityDirective::Iterates(rest)) => {
+                    let (ty_text, next_text) = split_iterates(rest)?;
+                    if entity.iteration.is_some() {
+                        return Err(("E0004", "duplicate iterates clause"));
+                    }
+                    let next = named(next_text.trim())?;
+                    let item = parse_type(ty_text).ok_or(("E0004", "malformed type"))?;
+                    entity.iteration = Some(IterationDecl { item, next });
+                }
+                None => return Err(("E0001", "unknown entity statement")),
+            },
             Item::Enum(declaration) => declaration.variants.push(named(text)?),
             Item::Layer(layer) => {
                 let rule = if let Some(rest) = text.strip_prefix("owns ") {
@@ -1378,24 +1735,47 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
                     return Err(("E0001", "unknown service statement"));
                 }
             }
-            Item::Operation(operation) => {
-                if let Some(rest) = text.strip_prefix("accepts ") {
+            Item::Operation(operation) => match op_directive(text) {
+                Some(OpDirective::Accepts(rest)) => {
                     let (name, ty) = typed(rest)?;
                     operation.accepts.push(ParamDecl { name, ty });
-                } else if text == "returns" {
-                    return Err(("E0004", "malformed type"));
-                } else if let Some(rest) = text.strip_prefix("returns ") {
-                    let ty = parse_type(rest).ok_or(("E0004", "malformed type"))?;
-                    if let Some(previous) = operation.returns.replace(ty) {
-                        discard_type(previous);
+                }
+                Some(OpDirective::Returns(rest)) => {
+                    let (ty_text, provenance) = split_returns_from(rest)?;
+                    if ty_text.is_empty() || ty_text == "returns" {
+                        return Err(("E0004", "malformed type"));
                     }
-                } else if let Some(rest) = text.strip_prefix("effects:") {
+                    if operation.returns.is_some() {
+                        return Err(("E0004", "duplicate returns clause"));
+                    }
+                    let names = provenance
+                        .map(|names| names.split(',').map(|name| named(name.trim())).collect())
+                        .transpose()?
+                        .unwrap_or_default();
+                    let ty = parse_type(ty_text).ok_or(("E0004", "malformed type"))?;
+                    operation.returns = Some(ty);
+                    operation.ownership.return_from = names;
+                }
+                Some(OpDirective::Borrows(rest)) => {
+                    if rest.is_empty() {
+                        return Err(("E0004", "expected a borrowed parameter name"));
+                    }
+                    operation.ownership.borrows.push(named(rest.trim())?);
+                }
+                Some(OpDirective::Consumes(rest)) => {
+                    if rest.is_empty() {
+                        return Err(("E0004", "expected a consumed parameter name"));
+                    }
+                    operation.ownership.consumes.push(named(rest.trim())?);
+                }
+                Some(OpDirective::Effects(rest)) => {
                     let effects = rest
                         .split(',')
                         .map(|effect| named(effect.trim()))
                         .collect::<Result<Vec<_>, _>>()?;
                     operation.effects.extend(effects);
-                } else if let Some(rest) = text.strip_prefix("responds with ") {
+                }
+                Some(OpDirective::RespondsWith(rest)) => {
                     let body = rest.trim();
                     if body.starts_with('"') && body.ends_with('"') && body.len() >= 2 {
                         let literal = unescape(&body[1..body.len() - 1])
@@ -1405,21 +1785,23 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
                     } else {
                         return Err(("E0001", "expected `responds with \"literal\"`"));
                     }
-                } else if let Some(rest) = text
-                    .strip_prefix("exports")
-                    .or_else(|| text.strip_prefix("imports"))
-                {
-                    let imported = text.starts_with("imports");
+                }
+                Some(OpDirective::Linkage(rest)) => {
+                    let imported = rest.starts_with("imports");
                     let expected = if imported {
                         "expected `imports \"C\" as \"symbol\"`"
                     } else {
                         "expected `exports \"C\" as \"symbol\"`"
                     };
-                    if !rest.starts_with([' ', '\t']) {
+                    let tail = rest
+                        .strip_prefix("exports")
+                        .or_else(|| rest.strip_prefix("imports"))
+                        .unwrap_or(rest);
+                    if !tail.starts_with([' ', '\t']) {
                         return Err(("E0004", expected));
                     }
-                    let rest = rest.trim_start();
-                    let abi = rest.strip_prefix('"').ok_or(("E0004", expected))?;
+                    let tail = tail.trim_start();
+                    let abi = tail.strip_prefix('"').ok_or(("E0004", expected))?;
                     let end = abi.find('"').ok_or(("E0004", expected))?;
                     if &abi[..end] != "C" {
                         return Err(("E0004", "unknown C linkage ABI (only \"C\" is supported)"));
@@ -1451,10 +1833,9 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
                     } else {
                         operation.c_export = Some(symbol.to_owned());
                     }
-                } else {
-                    return Err(("E0001", "unknown operation statement"));
                 }
-            }
+                None => return Err(("E0001", "unknown operation statement")),
+            },
             Item::Server(server) => {
                 if let Some(rest) = text.strip_prefix("listens on port ") {
                     let digits = rest.trim();
@@ -1660,10 +2041,31 @@ pub fn parse(_source: &str) -> (SalFile, Vec<Diagnostic>) {
                                             "sub-block item must not be empty",
                                         ),
                                     );
-                                } else if let Some(Subblock::Text(target)) =
-                                    subblock(&mut item, label)
-                                {
-                                    target.push(value.to_owned());
+                                } else {
+                                    match subblock(&mut item, label) {
+                                        Some(Subblock::Text(target)) => {
+                                            target.push(value.to_owned());
+                                        }
+                                        Some(Subblock::Requires(target)) => {
+                                            match parse_contract_clause(value) {
+                                                Ok(clause) => target.push(clause),
+                                                Err((code, message)) => {
+                                                    diagnostics
+                                                        .push(child.diagnostic(code, message));
+                                                }
+                                            }
+                                        }
+                                        Some(Subblock::Ensures(target)) => {
+                                            match parse_expr(value) {
+                                                Some(condition) => target.push(condition),
+                                                None => diagnostics.push(child.diagnostic(
+                                                    "E0004",
+                                                    "malformed contract expression",
+                                                )),
+                                            }
+                                        }
+                                        Some(Subblock::Body(_)) | None => {}
+                                    }
                                 }
                             } else {
                                 diagnostics.push(
@@ -2115,6 +2517,64 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_blocks_nest_in_branches_loops_and_functions_without_swallowing_siblings() {
+        let (file, diagnostics) = parse(
+            "operation Run:\n    body:\n        if true:\n            unsafe:\n                return 1.\n            return 2.\n        else:\n            unsafe:\n                return 3.\n        while true:\n            unsafe:\n                continue.\n        for row in rows:\n            unsafe:\n                emit(row).\n        unsafe:\n            unsafe:\n                return 4.\n        return 5.\n",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let Item::Operation(operation) = &file.items[0] else {
+            panic!("expected operation");
+        };
+        assert_eq!(operation.body.len(), 5);
+        let Stmt::If { then, else_, .. } = &operation.body[0] else {
+            panic!("expected outer if");
+        };
+        assert_eq!(then.len(), 2);
+        assert!(matches!(&then[0], Stmt::Unsafe { body } if body == &[Stmt::Return(Expr::Int(1))]));
+        assert_eq!(then[1], Stmt::Return(Expr::Int(2)));
+        assert!(
+            matches!(&else_[0], Stmt::Unsafe { body } if body == &[Stmt::Return(Expr::Int(3))])
+        );
+        assert!(matches!(&operation.body[1], Stmt::While { body, .. }
+            if body == &[Stmt::Unsafe { body: vec![Stmt::Continue] }]));
+        assert!(matches!(&operation.body[2], Stmt::For { body, .. } if body.len() == 1));
+        let Stmt::Unsafe { body } = &operation.body[3] else {
+            panic!("expected unsafe");
+        };
+        assert!(matches!(&body[0], Stmt::Unsafe { .. }));
+        assert_eq!(operation.body[4], Stmt::Return(Expr::Int(5)));
+    }
+
+    #[test]
+    fn unsafe_headers_recover_empty_malformed_and_orphan_else() {
+        let (file, diagnostics) = parse(
+            "operation Run:\n    body:\n        unsafe.\n        unsafe extra:\n        unsafe:\n        else:\n        return 2.\n",
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|d| (d.code, d.span.line))
+                .collect::<Vec<_>>(),
+            [
+                ("E0002", 3usize),
+                ("E0001", 4usize),
+                ("E0005", 5usize),
+                ("E0001", 6usize)
+            ],
+        );
+        let Item::Operation(operation) = &file.items[0] else {
+            panic!("expected operation");
+        };
+        assert_eq!(
+            operation.body,
+            [
+                Stmt::Unsafe { body: Vec::new() },
+                Stmt::Return(Expr::Int(2))
+            ]
+        );
+    }
+
+    #[test]
     fn body_headers_report_terminators_empty_blocks_and_orphan_else() {
         let (_, diagnostics) = parse(
             "operation Run:\n    body.\n        return 0.\n    body:\n        else:\n        if true.\n        while true:\n        return 1.\n        for row in rows.\n    returns Int.\n",
@@ -2160,9 +2620,9 @@ operation PlaceOrder:
     returns Result<Order, Error>.
     effects: persistence, clock.
     requires:
-        order is valid.
+        valid(order).
     ensures:
-        order is stored.
+        stored(order).
 module Orders:
     belongs to Domain.
     owns Order.
@@ -2202,16 +2662,31 @@ module Orders:
         assert_eq!(service.allowed_effects, ["persistence"]);
         assert_eq!(service.forbidden_effects, ["network"]);
         let Item::Operation(operation) = &file.items[5] else {
-            panic!("expected operation");
+            panic!("expected operation")
         };
         assert_eq!(operation.effects, ["persistence", "clock"]);
+        assert_eq!(operation.requires.len(), 1);
+        assert_eq!(
+            operation.requires[0].condition,
+            Expr::Call {
+                name: "valid".into(),
+                args: vec![Expr::Var("order".into())],
+            }
+        );
+        assert_eq!(operation.requires[0].otherwise, None);
+        assert_eq!(
+            operation.ensures,
+            [Expr::Call {
+                name: "stored".into(),
+                args: vec![Expr::Var("order".into())],
+            }]
+        );
         let Item::Module(module) = &file.items[6] else {
-            panic!("expected module");
+            panic!("expected module")
         };
         assert_eq!(module.cannot_modify, ["Catalog"]);
         assert_eq!(module.forbids, ["network"]);
     }
-
     #[test]
     fn recovers_from_each_diagnostic_category() {
         let source = "\
@@ -2284,12 +2759,12 @@ operation Good:
     fn rejects_deep_malformed_types_without_recursive_cleanup() {
         let nested = format!("{}Id{}", "List<".repeat(20_000), ">".repeat(20_000));
         let source = format!(
-            "operation Op:\n    returns {nested} extra.\n    returns Outer<{nested},>.\n    returns {nested}.\n    returns Id.\n"
+            "operation Op:\n    returns {nested} extra.\n    returns Outer<{nested},>.\n    returns Id.\n    returns {nested}.\n"
         );
         let (file, diagnostics) = parse(&source);
         assert_eq!(
             diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
-            ["E0004", "E0004"]
+            ["E0004", "E0004", "E0004"]
         );
         let Item::Operation(operation) = &file.items[0] else {
             panic!("expected operation");
@@ -2396,5 +2871,175 @@ operation Good:
             };
             assert_eq!(operation.c_export, None, "{source}");
         }
+    }
+
+    #[test]
+    fn parses_operation_contracts_and_ownership() {
+        let (file, diagnostics) = parse(
+            "operation Read:\n    accepts owner of type Buffer.\n    borrows owner.\n    returns Bytes from owner.\n    requires:\n        len(owner) > 0 otherwise bytes(\"\").\n    ensures:\n        len(result) <= len(owner).\n    body:\n        return owner.\n",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let Item::Operation(operation) = &file.items[0] else {
+            panic!("expected operation")
+        };
+        assert_eq!(operation.ownership.borrows, ["owner"]);
+        assert!(operation.ownership.consumes.is_empty());
+        assert_eq!(operation.ownership.return_from, ["owner"]);
+        assert!(!operation.ownership.lowered);
+        assert!(!operation.generated);
+        assert_eq!(operation.requires.len(), 1);
+        assert_eq!(
+            operation.requires[0].condition,
+            Expr::BinOp {
+                op: BinOp::Gt,
+                left: Box::new(Expr::Call {
+                    name: "len".into(),
+                    args: vec![Expr::Var("owner".into())],
+                }),
+                right: Box::new(Expr::Int(0)),
+            }
+        );
+        assert_eq!(
+            operation.requires[0].otherwise,
+            Some(Expr::Call {
+                name: "bytes".into(),
+                args: vec![Expr::Lit(String::new())],
+            })
+        );
+        assert_eq!(operation.ensures.len(), 1);
+    }
+
+    #[test]
+    fn parses_entity_json_schema_defaults_and_iteration() {
+        let (file, diagnostics) = parse(
+            "entity MutationInput:\n    encoding JSON.\n    has warehouse_id of type i64.\n    has codes of type TextList.\n    defaults warehouse_id to 1.\n    requires:\n        warehouse_id > 0.\n        len(codes) <= 64 otherwise -28.\n    iterates Text using TextListNext.\n",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let Item::Entity(entity) = &file.items[0] else {
+            panic!("expected entity")
+        };
+        assert!(entity.json.enabled);
+        assert!(!entity.generated);
+        assert_eq!(entity.json.defaults.len(), 1);
+        assert_eq!(entity.json.defaults[0].name, "warehouse_id");
+        assert_eq!(entity.json.defaults[0].value, Expr::Int(1));
+        assert_eq!(entity.json.requires.len(), 2);
+        assert_eq!(entity.json.requires[0].otherwise, None);
+        assert_eq!(entity.json.requires[1].otherwise, Some(Expr::Int(-28)));
+        let iteration = entity.iteration.as_ref().expect("iteration");
+        assert_eq!(iteration.next, "TextListNext");
+        assert_eq!(iteration.item, TypeRef::Named("Text".into()));
+    }
+
+    #[test]
+    fn source_cannot_name_erased_owner_factories_or_storage_types() {
+        let (file, diagnostics) = parse(
+            "operation Main:\n    accepts fake of type SalCollStorage.\n    returns i64.\n    body:\n        let forged = SalCollCreate(usize(0), usize(1)).\n        SalContractAssert(true).\n        return 0.\n",
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|d| (d.code, d.span.line))
+                .collect::<Vec<_>>(),
+            [("E0004", 2), ("E0004", 5)],
+        );
+        let Item::Operation(operation) = &file.items[0] else {
+            panic!("expected recovered operation");
+        };
+        assert!(operation.accepts.is_empty());
+        assert!(
+            matches!(&operation.body[0], Stmt::ExprStmt(Expr::Call { name, .. }) if name == "SalContractAssert")
+        );
+        assert_eq!(operation.body[1], Stmt::Return(Expr::Int(0)));
+    }
+
+    #[test]
+    fn invalid_and_duplicate_returns_do_not_replace_the_valid_signature() {
+        let (file, diagnostics) = parse(
+            "operation Read:\n    accepts owner of type Buffer.\n    returns Bytes from owner, bad name.\n    returns Bytes from owner.\n    returns i64.\n",
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|d| (d.code, d.span.line))
+                .collect::<Vec<_>>(),
+            [("E0001", 3), ("E0004", 5)],
+        );
+        let Item::Operation(operation) = &file.items[0] else {
+            panic!("expected operation");
+        };
+        assert_eq!(operation.returns, Some(TypeRef::Named("Bytes".into())));
+        assert_eq!(operation.ownership.return_from, ["owner"]);
+    }
+
+    #[test]
+    fn unicode_in_contract_directives_reports_errors_and_keeps_siblings() {
+        let (file, diagnostics) = parse(
+            "entity Data:\n    iterates Тип using Next.\n    has value of type i64.\noperation Read:\n    returns Тип.\n    returns i64.\n    requires:\n        проверка(1).\n        true.\n",
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|d| (d.code, d.span.line))
+                .collect::<Vec<_>>(),
+            [("E0004", 2), ("E0004", 5), ("E0004", 8)],
+        );
+        let Item::Operation(operation) = &file.items[1] else {
+            panic!("expected recovered operation");
+        };
+        assert_eq!(operation.returns, Some(TypeRef::Named("i64".into())));
+        assert_eq!(operation.requires[0].condition, Expr::Bool(true));
+    }
+
+    #[test]
+    fn malformed_contract_clauses_reject_without_swallowing_siblings() {
+        let (file, diagnostics) = parse(
+            "operation Read:\n    accepts owner of type Buffer.\n    borrows owner.\n    borrows bad name.\n    returns Bytes from owner.\n    returns Bytes from.\n    consumes.\n    requires:\n        len(owner) > 0 otherwise bytes(\"\").\n        not a contract.\n        warehouse_id >.\n        len(owner) > 0 otherwise.\n        good(owner).\n    ensures:\n        len(result) <= len(owner).\n        1 +.\n        ok(result).\n",
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|d| (d.code, d.span.line))
+                .collect::<Vec<_>>(),
+            [
+                ("E0001", 4usize),
+                ("E0004", 6usize),
+                ("E0004", 7usize),
+                ("E0004", 10usize),
+                ("E0004", 11usize),
+                ("E0004", 12usize),
+                ("E0004", 16usize),
+            ]
+        );
+        let Item::Operation(operation) = &file.items[0] else {
+            panic!("expected operation")
+        };
+        assert_eq!(operation.ownership.borrows, ["owner"]);
+        assert_eq!(operation.requires.len(), 2);
+        assert_eq!(operation.ensures.len(), 2);
+        let (entity_file, entity_diagnostics) = parse(
+            "entity MutationInput:\n    encoding JSON.\n    encoding YAML.\n    encoding JSON.\n    has warehouse_id of type i64.\n    defaults warehouse_id.\n    defaults warehouse_id to.\n    defaults warehouse_id to 1.\n    requires:\n        warehouse_id > 0.\n        1 +.\n        len(codes) <= 64 otherwise -28.\n    iterates Text using TextListNext.\n    iterates Text using Other.\n",
+        );
+        assert_eq!(
+            entity_diagnostics
+                .iter()
+                .map(|d| (d.code, d.span.line))
+                .collect::<Vec<_>>(),
+            [
+                ("E0004", 3usize),
+                ("E0004", 4usize),
+                ("E0004", 6usize),
+                ("E0004", 7usize),
+                ("E0004", 11usize),
+                ("E0004", 14usize),
+            ]
+        );
+        let Item::Entity(entity) = &entity_file.items[0] else {
+            panic!("expected entity")
+        };
+        assert!(entity.json.enabled);
+        assert_eq!(entity.json.defaults.len(), 1);
+        assert_eq!(entity.json.requires.len(), 2);
+        assert!(entity.iteration.is_some());
     }
 }
